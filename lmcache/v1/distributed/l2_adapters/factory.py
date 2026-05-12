@@ -165,6 +165,7 @@ def get_all_registered_names() -> list[str]:
 def create_l2_adapter_from_registry(
     config: "L2AdapterConfigBase",
     l1_memory_desc: "Optional[L1MemoryDesc]" = None,
+    l1_manager: object | None = None,
 ) -> "L2AdapterInterface":
     """Create an L2 adapter using the factory registry.
 
@@ -176,6 +177,11 @@ def create_l2_adapter_from_registry(
         l1_memory_desc: Optional L1 memory descriptor,
             required by adapters that register L1 memory
             with an external backend (e.g. Nixl).
+        l1_manager: Optional live L1Manager instance, forwarded only to
+            factories that declare an ``l1_manager`` keyword parameter
+            (e.g. CXL with peers configured for cross-node demand-pull).
+            Factories with the plain ``(config, l1_memory_desc)`` signature
+            are called unchanged.
 
     Returns:
         A new ``L2AdapterInterface`` instance.
@@ -184,6 +190,9 @@ def create_l2_adapter_from_registry(
         ValueError: If no factory is registered for this
             config type.
     """
+    # Standard
+    import inspect
+
     # Import here to avoid circular dependency
     # First Party
     from lmcache.v1.distributed.l2_adapters.config import (
@@ -202,4 +211,14 @@ def create_l2_adapter_from_registry(
             "%s. Make sure the adapter module is "
             "imported." % name
         )
+
+    # Only forward l1_manager to factories that opt in by declaring the
+    # keyword. Keeps the canonical (config, l1_memory_desc) factories
+    # untouched while letting CXL receive the live L1Manager it needs.
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "l1_manager" in params:
+        return factory(config, l1_memory_desc, l1_manager=l1_manager)
     return factory(config, l1_memory_desc)

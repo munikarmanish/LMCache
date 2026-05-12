@@ -209,5 +209,30 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
         return list(keys)
 
 
+class LazyStorePolicy(StorePolicy):
+    """
+    Lazy store policy: never proactively store to any L2 adapter.
+
+    L2 (e.g. CXL) gets populated only on demand — when a peer issues a
+    PushKVToCXL request and pulls a chunk that lives in this node's L1.
+    Eviction-time spill from L1 to L2 is a separate concern handled by
+    the eviction controller; this policy only governs the store path.
+    """
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        return {}
+
+    def select_l1_deletions(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        return []
+
+
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+register_store_policy("lazy", LazyStorePolicy)

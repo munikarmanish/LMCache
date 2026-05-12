@@ -37,6 +37,7 @@ for _finder, _module_name, _ispkg in pkgutil.iter_modules(__path__):
 def create_l2_adapter(
     config: L2AdapterConfigBase,
     l1_memory_desc: L1MemoryDesc | None = None,
+    l1_manager: object | None = None,
 ) -> L2AdapterInterface:
     """Create an L2 adapter from its config via the
     factory registry.
@@ -47,6 +48,9 @@ def create_l2_adapter(
             required for adapters that register L1 memory
             with an external backend (e.g. Nixl or
             Mooncake when ``protocol == "rdma"``).
+        l1_manager: Live L1Manager instance, required for adapters that
+            answer cross-node demand-pull requests by reading from L1
+            (e.g. CXL with peers configured).
 
     Returns:
         L2AdapterInterface: A new adapter instance.
@@ -58,6 +62,7 @@ def create_l2_adapter(
     return create_l2_adapter_from_registry(
         config,
         l1_memory_desc=l1_memory_desc,
+        l1_manager=l1_manager,
     )
 
 

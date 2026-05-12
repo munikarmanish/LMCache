@@ -1,0 +1,9 @@
+{
+  "node_id": 0,
+  "initialize": true,
+  "run_lock_manager": true,
+  "cxl_p2p_bind_url": "tcp://0.0.0.0:8447",
+  "peers": [
+    {"node_id": 1, "url": "tcp://NODE_B_HOST:8447"}
+  ]
+}

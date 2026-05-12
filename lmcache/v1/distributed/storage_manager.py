@@ -72,7 +72,9 @@ class StorageManager:
         l1_memory_desc = self._l1_manager.get_l1_memory_desc()
         self._l2_adapters: list[L2AdapterInterface] = []
         for ac in config.l2_adapter_config.adapters:
-            adapter: L2AdapterInterface = create_l2_adapter(ac, l1_memory_desc)
+            adapter: L2AdapterInterface = create_l2_adapter(
+                ac, l1_memory_desc, l1_manager=self._l1_manager
+            )
             if ac.serde_config is not None:
                 adapter = SerdeL2AdapterWrapper(
                     inner=adapter,

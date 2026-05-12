@@ -106,7 +106,9 @@ class StorageManagerConfig:
     """ The configuration for L2 adapters. """
 
     store_policy: str = "default"
-    """ The L2 store policy name. """
+    """ The L2 store policy name. 'default' fans out every L1 store to every
+    L2 adapter (write-through). 'lazy' never proactively writes to L2 — chunks
+    reach L2 only via on-demand peer pulls (e.g. CXL PushKVToCXL). """
 
     prefetch_policy: str = "default"
     """ The L2 prefetch policy name. """
@@ -241,7 +243,9 @@ def add_storage_manager_args(
         default="default",
         help="L2 store policy. Determines which adapters receive each key "
         "and whether keys are deleted from L1 after L2 store. "
-        "Default is 'default' (store all keys to all adapters, keep L1).",
+        "Default is 'default' (store all keys to all adapters, keep L1). "
+        "'lazy' never proactively writes to L2; chunks reach L2 only "
+        "on-demand (e.g. CXL PushKVToCXL).",
     )
     policy_group.add_argument(
         "--l2-prefetch-policy",
