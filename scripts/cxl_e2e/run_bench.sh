@@ -23,8 +23,8 @@ fi
 python bench_ttft.py \
         --node-a-url "http://${HOST_A}:8010" \
         --node-b-url "http://${HOST_B}:8010" \
-        --prompt-tokens 1000 2000 4000 8000 \
-        --repeat 3 \
+        --prompt-tokens 1000 3000 9000 27000 \
+        --repeat 5 \
         --label "$LABEL" \
         "${SEED_ARG[@]}" \
         --out "results-$LABEL.csv"

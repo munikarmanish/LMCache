@@ -102,6 +102,15 @@ class NixlChannel(BaseTransferChannel):
             str, NixlAgent.nixl_prepped_dlist_handle
         ] = {}
 
+        # Optional callback invoked with a peer's id (the requester's
+        # ``local_id``) right after an INCOMING handshake registers that
+        # peer's transfer handler in ``remote_xfer_handlers_dict``. Lets a
+        # caller learn a peer became reachable without polling — e.g. the
+        # NIXL-peer L2 adapter marks the peer connected so it never has to
+        # do its own outbound handshake in the request path. Default
+        # ``None`` (no-op); existing callers are unaffected.
+        self.on_peer_registered = kwargs.get("on_peer_registered", None)
+
         self.side_channels: list[zmq.Socket] = []
         self.running_threads: list[threading.Thread] = []
 
@@ -288,6 +297,16 @@ class NixlChannel(BaseTransferChannel):
             )
 
             logger.info("Replying mem register response")
+
+            # An incoming handshake just registered this peer's transfer
+            # handler, so we can now READ from it without our own outbound
+            # handshake. Notify any listener (best-effort; a bad callback
+            # must not break the init loop).
+            if self.on_peer_registered is not None:
+                try:
+                    self.on_peer_registered(req.local_id)
+                except Exception:
+                    logger.exception("on_peer_registered callback failed")
         elif isinstance(req, InitSideMsgBase):
             resp = self.handle_init_side_msg(req)
             logger.info("Replying P2P init side response")
