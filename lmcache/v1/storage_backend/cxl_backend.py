@@ -21,7 +21,7 @@ import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 # Third Party
 import torch
@@ -510,6 +510,32 @@ class CXLBackend(AllocatorBackendInterface):
             parent_allocator=_SlotRefcountAdapter(self, view.slot_idx, np_buf),
         )
         return obj
+
+    def gpu_src_view(self, key: CacheEngineKey) -> Optional[Tuple[int, int]]:
+        """Resolve a chunk's host source address for a GPU-direct H2D copy.
+
+        Returns ``(n_bytes, src_host_ptr)`` where ``src_host_ptr`` points
+        into the (``cudaHostRegister``'d) CXL pool, suitable as the source
+        of an async ``cudaMemcpyAsync`` H2D. Returns ``None`` on miss.
+
+        Unlike ``read_into`` / ``get_blocking`` this does NOT bump
+        ``ref_count``: the L2-resident retrieve path relies on the
+        ``pin_count`` held since ``lookup_and_lock`` to keep the slot alive
+        for the duration of the DMA. The caller MUST hold that pin (i.e.
+        have called ``pin(key)`` / ``contains(key, pin=True)``) and release
+        it via ``unpin(key)`` only after the stream confirms the copy.
+
+        Args:
+            key: The chunk's cache key.
+
+        Returns:
+            ``(n_bytes, src_host_ptr)`` on hit, or ``None`` on miss.
+        """
+        view = self._index.lookup(key)
+        if view is None:
+            return None
+        self._cache_slot(key, view.slot_idx)
+        return view.chunk_len, self._pool.base + view.chunk_offset
 
     # -------- pin / unpin / remove --------------------------------------
 

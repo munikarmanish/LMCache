@@ -6,8 +6,8 @@
 #   ./launch_vllm.sh <port> [<cuda-visible-device>]
 #
 # Examples:
-#   ./launch_vllm.sh 8100        # GPU 0, port 8100
-#   ./launch_vllm.sh 8200 1      # GPU 1, port 8200 (multi-GPU node)
+#   ./launch_vllm.sh 8010        # GPU 0, port 8010
+#   ./launch_vllm.sh 8010 1      # GPU 1, port 8010 (multi-GPU node)
 
 set -euo pipefail
 
@@ -38,10 +38,19 @@ KV_CFG='{
   }
 }'
 
+# Log to both the terminal and vllm.log (truncated each run via `tee`,
+# no -a). PIPESTATUS preserves vLLM's exit code through the pipe so
+# `set -e` still fails if it crashes.
+LOG="$HERE/vllm.log"
+
+# --disable-log-stats: silence vLLM's periodic throughput log lines
+# ("Avg prompt throughput: ... Avg generation throughput: ...").
 CUDA_VISIBLE_DEVICES="$GPU" vllm serve "$MODEL" \
     --kv-transfer-config "$KV_CFG" \
     --no-enable-prefix-caching \
     --enforce-eager \
     --gpu-memory-utilization 0.8 \
     --dtype float16 \
-    --port "$PORT"
+    --disable-log-stats \
+    --port "$PORT" 2>&1 | tee "$LOG"
+exit "${PIPESTATUS[0]}"

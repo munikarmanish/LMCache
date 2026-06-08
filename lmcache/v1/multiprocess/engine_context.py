@@ -14,6 +14,9 @@ from lmcache.v1.distributed.api import (
     ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.config import StorageManagerConfig
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    L2ResidentTierInfo,
+)
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
@@ -152,6 +155,13 @@ class MPCacheEngineContext:
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
 
+        # L2-resident tier info, keyed by request_id, bridging lookup ->
+        # retrieve. ``lookup`` (via query_prefetch_status) sets it; ``retrieve``
+        # and the abort path (``free_lookup_locks``) consume and pop it. Held
+        # here because the PrefetchHandle is popped before retrieve runs.
+        self._tier_info_lock = threading.Lock()
+        self._prefetch_tier_info: dict[str, L2ResidentTierInfo] = {}
+
     @property
     def chunk_size(self) -> int:
         """Chunk size for KV cache operations."""
@@ -205,6 +215,46 @@ class MPCacheEngineContext:
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
         return ipc_key_to_object_keys(key, chunk_hashes)
+
+    def set_tier_info(self, request_id: str, info: L2ResidentTierInfo) -> None:
+        """Stash L2-resident tier info for ``request_id``.
+
+        Called from the lookup path once the prefetch completes, so the
+        retrieve (or abort) path can later learn which keys to serve
+        GPU-direct. An empty ``info`` (no resident keys) is not stored.
+
+        Args:
+            request_id: The external request id (``IPCCacheEngineKey.request_id``).
+            info: The tier info from ``query_prefetch_tier_info``.
+        """
+        if not info.keys:
+            return
+        with self._tier_info_lock:
+            self._prefetch_tier_info[request_id] = info
+
+    def get_tier_info(self, request_id: str) -> L2ResidentTierInfo:
+        """Return (without removing) the L2-resident tier info for a request.
+
+        Args:
+            request_id: The external request id.
+
+        Returns:
+            The stashed :class:`L2ResidentTierInfo`, or an empty one if none.
+        """
+        with self._tier_info_lock:
+            return self._prefetch_tier_info.get(request_id, L2ResidentTierInfo())
+
+    def pop_tier_info(self, request_id: str) -> L2ResidentTierInfo:
+        """Remove and return the L2-resident tier info for a request.
+
+        Args:
+            request_id: The external request id.
+
+        Returns:
+            The stashed :class:`L2ResidentTierInfo`, or an empty one if none.
+        """
+        with self._tier_info_lock:
+            return self._prefetch_tier_info.pop(request_id, L2ResidentTierInfo())
 
     @staticmethod
     def _compute_shm_pool_info(

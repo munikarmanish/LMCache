@@ -118,6 +118,21 @@ class PrefetchPhase(enum.Enum):
     PLAN_AND_LOAD = enum.auto()
 
 
+@dataclass(frozen=True)
+class L2ResidentTierInfo:
+    """Per-key tier info for hits left L2-resident (GPU-direct retrieve).
+
+    Reported alongside the prefetch result bitmap so the retrieve handler
+    can drive ``submit_h2d`` for these keys (copying straight from L2 to
+    GPU) instead of expecting them in L1. ``keys[i]`` lives on the adapter
+    at ``adapter_indices[i]``; both tuples are parallel and indexed into
+    the original request's key list.
+    """
+
+    keys: tuple[ObjectKey, ...] = ()
+    adapter_indices: tuple[int, ...] = ()
+
+
 @dataclass
 class InFlightPrefetchRequest:
     """Tracks a single prefetch request across its lifecycle phases."""
@@ -141,6 +156,11 @@ class InFlightPrefetchRequest:
 
     # Load phase: adapter_idx -> bitmap of key indices to load
     load_plan: dict[int, Bitmap] = field(default_factory=dict)
+    # Load phase: adapter_idx -> bitmap of key indices left L2-resident
+    # (served GPU-direct at retrieve; never reserve/load into L1). The
+    # lookup-phase pins for these keys are held until the retrieve handler
+    # releases them, so they are NOT unlocked at finalize.
+    l2_resident_plan: dict[int, Bitmap] = field(default_factory=dict)
     # Load phase: adapter_idx -> task_id (removed as results arrive)
     pending_load_tasks: dict[int, L2TaskId] = field(default_factory=dict)
     # Load phase: adapter_idx -> L1 bytes reserved for that adapter's
@@ -239,6 +259,10 @@ class PrefetchController(StorageControllerInterface):
         # Thread-safe prefetch results (background -> external)
         self._prefetch_results_lock = threading.Lock()
         self._completed_results: dict[PrefetchRequestId, Bitmap] = {}
+        # L2-resident tier info, reported as a sidecar to the result bitmap
+        # (the bitmap contract is unchanged). Keyed by request id; populated
+        # in _complete_request, popped by query_prefetch_tier_info.
+        self._completed_tier_info: dict[PrefetchRequestId, L2ResidentTierInfo] = {}
 
         # Map eventfds to adapter indices for quick lookup in poll.
         # Relies on the L2AdapterInterface contract that every adapter
@@ -381,6 +405,27 @@ class PrefetchController(StorageControllerInterface):
             with self._lookup_results_lock:
                 self._completed_lookups.pop(request_id, None)
         return result
+
+    def query_prefetch_tier_info(
+        self, request_id: PrefetchRequestId
+    ) -> L2ResidentTierInfo:
+        """Pop the L2-resident tier info for a completed prefetch request.
+
+        Sidecar to :meth:`query_prefetch_result` (which owns the result
+        bitmap and its lifecycle). Returns an empty :class:`L2ResidentTierInfo`
+        when the request had no L2-resident hits or is unknown, so callers
+        can treat "no resident keys" and "not found" uniformly.
+
+        Thread-safe. Each request's tier info can only be retrieved once.
+
+        Args:
+            request_id: The request ID from submit_prefetch_request.
+
+        Returns:
+            The request's :class:`L2ResidentTierInfo`, or an empty one.
+        """
+        with self._prefetch_results_lock:
+            return self._completed_tier_info.pop(request_id, L2ResidentTierInfo())
 
     def report_status(self) -> dict:
         """Return a status dict for the prefetch controller."""
@@ -629,7 +674,21 @@ class PrefetchController(StorageControllerInterface):
         retained = build_trim_mask(merged_lookup, num_keys, request.policy)
         trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
 
-        if not trimmed_plan:
+        # Step 2b: split off adapters that serve hits GPU-direct from L2
+        # (L2-resident retrieve). Those keys skip the L1 reserve/load path
+        # entirely; their lookup-phase pins are kept until the retrieve
+        # handler drains them to GPU. Gated to PREFIX for v1 — under
+        # SPARSE/SEGMENTED these adapters stay on the L1-bounce path.
+        l2_resident_plan: dict[int, Bitmap] = {}
+        if request.policy is TrimPolicy.PREFIX:
+            for adapter_idx in list(trimmed_plan.keys()):
+                if self._l2_adapters[adapter_idx].supports_l2_resident_retrieve():
+                    l2_resident_plan[adapter_idx] = trimmed_plan.pop(adapter_idx)
+        request.l2_resident_plan = l2_resident_plan
+        # Bitmap of keys satisfied purely by a held L2-resident pin (no L1).
+        resident_bitmap = merge_bitmaps(l2_resident_plan.values(), num_keys)
+
+        if not trimmed_plan and not l2_resident_plan:
             # Nothing to load after trimming. Unlock all lookup locks and
             # complete with an empty retained set.
             self._unlock_all_lookups(request)
@@ -693,20 +752,34 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
-        # Step 5: recompute load plan excluding failed reservations
+        # Step 5: recompute load plan excluding failed reservations.
+        # L2-resident keys are satisfied by their held pin (no L1 reserve),
+        # so they count toward the retained prefix unconditionally.
         reserved_bitmap = Bitmap(num_keys)
         for i, key in enumerate(request.keys):
             if key in reserved_key_set:
                 reserved_bitmap.set(i)
+        reserved_bitmap = reserved_bitmap | resident_bitmap
 
         retained = build_trim_mask(reserved_bitmap, num_keys, request.policy)
-        trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
-        request.load_plan = trimmed_plan
+        # Re-trim BOTH partitions with the same mask, then re-split so the
+        # L1-load plan (request.load_plan) and the resident plan stay
+        # disjoint. ``load_plan`` still holds the resident adapters, so we
+        # remove them again after trimming.
+        retrimmed = trim_load_plan_with_mask(load_plan, retained)
+        request.l2_resident_plan = {
+            idx: bm for idx, bm in retrimmed.items() if idx in l2_resident_plan
+        }
+        request.load_plan = {
+            idx: bm for idx, bm in retrimmed.items() if idx not in l2_resident_plan
+        }
+        trimmed_plan = request.load_plan
 
-        ## Step 6: phase 1 unlock — keys locked in lookup but not in plan
+        ## Step 6: phase 1 unlock — keys locked in lookup but neither in the
+        ## L1-load plan nor kept L2-resident.
         self._unlock_unneeded_keys(request)
 
-        if not trimmed_plan:
+        if not trimmed_plan and not request.l2_resident_plan:
             # Nothing loadable after filtering
             if request.write_reserved_keys:
                 l1_mgr.finish_write(request.write_reserved_keys)
@@ -722,6 +795,24 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
             self._complete_request(request.request_id, Bitmap(num_keys))
+            return
+
+        # If only L2-resident keys remain (no L1 load tasks to wait on),
+        # finalize synchronously — there will be no load-completion event.
+        if not trimmed_plan:
+            self._update_lookup_results(
+                request.request_id, retained.count_leading_ones()
+            )
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
+                    metadata={
+                        "request_id": request.request_id,
+                        "prefix_hit_count": retained.count_leading_ones(),
+                    },
+                )
+            )
+            self._finalize_load(request)
             return
 
         ## Step 7: submit load tasks per adapter
@@ -888,21 +979,32 @@ class PrefetchController(StorageControllerInterface):
             for global_i in load_bitmap.gather(plan_indices):
                 result_bitmap.set(global_i)
 
-        # Separate loaded vs. failed among write-reserved keys
-        loaded_keys: list[ObjectKey] = result_bitmap.gather(request.keys)
-        loaded_set = set(loaded_keys)
+        # ``result_bitmap`` so far covers only L1-loaded keys. The L1
+        # lifecycle ops below (finish_write_and_reserve_read, finish_read,
+        # failed-key cleanup) must operate on THIS L1-only set, since
+        # resident keys have no L1 entry.
+        l1_loaded_keys: list[ObjectKey] = result_bitmap.gather(request.keys)
+        loaded_set = set(l1_loaded_keys)
         failed_keys = [k for k in request.write_reserved_keys if k not in loaded_set]
+
+        # L2-resident keys are "loaded" by virtue of their held pin — they
+        # are served GPU-direct at retrieve, never copied to L1. OR them
+        # into the result so they count toward the reported retained prefix.
+        resident_bitmap = merge_bitmaps(request.l2_resident_plan.values(), num_keys)
+        result_bitmap = result_bitmap | resident_bitmap
+        loaded_keys = result_bitmap.gather(request.keys)
 
         # Phase 2 unlock: release L2 locks for all keys in the load plan
         self._unlock_all_plan_keys(request)
 
         l1_mgr = self._l1_manager
 
-        # Transition loaded keys: write-locked -> read-locked
+        # Transition L1-loaded keys: write-locked -> read-locked
         # Use extra_count so that all TP workers each get their own read lock.
-        if loaded_keys:
+        # Resident keys are excluded — they were never write-reserved in L1.
+        if l1_loaded_keys:
             l1_mgr.finish_write_and_reserve_read(
-                loaded_keys, extra_count=request.extra_count
+                l1_loaded_keys, extra_count=request.extra_count
             )
 
         # Clean up failed keys
@@ -935,10 +1037,12 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
-        # Release read locks for any loaded key outside the retained set
-        # (partial load failures can create gaps).
+        # Release read locks for any L1-loaded key outside the retained set
+        # (partial load failures can create gaps). Resident keys are
+        # excluded — they hold a CXL pin, not an L1 read lock; that pin is
+        # released by the retrieve handler (or the abort path), not here.
         retained = build_trim_mask(result_bitmap, num_keys, request.policy)
-        released_bitmap = result_bitmap & (~retained)
+        released_bitmap = result_bitmap & (~retained) & (~resident_bitmap)
         released = released_bitmap.gather(request.keys)
         if released:
             l1_mgr.finish_read(released, extra_count=request.extra_count)
@@ -950,10 +1054,21 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
 
     def _unlock_unneeded_keys(self, request: InFlightPrefetchRequest) -> None:
-        """Phase 1 unlock: keys locked in lookup but not in the load plan."""
+        """Phase 1 unlock: keys locked in lookup but neither in the L1-load
+        plan nor kept L2-resident.
+
+        L2-resident keys keep their lookup pin (the retrieve handler drains
+        them to GPU and releases the pin afterwards), so they are excluded
+        from the unlock set here.
+        """
+        num_keys = len(request.keys)
         for adapter_idx, lookup_bitmap in request.lookup_results.items():
-            plan_bitmap = request.load_plan.get(adapter_idx, Bitmap(len(request.keys)))
-            to_unlock_bitmap = lookup_bitmap & (~plan_bitmap)
+            plan_bitmap = request.load_plan.get(adapter_idx, Bitmap(num_keys))
+            resident_bitmap = request.l2_resident_plan.get(
+                adapter_idx, Bitmap(num_keys)
+            )
+            kept_bitmap = plan_bitmap | resident_bitmap
+            to_unlock_bitmap = lookup_bitmap & (~kept_bitmap)
             unlock_keys = to_unlock_bitmap.gather(request.keys)
             if unlock_keys:
                 self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
@@ -971,15 +1086,54 @@ class PrefetchController(StorageControllerInterface):
             if unlock_keys:
                 self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
 
+    def _unlock_l2_resident_keys(self, request: InFlightPrefetchRequest) -> None:
+        """Release the held pins for L2-resident keys.
+
+        Used only on the shutdown/cleanup path: normally the retrieve
+        handler releases these pins after the GPU-direct H2D lands, but at
+        shutdown no retrieve will run, so we must unlock them here to avoid
+        leaking pins (which would block eviction forever).
+        """
+        for adapter_idx, resident_bitmap in request.l2_resident_plan.items():
+            unlock_keys = resident_bitmap.gather(request.keys)
+            if unlock_keys:
+                self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+
     # =========================================================================
     # Completion and cleanup
     # =========================================================================
 
     def _complete_request(self, request_id: PrefetchRequestId, result: Bitmap) -> None:
-        """Store the retained-key bitmap and remove from in-flight tracking."""
+        """Store the retained-key bitmap (and any L2-resident tier info) and
+        remove the request from in-flight tracking.
+
+        The tier info is built from the popped request's ``l2_resident_plan``
+        masked to the retained set, so the retrieve handler learns exactly
+        which keys to serve GPU-direct (and on which adapter).
+        """
+        removed = self._in_flight_requests.pop(request_id, None)
+
+        # Build L2-resident tier info from the retained resident keys.
+        tier_info = L2ResidentTierInfo()
+        if removed is not None and removed.l2_resident_plan:
+            resident_keys: list[ObjectKey] = []
+            resident_adapters: list[int] = []
+            for adapter_idx, plan_bitmap in removed.l2_resident_plan.items():
+                retained_resident = plan_bitmap & result
+                for global_i in retained_resident.get_indices_list():
+                    resident_keys.append(removed.keys[global_i])
+                    resident_adapters.append(adapter_idx)
+            if resident_keys:
+                tier_info = L2ResidentTierInfo(
+                    keys=tuple(resident_keys),
+                    adapter_indices=tuple(resident_adapters),
+                )
+
         with self._prefetch_results_lock:
             self._completed_results[request_id] = result
-        removed = self._in_flight_requests.pop(request_id, None)
+            if tier_info.keys:
+                self._completed_tier_info[request_id] = tier_info
+
         if removed is not None:
             self._status_in_flight_count -= 1
             if removed.phase == PrefetchPhase.LOOKUP:
@@ -987,9 +1141,10 @@ class PrefetchController(StorageControllerInterface):
             elif removed.phase == PrefetchPhase.PLAN_AND_LOAD:
                 self._status_load_phase_count -= 1
         logger.debug(
-            "Prefetch request %d completed: %d retained keys",
+            "Prefetch request %d completed: %d retained keys (%d L2-resident)",
             request_id,
             result.popcount(),
+            len(tier_info.keys),
         )
 
     def _cleanup_in_flight_requests(self) -> None:
@@ -1001,6 +1156,7 @@ class PrefetchController(StorageControllerInterface):
                     l1_mgr.finish_write(request.write_reserved_keys)
                     l1_mgr.delete(request.write_reserved_keys)
                 self._unlock_all_plan_keys(request)
+                self._unlock_l2_resident_keys(request)
             elif request.phase == PrefetchPhase.LOOKUP:
                 self._unlock_all_lookups(request)
             logger.warning(

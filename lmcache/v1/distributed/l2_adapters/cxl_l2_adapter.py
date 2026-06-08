@@ -36,6 +36,7 @@ import time
 import torch
 
 # First Party
+import lmcache.c_ops as lmc_ops
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.utils import CacheEngineKey
@@ -351,6 +352,12 @@ class CXLL2Adapter(L2AdapterInterface):
         self._completed_lookup: dict[L2TaskId, Bitmap] = {}
         self._completed_load: dict[L2TaskId, Bitmap] = {}
 
+        # L2-resident retrieve: maps an opaque h2d token -> the pinned key,
+        # so ``release_after_h2d`` can ``unpin`` the right key. Keyed by a
+        # monotonic counter so a token is never reused across in-flight DMAs.
+        self._h2d_token_to_key: dict[int, CacheEngineKey] = {}
+        self._next_h2d_token: int = 0
+
         # Bg loop.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -546,6 +553,83 @@ class CXLL2Adapter(L2AdapterInterface):
                 self._backend.unpin(ce_key)
             except Exception:
                 logger.exception("CXL L2 unpin failed for %s", ce_key)
+
+    # ---------------- l2-resident retrieve (GPU-direct) ----------------
+
+    def supports_l2_resident_retrieve(self) -> bool:
+        """CXL serves hits straight to GPU from the registered pool."""
+        return True
+
+    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+        """Issue an async H2D copy of ``key``'s chunk into ``gpu_ptr``.
+
+        The CXL pool is ``cudaHostRegister``'d at bootstrap, so this is a
+        real async DMA on the caller's current CUDA stream. No new lock is
+        taken: the ``pin_count`` acquired by ``submit_lookup_and_lock_task``
+        keeps the slot alive until ``release_after_h2d``.
+
+        Args:
+            key: The object key to copy.
+            gpu_ptr: Destination device pointer.
+            dst_size: Destination capacity in bytes.
+
+        Returns:
+            An opaque token for ``release_after_h2d`` on hit, or ``-1`` on
+            miss / error.
+        """
+        ce_key = _object_key_to_cache_engine_key(key, self._metadata)
+        try:
+            res = self._backend.gpu_src_view(ce_key)
+        except Exception:
+            logger.exception("CXL gpu_src_view failed for %s", ce_key)
+            return -1
+        if res is None:
+            return -1
+        n_bytes, src_ptr = res
+        n = min(n_bytes, dst_size)
+        # The whole CXL pool is one contiguous host-registered region, so
+        # there are no internal pin-chunk boundaries to respect; passing
+        # offset=0 and an alignment >= n makes the native helper issue a
+        # single full-size cudaMemcpyAsync on the current stream.
+        try:
+            lmc_ops.lmcache_memcpy_async(
+                gpu_ptr,
+                src_ptr,
+                n,
+                lmc_ops.TransferDirection.H2D,
+                0,
+                self._backend._chunk_size_bytes,
+            )
+        except Exception:
+            logger.exception("CXL H2D memcpy failed for %s", ce_key)
+            return -1
+        with self._lock:
+            token = self._next_h2d_token
+            self._next_h2d_token += 1
+            self._h2d_token_to_key[token] = ce_key
+        return token
+
+    def release_after_h2d(self, token: int) -> None:
+        """Unpin the chunk whose H2D was issued under ``token``.
+
+        Must be called only after the issuing stream has drained the copy
+        (i.e. from a stream-ordered host callback). A ``token < 0`` (a
+        ``submit_h2d`` miss) is a no-op.
+
+        Args:
+            token: A token returned by ``submit_h2d``.
+        """
+        if token < 0:
+            return
+        with self._lock:
+            ce_key = self._h2d_token_to_key.pop(token, None)
+        if ce_key is None:
+            logger.warning("CXL release_after_h2d: unknown token %d", token)
+            return
+        try:
+            self._backend.unpin(ce_key)
+        except Exception:
+            logger.exception("CXL release_after_h2d unpin failed for %s", ce_key)
 
     # ---------------- load ----------------
 

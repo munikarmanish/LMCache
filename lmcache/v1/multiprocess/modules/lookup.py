@@ -10,6 +10,7 @@ import time
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
+    ObjectKey,
     PrefetchHandle,
     ipc_key_to_object_keys,
 )
@@ -348,6 +349,12 @@ class LookupModule:
         if found is None:
             return None
 
+        # Stash any L2-resident tier info so retrieve (or the abort path)
+        # can serve those keys GPU-direct. Done before popping the job, so
+        # the handle is still valid for the tier-info query.
+        tier_info = self._ctx.storage_manager.query_prefetch_tier_info(job.handle)
+        self._ctx.set_tier_info(request_id, tier_info)
+
         # NOTE(Kuntai): this assumes two things:
         # 1. the world size is the same between keys
         # 2. the lookup sort the keys in prefix order and breaks at the
@@ -403,9 +410,35 @@ class LookupModule:
 
         extra_count = compute_extra_count(tp_size, key.world_size)
 
-        self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys, extra_count=extra_count
+        # Split off any L2-resident keys: those hold a CXL pin (not an L1
+        # read lock), so they must be unlocked on the adapter rather than
+        # via finish_read_prefetched. Without this an aborted request would
+        # leak the pin and block eviction of that slot forever.
+        tier_info = self._ctx.pop_tier_info(key.request_id)
+        resident_by_key = dict(
+            zip(tier_info.keys, tier_info.adapter_indices, strict=True)
         )
+        if resident_by_key:
+            resident_keys: list[ObjectKey] = []
+            resident_adapters: list[int] = []
+            l1_keys: list[ObjectKey] = []
+            for ok in obj_keys:
+                adapter_idx = resident_by_key.get(ok)
+                if adapter_idx is not None:
+                    resident_keys.append(ok)
+                    resident_adapters.append(adapter_idx)
+                else:
+                    l1_keys.append(ok)
+            if resident_keys:
+                self._ctx.storage_manager.submit_unlock_l2_resident(
+                    resident_keys, resident_adapters
+                )
+            obj_keys = l1_keys
+
+        if obj_keys:
+            self._ctx.storage_manager.finish_read_prefetched(
+                obj_keys, extra_count=extra_count
+            )
 
     def end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.

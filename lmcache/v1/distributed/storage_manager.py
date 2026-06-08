@@ -4,6 +4,7 @@ Distributed multi-tier storage manager for MP mode
 """
 
 # Standard
+from collections import defaultdict
 from contextlib import contextmanager
 from typing import Iterator, Literal
 import time
@@ -31,6 +32,9 @@ from lmcache.v1.distributed.storage_controllers import (
     L2EvictionController,
     PrefetchController,
     StoreController,
+)
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    L2ResidentTierInfo,
 )
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
@@ -643,6 +647,108 @@ class StorageManager:
                 handle.prefetch_request_id,
             )
         return found
+
+    def query_prefetch_tier_info(
+        self,
+        handle: PrefetchHandle,
+    ) -> L2ResidentTierInfo:
+        """Return the L2-resident tier info for a completed prefetch task.
+
+        Sidecar to :meth:`query_prefetch_status`. Names the keys (and the
+        adapter serving each) that were left L2-resident so the retrieve
+        handler can drive ``submit_h2d`` for them instead of expecting them
+        in L1. Returns an empty :class:`L2ResidentTierInfo` when the request
+        had no resident hits.
+
+        Args:
+            handle: The handle of the prefetch task.
+
+        Returns:
+            The task's :class:`L2ResidentTierInfo`, or an empty one.
+        """
+        if handle.prefetch_request_id == -1:
+            return L2ResidentTierInfo()
+        return self._prefetch_controller.query_prefetch_tier_info(
+            handle.prefetch_request_id
+        )
+
+    def submit_h2d_for_l2_resident(
+        self,
+        keys: list[ObjectKey],
+        adapter_indices: list[int],
+        gpu_ptrs: list[int],
+        sizes: list[int],
+    ) -> list[int]:
+        """Issue GPU-direct H2D copies for L2-resident keys.
+
+        Per-key fan-out to ``adapter.submit_h2d``. The caller MUST already
+        be positioned on the desired CUDA stream; the copies are enqueued
+        on that stream and not synchronized here.
+
+        Args:
+            keys: Resident keys to copy.
+            adapter_indices: Adapter index serving each key (parallel to
+                ``keys``).
+            gpu_ptrs: Destination device pointer per key.
+            sizes: Destination capacity in bytes per key.
+
+        Returns:
+            One token per key (``-1`` on miss), to pass to
+            :meth:`release_after_h2d` after the stream drains.
+        """
+        if not (len(keys) == len(adapter_indices) == len(gpu_ptrs) == len(sizes)):
+            raise ValueError(
+                "submit_h2d_for_l2_resident: keys, adapter_indices, gpu_ptrs "
+                "and sizes must have equal length"
+            )
+        tokens: list[int] = []
+        for key, adapter_idx, gpu_ptr, size in zip(
+            keys, adapter_indices, gpu_ptrs, sizes, strict=True
+        ):
+            tokens.append(self._l2_adapters[adapter_idx].submit_h2d(key, gpu_ptr, size))
+        return tokens
+
+    def release_after_h2d(self, payload: tuple[list[int], list[int]]) -> None:
+        """Release pins for L2-resident keys whose H2D has landed.
+
+        Single-argument shape so it can be dispatched directly by the GPU
+        stream callback. Groups tokens by adapter and calls
+        ``release_after_h2d_batch`` on each.
+
+        Args:
+            payload: ``(tokens, adapter_indices)`` — parallel lists where
+                ``tokens[i]`` was issued by adapter ``adapter_indices[i]``.
+                ``-1`` tokens (misses) are ignored by the adapter.
+        """
+        tokens, adapter_indices = payload
+        by_adapter: dict[int, list[int]] = defaultdict(list)
+        for token, adapter_idx in zip(tokens, adapter_indices, strict=True):
+            by_adapter[adapter_idx].append(token)
+        for adapter_idx, adapter_tokens in by_adapter.items():
+            self._l2_adapters[adapter_idx].release_after_h2d_batch(adapter_tokens)
+
+    def submit_unlock_l2_resident(
+        self,
+        keys: list[ObjectKey],
+        adapter_indices: list[int],
+    ) -> None:
+        """Release the held pins for L2-resident keys without a GPU copy.
+
+        The abort counterpart to a normal retrieve: when a looked-up
+        request is freed before retrieve, the resident pins must be dropped
+        or they leak (blocking eviction). Groups keys by adapter and calls
+        ``submit_unlock``.
+
+        Args:
+            keys: Resident keys to unlock.
+            adapter_indices: Adapter index serving each key (parallel to
+                ``keys``).
+        """
+        by_adapter: dict[int, list[ObjectKey]] = defaultdict(list)
+        for key, adapter_idx in zip(keys, adapter_indices, strict=True):
+            by_adapter[adapter_idx].append(key)
+        for adapter_idx, adapter_keys in by_adapter.items():
+            self._l2_adapters[adapter_idx].submit_unlock(adapter_keys)
 
     def touch_l1_keys(self, keys: list[ObjectKey]):
         """

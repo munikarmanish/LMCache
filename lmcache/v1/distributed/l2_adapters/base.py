@@ -343,6 +343,99 @@ class L2AdapterInterface(ABC):
         pass
 
     #####################
+    # L2-Resident Retrieve Interface (GPU-direct, no L1 detour)
+    #####################
+
+    def supports_l2_resident_retrieve(self) -> bool:
+        """Whether this adapter can serve hits straight to GPU from L2.
+
+        When ``True``, the ``PrefetchController`` leaves hits on this
+        adapter L2-resident: the ``lookup_and_lock`` pin is held past
+        prefetch completion (no L1 reserve, no ``submit_load_task``), and
+        the retrieve consumer drives ``submit_h2d`` / ``release_after_h2d``
+        to copy the chunk directly from L2 into the GPU KV cache.
+
+        Defaults to ``False``: the adapter stays on the legacy path where
+        prefetch copies every hit into an L1 buffer via
+        ``submit_load_task`` before retrieve.
+
+        Returns:
+            ``True`` iff the adapter implements ``submit_h2d`` /
+            ``release_after_h2d``.
+        """
+        return False
+
+    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+        """Queue an async H2D copy of ``key``'s chunk straight into GPU memory.
+
+        The copy is enqueued on the caller's CURRENT CUDA stream (the
+        implementation picks it up via the device-current stream). The
+        method does NOT synchronize the stream and acquires NO new
+        eviction lock — it relies on the ``lookup_and_lock`` pin that the
+        prefetch phase still holds for this key.
+
+        Preconditions:
+            - ``submit_lookup_and_lock_task`` previously succeeded for
+              ``key`` (its pin is held).
+            - The caller is positioned on the desired CUDA stream.
+
+        Args:
+            key: The object key whose chunk to copy.
+            gpu_ptr: Destination device pointer (the retrieve staging
+                buffer).
+            dst_size: Capacity of the destination in bytes; the copy is
+                clamped to ``min(chunk_len, dst_size)``.
+
+        Returns:
+            An opaque non-negative token to pass to ``release_after_h2d``
+            once the stream confirms the DMA landed, or ``-1`` on miss
+            (which should not happen under the preconditions but is the
+            well-defined failure mode).
+
+        Raises:
+            NotImplementedError: If the adapter does not support
+                L2-resident retrieve.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support l2-resident retrieve"
+        )
+
+    def release_after_h2d(self, token: int) -> None:
+        """Drop the pin for a chunk whose H2D was issued via ``submit_h2d``.
+
+        MUST be invoked only AFTER the caller's CUDA stream has been
+        synchronized for the corresponding DMA (e.g. from a stream-ordered
+        host callback scheduled after ``event.record()``) — otherwise
+        eviction could race the in-flight copy.
+
+        A ``token < 0`` (from a ``submit_h2d`` miss) is a no-op so callers
+        can release a batch uniformly.
+
+        Args:
+            token: The value returned by ``submit_h2d``.
+
+        Raises:
+            NotImplementedError: If the adapter does not support
+                L2-resident retrieve.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support l2-resident retrieve"
+        )
+
+    def release_after_h2d_batch(self, tokens: list[int]) -> None:
+        """Release a batch of ``submit_h2d`` tokens.
+
+        Default implementation loops over ``release_after_h2d``; adapters
+        may override for efficiency.
+
+        Args:
+            tokens: Tokens returned by ``submit_h2d`` (``-1`` entries are
+                ignored).
+        """
+        for token in tokens:
+            self.release_after_h2d(token)
+
+    #####################
     # Listener Interface
     #####################
 

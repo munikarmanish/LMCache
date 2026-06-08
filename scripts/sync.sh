@@ -61,6 +61,7 @@ rsync -avz --delete \
     --exclude='.vscode/' \
     --exclude='node_modules/' \
     --exclude='*.log' \
+    --exclude='*.csv' \
     --exclude='*.tmp' \
     "${SOURCE_DIR}/" "${USER}@${HOST}:${TARGET}/"
 

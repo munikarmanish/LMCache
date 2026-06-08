@@ -95,6 +95,20 @@ def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None
 
 
 @dataclass
+class _ResidentSource:
+    """Marks a retrieve chunk to be served GPU-direct from an L2 adapter.
+
+    Stands in for an L1 ``MemoryObj`` in the per-key source list so the
+    retrieve loop can branch: L1 sources bounce through the memory object,
+    ``_ResidentSource`` entries DMA straight from the (host-registered) L2
+    pool into the staging buffer via ``submit_h2d``.
+    """
+
+    key: ObjectKey
+    adapter_idx: int
+
+
+@dataclass
 class ContextEntry:
     """Registered cache context metadata for a single worker instance.
 
@@ -139,6 +153,14 @@ class GPUTransferModule:
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
+        )
+        # Release CXL pins for L2-resident keys after their GPU-direct H2D
+        # has drained on the retrieve stream. Payload is
+        # ``(tokens, adapter_indices)`` — both lists of ints.
+        self._device_host_func_dispatcher.register(
+            "release_after_h2d",
+            self._ctx.storage_manager.release_after_h2d,
+            payload_type=tuple[list[int], list[int]],
         )
         self._device_host_func_dispatcher.start()
 
@@ -597,13 +619,21 @@ class GPUTransferModule:
             cache_context.kv_layer_groups_manager.inference_engine_logical_block_size
         )
 
-        def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
+        # Per-key copy source, aligned 1:1 with obj_keys. Each entry is
+        # either an L1 ``MemoryObj`` (legacy bounce-buffer path) or a
+        # ``_ResidentSource`` marking a key to copy GPU-direct from L2.
+        # ``h2d_tokens`` / ``h2d_token_adapters`` collect the resident
+        # tokens so the stream callback can release their pins.
+        h2d_tokens: list[int] = []
+        h2d_token_adapters: list[int] = []
+
+        def _retrieve_loop(sources: list[object]) -> None:
             _BATCH_SIZE = cache_context.max_batch_size
             groups = cache_context.kv_layer_groups_manager.kv_layer_groups
-            for batch_idx, memory_obj_batch in enumerate(
-                batched_iteration(memory_objs, batch_size=_BATCH_SIZE)
+            for batch_idx, source_batch in enumerate(
+                batched_iteration(sources, batch_size=_BATCH_SIZE)
             ):
-                batch_len = len(memory_obj_batch)
+                batch_len = len(source_batch)
                 chunk_start = batch_idx * self._ctx.chunk_size * _BATCH_SIZE
                 chunk_end = chunk_start + self._ctx.chunk_size * batch_len
 
@@ -632,12 +662,22 @@ class GPUTransferModule:
                 start_chunk_id = batch_idx * _BATCH_SIZE
                 end_chunk_id = start_chunk_id + batch_len
                 # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
-                # H2D copy: each memory_obj maps to its own batch slot
-                for chunk_idx, memory_obj in enumerate(memory_obj_batch):
-                    lmcache_memcpy_async_h2d(
-                        memory_obj,
-                        cache_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
-                    )
+                # H2D copy: each source maps to its own batch slot. L1 sources
+                # bounce through the memory object; L2-resident sources DMA
+                # straight from the CXL pool into the same staging slot.
+                for chunk_idx, source in enumerate(source_batch):
+                    staging = cache_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx)
+                    if isinstance(source, _ResidentSource):
+                        tokens = self._ctx.storage_manager.submit_h2d_for_l2_resident(
+                            [source.key],
+                            [source.adapter_idx],
+                            [staging.data_ptr()],
+                            [staging.nbytes],
+                        )
+                        h2d_tokens.append(tokens[0])
+                        h2d_token_adapters.append(source.adapter_idx)
+                    else:
+                        lmcache_memcpy_async_h2d(source, staging)
                 for group_idx, group in enumerate(groups):
                     bpc = cache_context.blocks_for_tokens(
                         self._ctx.chunk_size, group_idx
@@ -691,20 +731,45 @@ class GPUTransferModule:
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
+            # Split keys by tier. L2-resident keys (e.g. CXL) are served
+            # GPU-direct via submit_h2d and must NOT be expected in L1; the
+            # rest go through the L1 bounce-buffer path as before.
+            tier_info = self._ctx.get_tier_info(key.request_id)
+            resident_by_key: dict[ObjectKey, int] = dict(
+                zip(tier_info.keys, tier_info.adapter_indices, strict=True)
+            )
+            l1_keys = [k for k in obj_keys if k not in resident_by_key]
+
             prefetched_keys: list[ObjectKey] = []
             retrieve_succeeded = False
             total_bytes = 0
             try:
                 with self._ctx.storage_manager.read_prefetched_results(
-                    obj_keys
+                    l1_keys
                 ) as memory_objs:
-                    if not memory_objs or len(memory_objs) != len(obj_keys):
+                    # read_prefetched_results yields None on an L1 miss and an
+                    # empty list when l1_keys is empty (the all-L2-resident
+                    # case, which is valid — those keys go straight to GPU via
+                    # submit_h2d). Only None or a count mismatch is a failure.
+                    if memory_objs is None or len(memory_objs) != len(l1_keys):
                         logger.error("Some keys not found during retrieve!")
                         return event.ipc_handle(), False
 
-                    prefetched_keys = obj_keys[: len(memory_objs)]
+                    # Build the per-key source list aligned 1:1 with obj_keys:
+                    # an L1 MemoryObj or a _ResidentSource per position.
+                    l1_obj_by_key = dict(zip(l1_keys, memory_objs, strict=True))
+                    sources: list[object] = []
+                    for ok in obj_keys:
+                        adapter_idx = resident_by_key.get(ok)
+                        if adapter_idx is not None:
+                            sources.append(_ResidentSource(ok, adapter_idx))
+                        else:
+                            sources.append(l1_obj_by_key[ok])
+
+                    # L1 read locks are released for the L1 subset only.
+                    prefetched_keys = l1_keys[: len(memory_objs)]
                     total_bytes = sum(mo.get_size() for mo in memory_objs)
-                    _retrieve_loop(obj_keys, memory_objs)
+                    _retrieve_loop(sources)
                 # Only set True when with-block exits normally
                 retrieve_succeeded = True
             except Exception:
@@ -718,6 +783,24 @@ class GPUTransferModule:
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
+                    # Release CXL pins after the H2D DMAs drain on this stream.
+                    if h2d_tokens:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "release_after_h2d",
+                            (h2d_tokens, h2d_token_adapters),
+                        )
+                elif resident_by_key:
+                    # Failure path: no stream callback will run, so release
+                    # the resident pins synchronously or they leak and block
+                    # eviction of those CXL slots forever.
+                    self._ctx.storage_manager.submit_unlock_l2_resident(
+                        list(resident_by_key.keys()),
+                        list(resident_by_key.values()),
+                    )
+                # Tier info is consumed exactly once per request — drop it so
+                # it can't leak (which would strand a CXL pin).
+                self._ctx.pop_tier_info(key.request_id)
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(

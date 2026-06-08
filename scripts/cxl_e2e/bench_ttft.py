@@ -39,6 +39,7 @@ import argparse
 import csv
 import json
 import random
+import statistics
 import string
 import sys
 import time
@@ -77,6 +78,34 @@ def send_completion(url: str, model: str, prompt: str, timeout_s: float) -> floa
         # Drain the response so timing covers the full first-token path.
         resp.read()
     return time.perf_counter() - t0
+
+
+def print_median_summary(rows: list[dict]) -> None:
+    """Print a per-prompt-length median table for each TTFT metric.
+
+    Medians (not means) are reported because TTFT distributions are
+    right-skewed: a few slow requests pull the mean up and misrepresent
+    typical latency. Grouped by ``prompt_tokens`` across all repeats.
+
+    Args:
+        rows: Per-trial result dicts produced by the benchmark loop.
+    """
+    metrics = ("ttft_a_local", "ttft_b_cold", "ttft_b_warm")
+    by_len: dict[int, list[dict]] = {}
+    for row in rows:
+        by_len.setdefault(row["prompt_tokens"], []).append(row)
+
+    print("\n=== Median TTFT (seconds) by prompt length ===", file=sys.stderr)
+    header = f"{'prompt_tokens':>14} {'n':>4} " + " ".join(
+        f"{m:>14}" for m in metrics
+    )
+    print(header, file=sys.stderr)
+    for n_tok in sorted(by_len):
+        group = by_len[n_tok]
+        medians = " ".join(
+            f"{statistics.median(r[m] for r in group):>14.4f}" for m in metrics
+        )
+        print(f"{n_tok:>14} {len(group):>4} {medians}", file=sys.stderr)
 
 
 def main() -> int:
@@ -132,6 +161,8 @@ def main() -> int:
         w.writeheader()
         w.writerows(rows)
     print(f"wrote {len(rows)} rows to {args.out}", file=sys.stderr)
+
+    print_median_summary(rows)
     return 0
 
 
