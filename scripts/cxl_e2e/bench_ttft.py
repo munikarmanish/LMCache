@@ -46,27 +46,102 @@ import time
 import urllib.request
 
 
-def make_prompt(num_tokens: int, seed: int) -> str:
-    """Generate a deterministic random-ish prompt of approximately
-    `num_tokens` tokens (rough heuristic: 4 chars/token).
+def _basic_prompt(seed: int, num_tokens: int) -> str:
+    """Build a prompt without a tokenizer: ``seed`` then a repeated word.
+
+    Mirrors ``scripts/p2p/long_doc_qa.py``: the prompt starts with the seed
+    number (so prompts with different seeds don't share a prefix) followed by
+    ``"hi"`` repeated ``num_tokens`` times. ``"hi"`` is a single token for
+    common tokenizers, so the length is approximate (off by the few tokens
+    the leading seed contributes).
+
+    Args:
+        seed: Reproducibility seed; also the unique prompt prefix.
+        num_tokens: Approximate target prompt length in tokens.
+
+    Returns:
+        The generated prompt string.
     """
+    return f"{seed} " + " ".join(["hi"] * num_tokens)
+
+
+def load_tokenizer(model: str):
+    """Load ``model``'s tokenizer via the fast ``tokenizers`` library.
+
+    Returns an ``(encode, decode)`` pair: ``encode(text) -> list[int]`` and
+    ``decode(ids) -> str``. Returns ``(None, None)`` if the tokenizer can't be
+    loaded, signalling callers to fall back to :func:`_basic_prompt`.
+
+    Only the lightweight ``tokenizers`` library is used (import ~0.01s); the
+    heavy ``transformers`` library is intentionally avoided. Load this ONCE
+    and reuse it across all prompts.
+
+    Args:
+        model: Model name / repo id whose tokenizer to load.
+
+    Returns:
+        ``(encode, decode)`` callables, or ``(None, None)`` on failure.
+    """
+    try:
+        # Third Party
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_pretrained(model)
+        return (lambda text: tok.encode(text).ids), (lambda ids: tok.decode(ids))
+    except Exception as exc:  # tokenizer unavailable (offline/gated/no deps)
+        print(
+            f"[bench_ttft] tokenizers for {model!r} unavailable ({exc}); "
+            "falling back to a basic repeated-word prompt (length approximate).",
+            file=sys.stderr,
+        )
+        return None, None
+
+
+def make_prompt(num_tokens: int, seed: int, encode=None, decode=None) -> str:
+    """Generate a deterministic prompt of ``num_tokens`` tokens.
+
+    When ``encode``/``decode`` (from :func:`load_tokenizer`) are provided the
+    prompt is trimmed to *exactly* ``num_tokens`` tokens. Otherwise it falls
+    back to :func:`_basic_prompt` (seed prefix + repeated ``"hi"``), whose
+    length is approximate. Deterministic for a given ``seed``.
+
+    Args:
+        num_tokens: Target prompt length in tokens.
+        seed: RNG seed for reproducible prompts.
+        encode: ``text -> list[int]`` tokenizer callable, or ``None``.
+        decode: ``list[int] -> str`` tokenizer callable, or ``None``.
+
+    Returns:
+        A prompt string of (exactly or approximately) ``num_tokens`` tokens.
+    """
+    if encode is None or decode is None:
+        return _basic_prompt(seed, num_tokens)
+
+    # Build random-ish text from the seed, then trim to exactly num_tokens
+    # token ids and decode. Over-generate so the first encode usually suffices.
     rng = random.Random(seed)
-    words = [
+    text = " ".join(
         "".join(rng.choices(string.ascii_lowercase, k=rng.randint(3, 8)))
-        for _ in range(num_tokens)
-    ]
-    return " ".join(words)
+        for _ in range(num_tokens * 2)
+    )
+    token_ids = encode(text)
+    while len(token_ids) < num_tokens:
+        text += " " + "".join(rng.choices(string.ascii_lowercase, k=5))
+        token_ids = encode(text)
+    return decode(token_ids[:num_tokens])
 
 
 def send_completion(url: str, model: str, prompt: str, timeout_s: float) -> float:
     """POST a single-token completion request. Returns elapsed wall-clock
     seconds (TTFT proxy: max_tokens=1, so end-to-end ≈ TTFT)."""
-    body = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": 1,
-        "temperature": 0,
-    }).encode("utf-8")
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0,
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
         f"{url}/v1/completions",
         data=body,
@@ -96,9 +171,7 @@ def print_median_summary(rows: list[dict]) -> None:
         by_len.setdefault(row["prompt_tokens"], []).append(row)
 
     print("\n=== Median TTFT (seconds) by prompt length ===", file=sys.stderr)
-    header = f"{'prompt_tokens':>14} {'n':>4} " + " ".join(
-        f"{m:>14}" for m in metrics
-    )
+    header = f"{'prompt_tokens':>14} {'n':>4} " + " ".join(f"{m:>14}" for m in metrics)
     print(header, file=sys.stderr)
     for n_tok in sorted(by_len):
         group = by_len[n_tok]
@@ -110,40 +183,68 @@ def print_median_summary(rows: list[dict]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--node-a-url", required=True,
-                   help="vLLM URL on Node A, e.g. http://10.0.0.1:8100")
-    p.add_argument("--node-b-url", required=True,
-                   help="vLLM URL on Node B, e.g. http://10.0.0.2:8200")
+    p.add_argument(
+        "--node-a-url",
+        required=True,
+        help="vLLM URL on Node A, e.g. http://10.0.0.1:8100",
+    )
+    p.add_argument(
+        "--node-b-url",
+        required=True,
+        help="vLLM URL on Node B, e.g. http://10.0.0.2:8200",
+    )
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
-    p.add_argument("--prompt-tokens", type=int, nargs="+",
-                   default=[1000, 2000, 4000, 8000],
-                   help="Approx prompt lengths to sweep.")
-    p.add_argument("--repeat", type=int, default=5,
-                   help="Trials per prompt length.")
-    p.add_argument("--label", required=True,
-                   help="Tag for the rows (e.g. cxl-static, nixl-controller).")
-    p.add_argument("--seed-base", type=int, default=0)
+    p.add_argument(
+        "--prompt-tokens",
+        type=int,
+        nargs="+",
+        default=[1000, 2000, 4000, 8000],
+        help="Approx prompt lengths to sweep.",
+    )
+    p.add_argument("--repeat", type=int, default=5, help="Trials per prompt length.")
+    p.add_argument(
+        "--label",
+        required=True,
+        help="Tag for the rows (e.g. cxl-static, nixl-controller).",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base seed for prompt generation; per-trial seeds "
+        "derive from it. Default: current timestamp (printed "
+        "to stderr so a run can be reproduced with --seed).",
+    )
     p.add_argument("--timeout-s", type=float, default=120.0)
     p.add_argument("--out", required=True, help="CSV output path.")
     args = p.parse_args()
 
+    seed_base = args.seed if args.seed is not None else int(time.time())
+    print(f"[bench_ttft] seed={seed_base}", file=sys.stderr)
+
+    # Load the model tokenizer once so prompts hit an exact token length.
+    encode, decode = load_tokenizer(args.model)
+
     rows = []
     for n_tok in args.prompt_tokens:
         for trial in range(args.repeat):
-            seed = args.seed_base + n_tok * 1000 + trial
-            prompt = make_prompt(n_tok, seed)
+            seed = seed_base + n_tok * 1000 + trial
+            prompt = make_prompt(n_tok, seed, encode, decode)
 
             # Warmup on A — discard.
             send_completion(args.node_a_url, args.model, prompt, args.timeout_s)
             # Measured request on A — local cache (warm).
             t_a_local = send_completion(
-                args.node_a_url, args.model, prompt, args.timeout_s)
+                args.node_a_url, args.model, prompt, args.timeout_s
+            )
             # First request on B — triggers cross-node fetch.
             t_b_cold = send_completion(
-                args.node_b_url, args.model, prompt, args.timeout_s)
+                args.node_b_url, args.model, prompt, args.timeout_s
+            )
             # Second request on B — post-fetch hit.
             t_b_warm = send_completion(
-                args.node_b_url, args.model, prompt, args.timeout_s)
+                args.node_b_url, args.model, prompt, args.timeout_s
+            )
 
             row = {
                 "label": args.label,
