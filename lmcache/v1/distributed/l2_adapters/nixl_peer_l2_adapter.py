@@ -291,26 +291,45 @@ class _NixlReadChannel:
             The number of chunks transferred.
 
         Raises:
-            ValueError: If a local buffer is not page-aligned.
+            ValueError: If a local buffer is not page-aligned or its size
+                is not a whole number of NIXL pages.
             RuntimeError: If the NIXL transfer reports an error.
         """
         agent = self._channel.nixl_agent
+        # The NIXL xfer dlist has one descriptor per ``page_size`` bytes of
+        # the registered L1 buffer (page_size = l1 align_bytes, e.g. 4 KiB).
+        # A KV chunk is much larger (e.g. 32 MiB = pages_per_chunk pages), so
+        # each chunk spans MANY consecutive descriptors. We must expand each
+        # chunk's base index into all ``pages_per_chunk`` descriptor indices
+        # — both local and remote, paired in order — or NIXL transfers only
+        # the first page of each chunk (the bug that made a 3.3 GB READ
+        # "complete" in ~1.6 ms with corrupt tails).
         local_indices: list[int] = []
-        for buf in buffers:
+        remote_indices: list[int] = []
+        for buf, remote_base in zip(buffers, remote_page_indices, strict=True):
             addr = buf.meta.address
             if addr % self._page_size != 0:
                 raise ValueError(
                     f"local L1 address {addr} not aligned to page_size "
                     f"{self._page_size}"
                 )
-            local_indices.append(addr // self._page_size)
+            size = buf.get_size()
+            if size % self._page_size != 0:
+                raise ValueError(
+                    f"chunk size {size} not a multiple of page_size {self._page_size}"
+                )
+            pages_per_chunk = size // self._page_size
+            local_base = addr // self._page_size
+            for p in range(pages_per_chunk):
+                local_indices.append(local_base + p)
+                remote_indices.append(remote_base + p)
 
         handle = agent.make_prepped_xfer(
             "READ",
             self._channel.nixl_wrapper.xfer_handler,
             local_indices,
             self._channel.remote_xfer_handlers_dict[peer_id],
-            list(remote_page_indices),
+            remote_indices,
         )
         agent.transfer(handle)
         while True:
@@ -1075,13 +1094,38 @@ def build_nixl_peer_adapter_from_config(
     )
     from lmcache.v1.transfer_channel.nixl_channel import NixlChannel
 
+    # NIXL descriptor (transfer-op) size. The one-sided READ moves one
+    # descriptor per RDMA op, so this sets the op size. We register at 2 MiB
+    # rather than the L1 allocator's small align_bytes (e.g. 4 KiB): a KV
+    # chunk then spans only chunk_bytes/2MiB descriptors (e.g. 16 for a
+    # 32 MiB chunk) instead of thousands, so each transfer is a handful of
+    # large RDMA ops at ~line rate, and the per-chunk index expansion in
+    # _NixlReadChannel stays tiny (no million-element Python list). 2 MiB is
+    # the x86 hugepage size and divides typical KV chunk sizes.
+    #
+    # CRITICAL: this page size is part of the cross-node wire contract — the
+    # donor returns ``meta.address // page_size`` as a chunk's base index and
+    # the requester expands by ``chunk_bytes // page_size``. Both nodes must
+    # use the SAME value or the index arithmetic desyncs and corrupts KV. It
+    # is a fixed constant (not derived from per-node state) precisely so all
+    # nodes agree. We require the L1 buffer to tile evenly at 2 MiB and fail
+    # loudly otherwise rather than silently picking a different (desyncing)
+    # size on one node.
+    nixl_page_bytes = 2 * 1024 * 1024
+    if l1_memory_desc.size % nixl_page_bytes != 0:
+        raise ValueError(
+            f"nixl_peer requires the L1 buffer size ({l1_memory_desc.size}) to "
+            f"be a multiple of the {nixl_page_bytes}-byte NIXL descriptor size. "
+            f"Adjust --l1-size-gb so the buffer tiles evenly at 2 MiB."
+        )
+
     channel = NixlChannel(
         async_mode=False,
         device=config.device,
         role="both",
         buffer_ptr=l1_memory_desc.ptr,
         buffer_size=l1_memory_desc.size,
-        align_bytes=l1_memory_desc.align_bytes,
+        align_bytes=nixl_page_bytes,
         tp_rank=config.local_worker_id,
         # NixlChannel prepends tcp:// itself, so pass a bare host:port.
         peer_init_url=_strip_tcp_scheme(config.init_bind_url),
@@ -1094,10 +1138,12 @@ def build_nixl_peer_adapter_from_config(
     our_peer_id = channel.nixl_agent.name
 
     # A MemoryObj.meta.address is a byte offset into the registered L1
-    # buffer; the one-sided READ is addressed by descriptor index (one
-    # per align_bytes). The donor converts offset -> index; the read
-    # channel converts the local buffers the same way.
-    page_size = l1_memory_desc.align_bytes
+    # buffer; the one-sided READ is addressed by descriptor index (one per
+    # nixl_page_bytes). The donor converts offset -> base index and the read
+    # channel expands each chunk into its chunk_bytes/nixl_page_bytes
+    # consecutive descriptors. Both MUST use the SAME page size or the index
+    # arithmetic desyncs, so they share nixl_page_bytes here.
+    page_size = nixl_page_bytes
     read_channel = _NixlReadChannel(channel, page_size=page_size)
 
     donor = NixlPeerDonor(

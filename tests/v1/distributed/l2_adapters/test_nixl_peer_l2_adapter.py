@@ -44,6 +44,7 @@ from lmcache.v1.distributed.l2_adapters.nixl_peer_donor import (
 from lmcache.v1.distributed.l2_adapters.nixl_peer_l2_adapter import (
     NixlPeerL2Adapter,
     NixlPeerL2AdapterConfig,
+    _NixlReadChannel,
     _Peer,
     _strip_tcp_scheme,
 )
@@ -803,3 +804,97 @@ def test_adapter_no_peers_returns_all_miss():
         assert bitmap.popcount() == 0
     finally:
         adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# _NixlReadChannel descriptor-index expansion (the chunk-vs-page granularity
+# that previously transferred only the first page of each chunk)
+# ---------------------------------------------------------------------------
+
+
+class _FakeNixlAgent:
+    """Captures the indices passed to make_prepped_xfer; reports DONE."""
+
+    def __init__(self):
+        self.local_indices = None
+        self.remote_indices = None
+
+    def make_prepped_xfer(
+        self, op, local_handler, local_indices, remote_handler, remote_indices
+    ):
+        self.local_indices = list(local_indices)
+        self.remote_indices = list(remote_indices)
+        return "handle"
+
+    def transfer(self, handle):
+        return "DONE"
+
+    def check_xfer_state(self, handle):
+        return "DONE"
+
+
+class _FakeNixlWrapper:
+    xfer_handler = "local_handler"
+
+
+class _FakeChannelForRead:
+    """Minimal channel exposing what _NixlReadChannel.read_chunks touches."""
+
+    def __init__(self):
+        self.nixl_agent = _FakeNixlAgent()
+        self.nixl_wrapper = _FakeNixlWrapper()
+        self.remote_xfer_handlers_dict = {"node-1": "remote_handler"}
+
+
+class _FakeBuf:
+    """MemoryObj stand-in: only meta.address and get_size() are used."""
+
+    def __init__(self, address: int, size: int):
+        self.meta = type("M", (), {"address": address})()
+        self._size = size
+
+    def get_size(self) -> int:
+        return self._size
+
+
+def test_read_chunks_expands_chunk_into_all_descriptors():
+    # A chunk that spans multiple NIXL descriptors must expand into ALL of
+    # its consecutive descriptor indices (local + remote, paired) — not one
+    # per chunk. This is the regression guard for the bug where only the
+    # first page of each chunk transferred.
+    page = 2 * 1024 * 1024  # 2 MiB descriptor
+    chunk = 32 * 1024 * 1024  # 32 MiB chunk -> 16 descriptors
+    pages_per_chunk = chunk // page
+
+    fake = _FakeChannelForRead()
+    rc = _NixlReadChannel(fake, page_size=page)
+
+    # Two chunks at byte offsets 0 and 32 MiB; remote bases 0 and 16.
+    buffers = [_FakeBuf(0, chunk), _FakeBuf(chunk, chunk)]
+    remote_bases = [0, pages_per_chunk]  # donor returns base = addr // page
+
+    rc.read_chunks(buffers, remote_bases, "node-1")
+
+    agent = fake.nixl_agent
+    # Each chunk -> pages_per_chunk consecutive indices.
+    assert agent.local_indices == (
+        list(range(0, pages_per_chunk))
+        + list(range(pages_per_chunk, 2 * pages_per_chunk))
+    )
+    # Remote bases expand the same way and stay paired with local.
+    assert agent.remote_indices == agent.local_indices
+    assert len(agent.local_indices) == 2 * pages_per_chunk
+
+
+def test_read_chunks_rejects_misaligned_address():
+    page = 2 * 1024 * 1024
+    rc = _NixlReadChannel(_FakeChannelForRead(), page_size=page)
+    with pytest.raises(ValueError):
+        rc.read_chunks([_FakeBuf(page + 1, page)], [0], "node-1")
+
+
+def test_read_chunks_rejects_non_multiple_size():
+    page = 2 * 1024 * 1024
+    rc = _NixlReadChannel(_FakeChannelForRead(), page_size=page)
+    with pytest.raises(ValueError):
+        rc.read_chunks([_FakeBuf(0, page + 1)], [0], "node-1")
