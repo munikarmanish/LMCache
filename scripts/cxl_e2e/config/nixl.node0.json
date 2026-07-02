@@ -5,8 +5,8 @@
   "peers": [
     {
       "node_id": 1,
-      "control_url": "tcp://NODE_B_HOST:8500",
-      "init_url": "NODE_B_HOST:8501"
+      "control_url": "tcp://NODE1_HOST:8500",
+      "init_url": "NODE1_HOST:8501"
     }
   ]
 }

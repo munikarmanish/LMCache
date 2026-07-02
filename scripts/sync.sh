@@ -36,7 +36,6 @@ echo "Syncing ${SOURCE_DIR}/ -> ${USER}@${HOST}:${TARGET}/"
 ssh "${USER}@${HOST}" "mkdir -p ${TARGET}"
 
 rsync -avz --delete \
-    --exclude='.git/' \
     --exclude='__pycache__/' \
     --exclude='*.py[cod]' \
     --exclude='*.so' \

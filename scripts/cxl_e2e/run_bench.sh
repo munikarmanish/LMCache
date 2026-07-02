@@ -20,11 +20,15 @@ if [[ -n "$SEED" ]]; then
     SEED_ARG=(--seed "$SEED")
 fi
 
+# Result CSVs live under results/.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$HERE/results"
+
 python bench_ttft.py \
-        --node-a-url "http://${HOST_A}:8010" \
-        --node-b-url "http://${HOST_B}:8010" \
-        --prompt-tokens 1000 3000 9000 27000 \
-        --repeat 5 \
-        --label "$LABEL" \
-        "${SEED_ARG[@]}" \
-        --out "results-$LABEL.csv"
+    --node-a-url "http://${HOST_A}:8010" \
+    --node-b-url "http://${HOST_B}:8010" \
+    --prompt-tokens 1000 3000 9000 27000 \
+    --repeat 3 \
+    --label "$LABEL" \
+    "${SEED_ARG[@]}" \
+    --out "$HERE/results/results-$LABEL.csv"

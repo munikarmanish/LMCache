@@ -9,7 +9,7 @@ Usage:
         --prompt-tokens 1000 2000 4000 8000 \
         --repeat 5 \
         --label cxl-static \
-        --out results-cxl.csv
+        --out results/results-cxl.csv
 
 Run once per arm (CXL, NIXL), pointing at the respective vLLM ports.
 Pass `--label` to tag the rows so you can concat the CSVs later.
