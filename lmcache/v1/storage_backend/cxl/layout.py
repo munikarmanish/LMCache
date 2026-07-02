@@ -61,6 +61,15 @@ DEFAULT_MAX_NODES = 64
 DEFAULT_REGION_SIZE = 256 * 1024 * 1024  # 256 MiB
 DEFAULT_INDEX_LOAD_FACTOR = 0.5  # index_slot_count >= chunks / load_factor
 
+# Assumed smallest chunk a region can hold, used only to estimate the
+# default ``index_slot_count`` when the caller does not pass one. The
+# layout planner does not know the real chunk size, so it bounds the
+# peak chunk count by ``capacity / DEFAULT_MIN_CHUNK_SIZE``. Set to 2 MiB:
+# KV chunks in practice are far larger (tens of MiB), so this keeps the
+# index comfortably sized without over-provisioning by orders of magnitude
+# (the previous 4 KiB assumption inflated the index ~500x).
+DEFAULT_MIN_CHUNK_SIZE = 2 * 1024 * 1024  # 2 MiB
+
 GEOM_HASH_SIZE = 16
 
 
@@ -289,13 +298,17 @@ class PoolLayout:
         region_count = int(max_region_count_by_cap)
         for _ in range(4):
             if index_slot_count is None:
-                # Sized per plan: ~2x peak chunks. Peak chunks is bounded
-                # by total capacity / min-chunk-size, but we don't know
-                # chunk size at the layout level. Use a capacity-based
-                # heuristic: one slot per 4 KiB of region capacity,
-                # capped. Callers can override.
+                # We don't know the real chunk size at the layout level,
+                # so bound the peak chunk count by assuming the smallest
+                # chunk a region could hold (DEFAULT_MIN_CHUNK_SIZE): one
+                # slot per that many bytes of region capacity, floored at
+                # 1024. Real chunks are larger, so this over-provisions a
+                # little but no longer by orders of magnitude. Callers that
+                # know the chunk size should pass index_slot_count.
                 capacity = region_count * region_size
-                index_slot_count_local = max(1024, capacity // 4096)
+                index_slot_count_local = max(
+                    1024, capacity // DEFAULT_MIN_CHUNK_SIZE
+                )
             else:
                 index_slot_count_local = index_slot_count
 

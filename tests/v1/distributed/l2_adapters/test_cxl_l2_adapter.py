@@ -190,7 +190,10 @@ def test_store_then_lookup_then_load_round_trip(adapter):
     _wait_efd(adapter.get_store_event_fd())
     store_results = adapter.pop_completed_store_tasks()
     assert store_id in store_results
-    assert store_results[store_id] is True
+    assert store_results[store_id].is_successful()
+    assert store_results[store_id].bytes_transferred() == sum(
+        p.get_size() for p in payloads
+    )
 
     # Lookup-and-lock — bitmap should be all 1s.
     lookup_id = adapter.submit_lookup_and_lock_task(keys)

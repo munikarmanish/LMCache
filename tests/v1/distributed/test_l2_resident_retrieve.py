@@ -346,6 +346,33 @@ class TestResidentAdapterPrimitives:
             adapter.submit_h2d(make_object_key(0), 0, 0)
         adapter.close()
 
+    def test_submit_h2d_batch_matches_per_key(self):
+        # The batched path (default loop over submit_h2d) must produce the
+        # same tokens, one per key, with misses as -1 — and record one
+        # submit_h2d call per chunk.
+        adapter = make_resident_adapter()
+        layout = make_layout()
+        hit_keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, hit_keys, layout)
+        miss = make_object_key(99)
+        keys = [hit_keys[0], miss, hit_keys[1], hit_keys[2]]
+
+        tokens = adapter.submit_h2d_batch(keys, [0, 0, 0, 0], [0, 0, 0, 0])
+        assert len(tokens) == len(keys)
+        assert tokens[1] == -1  # the miss
+        assert all(t >= 0 for t in (tokens[0], tokens[2], tokens[3]))
+        assert len(adapter.submit_h2d_calls) == 4
+
+        adapter.release_after_h2d_batch(tokens)
+        assert sorted(adapter.release_tokens) == sorted(t for t in tokens if t >= 0)
+        adapter.close()
+
+    def test_submit_h2d_batch_rejects_unequal_lengths(self):
+        adapter = make_resident_adapter()
+        with pytest.raises(ValueError):
+            adapter.submit_h2d_batch([make_object_key(0)], [0, 0], [0])
+        adapter.close()
+
 
 # =============================================================================
 # MLA multi-reader: pin counter held N times, released N times

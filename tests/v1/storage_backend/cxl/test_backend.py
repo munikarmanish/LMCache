@@ -244,18 +244,14 @@ def test_held_memoryobj_blocks_evict_until_released(backend):
 
 def test_batched_async_contains_matches_sync(backend):
     keys = [_make_key(0xB000 + i) for i in range(3)]
-    backend.batched_submit_put_task(
-        keys[:2], [_make_source_obj(512) for _ in range(2)]
-    )
+    backend.batched_submit_put_task(keys[:2], [_make_source_obj(512) for _ in range(2)])
     hit = asyncio.run(backend.batched_async_contains("lookup-1", keys))
     assert hit == 2
 
 
 def test_batched_get_non_blocking_returns_hit_prefix(backend):
     keys = [_make_key(0xC000 + i) for i in range(4)]
-    backend.batched_submit_put_task(
-        keys[:3], [_make_source_obj(512) for _ in range(3)]
-    )
+    backend.batched_submit_put_task(keys[:3], [_make_source_obj(512) for _ in range(3)])
     got = asyncio.run(backend.batched_get_non_blocking("lookup-2", keys))
     assert len(got) == 3
     for obj in got:
@@ -272,10 +268,7 @@ def test_allocate_returns_memoryobj_within_chunk_size(backend):
     assert obj.get_size() == 1024
     # Address is in the CXL pool.
     assert obj.meta.address >= backend._pool.base + backend._pool.layout.off_regions
-    assert (
-        obj.meta.address + obj.get_size()
-        <= backend._pool.base + backend._pool.size
-    )
+    assert obj.meta.address + obj.get_size() <= backend._pool.base + backend._pool.size
     obj.ref_count_down()
 
 
@@ -345,3 +338,69 @@ def test_backend_close_cleans_up(backend):
     # placeholder ensures at least one test exercises close() without
     # prior put activity.
     assert backend._pool is not None
+
+
+# ---------- batched pin / unpin ----------
+
+
+def _pin_count(backend, key):
+    """Read the on-CXL pin_count for ``key`` (-1 if no VALID slot)."""
+    view = backend._index.lookup(key)
+    if view is None:
+        return -1
+    return int(backend._pool.slots()[view.slot_idx].line1.pin_count)
+
+
+def test_pin_batch_pins_only_present_keys(backend):
+    """pin_batch returns per-key success and pins exactly the VALID slots."""
+    present = [_make_key(0x6100 + i) for i in range(3)]
+    for k in present:
+        backend.batched_submit_put_task([k], [_make_source_obj(512)])
+    missing = _make_key(0x61FF)
+
+    # Interleave a missing key in the middle.
+    keys = [present[0], missing, present[1], present[2]]
+    results = backend.pin_batch(keys)
+    assert results == [True, False, True, True]
+    assert _pin_count(backend, present[0]) == 1
+    assert _pin_count(backend, present[1]) == 1
+    assert _pin_count(backend, present[2]) == 1
+    assert _pin_count(backend, missing) == -1
+
+
+def test_pin_batch_then_unpin_batch_round_trip(backend):
+    """unpin_batch reverses pin_batch; the slot is reclaimable afterward."""
+    keys = [_make_key(0x6200 + i) for i in range(4)]
+    for k in keys:
+        backend.batched_submit_put_task([k], [_make_source_obj(256)])
+
+    backend.pin_batch(keys)
+    for k in keys:
+        assert _pin_count(backend, k) == 1
+        # Pinned slots refuse eviction.
+        assert not backend.remove(k)
+
+    results = backend.unpin_batch(keys)
+    assert results == [True, True, True, True]
+    for k in keys:
+        assert _pin_count(backend, k) == 0
+        # Now reclaimable.
+        assert backend.remove(k)
+
+
+def test_pin_batch_duplicate_keys_bump_twice(backend):
+    """A key appearing twice in pin_batch is pinned twice (one per slot)."""
+    key = _make_key(0x6300)
+    backend.batched_submit_put_task([key], [_make_source_obj(256)])
+
+    results = backend.pin_batch([key, key])
+    assert results == [True, True]
+    assert _pin_count(backend, key) == 2
+
+    backend.unpin_batch([key, key])
+    assert _pin_count(backend, key) == 0
+
+
+def test_pin_batch_empty_is_noop(backend):
+    assert backend.pin_batch([]) == []
+    assert backend.unpin_batch([]) == []

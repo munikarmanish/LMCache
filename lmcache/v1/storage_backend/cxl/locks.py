@@ -34,7 +34,7 @@ import ctypes
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 # First Party
 from lmcache.logging import init_logger
@@ -95,9 +95,7 @@ class TwoTierLock:
         num_locks = handle.layout.num_locks
         max_nodes = handle.layout.max_nodes
         if not 0 <= node_id < max_nodes:
-            raise ValueError(
-                f"node_id {node_id} out of range [0, {max_nodes})"
-            )
+            raise ValueError(f"node_id {node_id} out of range [0, {max_nodes})")
 
         self._handle = handle
         self._node_id = node_id
@@ -152,6 +150,68 @@ class TwoTierLock:
         finally:
             local_mutex.release()
 
+    @contextlib.contextmanager
+    def acquire_batch(self, lock_ids: "Iterable[int]") -> Iterator[None]:
+        """Acquire many locks together in a single arbiter sweep.
+
+        The serial pattern ``for id in ids: with acquire(id): ...`` pays one
+        arbiter round-trip (~one sweep) *per* lock, because each ``acquire``
+        publishes WAITING and then blocks before the next one is even
+        requested. This batches the three phases so all locks are pending at
+        once:
+
+        1. Take every distinct lock's local mutex in ascending ``lock_id``
+           order (a global order, so two concurrent batch callers cannot
+           deadlock).
+        2. Publish WAITING to all rows — cheap CXL stores, no waiting.
+        3. Spin until *every* row is granted LOCKED. Because distinct
+           ``lock_id``s are arbitrated independently within one
+           ``sweep_once``, the manager grants the whole batch in ~one sweep
+           rather than N.
+
+        On exit (including exceptions) all rows are dropped to IDLE and the
+        local mutexes released in reverse order.
+
+        Duplicate ``lock_id``s are de-duplicated: the caller holds each
+        distinct lock once and runs all of its critical-section work under
+        that single hold. An empty ``lock_ids`` is a valid no-op.
+
+        Args:
+            lock_ids: The lock ids to acquire together (duplicates allowed).
+
+        Yields:
+            None — with all requested locks held.
+        """
+        # Dedup + sort for a deadlock-free global acquisition order.
+        ordered = sorted(set(lock_ids))
+        for lock_id in ordered:
+            self._check_lock_id(lock_id)
+
+        acquired_mutexes: list[int] = []
+        published: list[int] = []
+        try:
+            # Phase 1: take all local mutexes in ascending order.
+            for lock_id in ordered:
+                self._local_mutexes[lock_id].acquire()
+                acquired_mutexes.append(lock_id)
+
+            # Phase 2: publish WAITING to every row (no blocking).
+            for lock_id in ordered:
+                self._publish_waiting(lock_id)
+                published.append(lock_id)
+
+            # Phase 3: spin until all rows are LOCKED (≈ one arbiter sweep).
+            self._wait_for_locked_batch(ordered)
+
+            yield
+        finally:
+            # Drop every published row back to IDLE, then release mutexes
+            # in reverse acquisition order.
+            for lock_id in published:
+                self._publish_idle(lock_id)
+            for lock_id in reversed(acquired_mutexes):
+                self._local_mutexes[lock_id].release()
+
     def try_acquire(self, lock_id: int, timeout_s: float) -> Optional["_Held"]:
         """Non-blocking / bounded-wait variant. Returns None on timeout.
 
@@ -188,9 +248,7 @@ class TwoTierLock:
 
     def _check_lock_id(self, lock_id: int) -> None:
         if not 0 <= lock_id < self._num_locks:
-            raise ValueError(
-                f"lock_id {lock_id} out of range [0, {self._num_locks})"
-            )
+            raise ValueError(f"lock_id {lock_id} out of range [0, {self._num_locks})")
 
     # -------- transitions ------------------------------------------------
 
@@ -242,6 +300,41 @@ class TwoTierLock:
                 raise LockAcquisitionTimeout(
                     f"lock_id {lock_id} not granted within {timeout_s}s; "
                     "lock-manager may be stalled or dead"
+                )
+
+    def _wait_for_locked_batch(self, lock_ids: "list[int]") -> None:
+        """Spin until every row in ``lock_ids`` is granted LOCKED.
+
+        Tracks the still-pending set and rechecks only those each pass, so
+        the batch completes as soon as the last grant lands (typically within
+        one arbiter sweep, since distinct lock_ids are granted in the same
+        sweep). Uses the same global ``acquire_timeout_s`` as the single-lock
+        path; on timeout the caller's ``finally`` drops any rows already
+        published to IDLE.
+
+        Args:
+            lock_ids: Distinct, sorted lock ids whose rows to await.
+
+        Raises:
+            LockAcquisitionTimeout: If any row is not granted in time.
+        """
+        timeout_s = self._config.acquire_timeout_s
+        deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+        pending = list(lock_ids)
+        while pending:
+            still_pending: list[int] = []
+            for lock_id in pending:
+                row_addr = self._row_address(lock_id, self._node_id)
+                self._fence.flush_before_read(row_addr, self._lock_slot_size)
+                if self._row(lock_id, self._node_id).state != LOCK_STATE_LOCKED:
+                    still_pending.append(lock_id)
+            if not still_pending:
+                return
+            pending = still_pending
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LockAcquisitionTimeout(
+                    f"batch lock_ids {pending} not all granted within "
+                    f"{timeout_s}s; lock-manager may be stalled or dead"
                 )
 
 

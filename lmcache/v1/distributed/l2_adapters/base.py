@@ -400,6 +400,50 @@ class L2AdapterInterface(ABC):
             f"{type(self).__name__} does not support l2-resident retrieve"
         )
 
+    def submit_h2d_batch(
+        self,
+        keys: list[ObjectKey],
+        gpu_ptrs: list[int],
+        dst_sizes: list[int],
+    ) -> list[int]:
+        """Queue async H2D copies for a batch of keys in one call.
+
+        The batched analogue of :meth:`submit_h2d`: one entry per key,
+        parallel lists. Same preconditions and stream semantics as
+        ``submit_h2d`` (caller is on the desired CUDA stream; pins from
+        ``lookup_and_lock`` are held; no synchronization here).
+
+        The default implementation loops over ``submit_h2d`` so adapters
+        that don't override it keep working. Adapters that can resolve and
+        enqueue the whole batch with less per-chunk overhead (e.g. CXL,
+        which does N chunk-index lookups + N ``cudaMemcpyAsync`` launches)
+        should override this to collapse the Python/lock round-trips into
+        one.
+
+        Args:
+            keys: The object keys whose chunks to copy.
+            gpu_ptrs: Destination device pointer per key.
+            dst_sizes: Destination capacity in bytes per key.
+
+        Returns:
+            One token per key, in input order — a non-negative token to
+            pass to ``release_after_h2d`` / ``release_after_h2d_batch`` on
+            hit, or ``-1`` on miss.
+
+        Raises:
+            NotImplementedError: If the adapter does not support
+                L2-resident retrieve.
+            ValueError: If the three lists do not have equal length.
+        """
+        if not (len(keys) == len(gpu_ptrs) == len(dst_sizes)):
+            raise ValueError(
+                "submit_h2d_batch: keys, gpu_ptrs and dst_sizes must have equal length"
+            )
+        return [
+            self.submit_h2d(key, gpu_ptr, dst_size)
+            for key, gpu_ptr, dst_size in zip(keys, gpu_ptrs, dst_sizes, strict=True)
+        ]
+
     def release_after_h2d(self, token: int) -> None:
         """Drop the pin for a chunk whose H2D was issued via ``submit_h2d``.
 

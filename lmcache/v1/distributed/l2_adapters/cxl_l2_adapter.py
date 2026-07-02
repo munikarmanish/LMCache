@@ -41,6 +41,7 @@ from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
@@ -51,6 +52,7 @@ from lmcache.v1.distributed.l2_adapters.factory import (
 )
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mp_observability.profile import PROFILE_ENABLED
 from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
 
 logger = init_logger(__name__)
@@ -150,9 +152,7 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             if not isinstance(p, dict):
                 raise ValueError(f"peers[{i}] must be a dict")
             if not isinstance(p.get("node_id"), int) or p["node_id"] < 0:
-                raise ValueError(
-                    f"peers[{i}].node_id must be a non-negative int"
-                )
+                raise ValueError(f"peers[{i}].node_id must be a non-negative int")
             if p["node_id"] == node_id:
                 raise ValueError(
                     f"peers[{i}].node_id ({node_id}) must differ from this "
@@ -348,7 +348,7 @@ class CXLL2Adapter(L2AdapterInterface):
         # Task bookkeeping.
         self._lock = threading.Lock()
         self._next_task_id: L2TaskId = 0
-        self._completed_store: dict[L2TaskId, bool] = {}
+        self._completed_store: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup: dict[L2TaskId, Bitmap] = {}
         self._completed_load: dict[L2TaskId, Bitmap] = {}
 
@@ -406,19 +406,19 @@ class CXLL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
     ) -> None:
         success = True
+        bytes_transferred = 0
         try:
-            ce_keys = [
-                _object_key_to_cache_engine_key(k, self._metadata) for k in keys
-            ]
+            ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
             self._backend.batched_submit_put_task(ce_keys, list(objects))
+            bytes_transferred = sum(obj.get_size() for obj in objects)
         except Exception:
             logger.exception("CXL L2 store task %d failed", task_id)
             success = False
         with self._lock:
-            self._completed_store[task_id] = success
+            self._completed_store[task_id] = L2StoreResult(success, bytes_transferred)
         os.eventfd_write(self._store_efd, 1)
 
-    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         with self._lock:
             done = self._completed_store
             self._completed_store = {}
@@ -435,39 +435,66 @@ class CXLL2Adapter(L2AdapterInterface):
         return task_id
 
     def _do_lookup(self, keys: list[ObjectKey], task_id: L2TaskId) -> None:
-        ce_keys = [
-            _object_key_to_cache_engine_key(k, self._metadata) for k in keys
-        ]
+        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
         bitmap = Bitmap(len(keys))
 
-        # First pass: pure CXL hits.
+        prof = PROFILE_ENABLED
+        t_local0 = time.perf_counter() if prof else 0.0
+
+        # First pass: pure CXL hits. Pin all keys in one batched lock
+        # acquisition (≈ one arbiter sweep) instead of one sweep per key —
+        # this is the dominant warm-lookup cost at long prompts. A pin
+        # succeeds only for a currently-VALID slot, so the True positions are
+        # exactly the local CXL hits; the rest are misses to fetch remotely.
+        pinned = self._backend.pin_batch(ce_keys)
         miss_indices: list[int] = []
-        for i, ce_key in enumerate(ce_keys):
-            # `pin=True` increments slot pin_count, which is what
-            # "lock" semantically means here: while pinned, the slot
-            # cannot be evicted regardless of who calls remove().
-            if self._backend.contains(ce_key, pin=True):
+        for i, ok in enumerate(pinned):
+            if ok:
                 bitmap.set(i)
             else:
                 miss_indices.append(i)
+
+        local_pin_s = (time.perf_counter() - t_local0) if prof else 0.0
+        n_miss = len(miss_indices)
+        remote_breakdown: dict[str, float] = {}
 
         # Second pass (Alternative A — static peers, no controller):
         # For each contiguous run of misses, ask each known peer in
         # turn via PushKVToCXL. After a successful donor commit, retry
         # contains(pin=True) so the bitmap reflects the new hits.
         if miss_indices and self._peer_clients:
-            self._try_remote_fetch_misses(ce_keys, miss_indices, bitmap)
+            remote_breakdown = self._try_remote_fetch_misses(
+                ce_keys, miss_indices, bitmap
+            )
 
         with self._lock:
             self._completed_lookup[task_id] = bitmap
         os.eventfd_write(self._lookup_efd, 1)
+
+        if prof:
+            # Compact sub-breakdown of the L2 lookup/pin (``l2lk``) span,
+            # measured on the adapter loop. ``local_pin`` is the local CXL
+            # hit-scan + pin; ``reserve``/``rpc``/``repin`` are the cross-node
+            # cold-fetch parts (per-key slot reservation, the one batched
+            # donor RPC round-trip, and re-pinning satisfied keys). All in ms.
+            # Correlate with the main PROFILE line by n (chunk count).
+            logger.info(
+                "PROFILE-L2LK n=%d miss=%d local_pin=%.1f reserve=%.1f "
+                "rpc=%.1f repin=%.1f",
+                len(keys),
+                n_miss,
+                local_pin_s * 1000.0,
+                remote_breakdown.get("reserve", 0.0) * 1000.0,
+                remote_breakdown.get("rpc", 0.0) * 1000.0,
+                remote_breakdown.get("repin", 0.0) * 1000.0,
+            )
 
     def _try_remote_fetch_misses(
         self,
         ce_keys: list,
         miss_indices: list[int],
         bitmap: Bitmap,
-    ) -> None:
+    ) -> dict[str, float]:
         """Attempt to fetch missed chunks from each peer in turn.
 
         We hand the donor the *contiguous prefix of misses starting from
@@ -478,6 +505,10 @@ class CXLL2Adapter(L2AdapterInterface):
 
         This is intentionally simple: O(peers * misses) in the worst
         case. With 2 nodes it's just "ask the other one once."
+
+        Returns:
+            A ``{stage: seconds}`` profiling breakdown (``reserve``, ``rpc``,
+            ``repin``) when ``LMC_PROFILE`` is set, else an empty dict.
         """
         # First Party
         from lmcache.v1.storage_backend.cxl.cross_node import remote_fetch
@@ -492,6 +523,10 @@ class CXLL2Adapter(L2AdapterInterface):
         epoch = int(self._backend._pool.header.gen)
         sender_id = f"node-{self._backend._node_id}"
 
+        # Accumulated across all peers tried: remote_fetch fills reserve/rpc;
+        # the re-pin loop below adds repin. Empty (and unused) unless profiling.
+        timings: dict[str, float] = {} if PROFILE_ENABLED else None  # type: ignore[assignment]
+
         for donor_node_id, client in self._peer_clients:
             try:
                 result = remote_fetch(
@@ -502,6 +537,7 @@ class CXLL2Adapter(L2AdapterInterface):
                     donor=client,
                     sender_id=sender_id,
                     epoch=epoch,
+                    timings=timings,
                 )
             except Exception:
                 logger.exception(
@@ -513,11 +549,34 @@ class CXLL2Adapter(L2AdapterInterface):
             if num <= 0:
                 continue
 
-            # Re-pin and flip bitmap bits for the satisfied prefix.
+            # Settle the satisfied prefix into the bitmap + local slot cache.
+            # Freshly-committed slots are born-pinned by the donor (the pin is
+            # already held on our behalf), so we only verify+cache them
+            # (pin=False) and skip the redundant per-chunk pin round-trip on
+            # the arbiter. ALREADY_PRESENT slots were not committed by this
+            # fetch, so they still need a pin.
+            t_repin0 = time.perf_counter() if PROFILE_ENABLED else 0.0
             satisfied_indices = miss_indices[:num]
+            born_pinned = result.born_pinned
             for j, idx in enumerate(satisfied_indices):
-                if self._backend.contains(miss_keys[j], pin=True):
+                already_pinned = j < len(born_pinned) and born_pinned[j]
+                if self._backend.contains(miss_keys[j], pin=not already_pinned):
                     bitmap.set(idx)
+                elif already_pinned:
+                    # The donor born-pinned this slot but it is no longer
+                    # VALID (evicted between commit and our verify — pin should
+                    # have prevented this, but guard against a protocol race).
+                    # Drop the orphaned pin so it doesn't leak.
+                    logger.warning(
+                        "born-pinned slot for key %s not VALID at verify; "
+                        "releasing orphaned pin",
+                        miss_keys[j],
+                    )
+                    self._backend.unpin(miss_keys[j])
+            if timings is not None:
+                timings["repin"] = timings.get("repin", 0.0) + (
+                    time.perf_counter() - t_repin0
+                )
 
             logger.info(
                 "remote_fetch from node %d satisfied %d/%d keys (status=%s)",
@@ -530,12 +589,14 @@ class CXLL2Adapter(L2AdapterInterface):
             # If the donor returned PARTIAL, the tail might be at
             # another peer — keep trying.
             if result.status == PushStatus.OK:
-                return
+                return timings or {}
             # Otherwise, attempt remaining tail with next peer.
             miss_indices = miss_indices[num:]
             miss_keys = miss_keys[num:]
             if not miss_keys:
-                return
+                return timings or {}
+
+        return timings or {}
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Optional[Bitmap]:
         with self._lock:
@@ -547,12 +608,13 @@ class CXLL2Adapter(L2AdapterInterface):
         self._loop.call_soon_threadsafe(self._do_unlock, list(keys))
 
     def _do_unlock(self, keys: list[ObjectKey]) -> None:
-        for key in keys:
-            ce_key = _object_key_to_cache_engine_key(key, self._metadata)
-            try:
-                self._backend.unpin(ce_key)
-            except Exception:
-                logger.exception("CXL L2 unpin failed for %s", ce_key)
+        # Unpin all keys in one batched lock acquisition (≈ one arbiter
+        # sweep) instead of one sweep per key.
+        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
+        try:
+            self._backend.unpin_batch(ce_keys)
+        except Exception:
+            logger.exception("CXL L2 batched unpin failed for %d keys", len(ce_keys))
 
     # ---------------- l2-resident retrieve (GPU-direct) ----------------
 
@@ -609,6 +671,89 @@ class CXLL2Adapter(L2AdapterInterface):
             self._h2d_token_to_key[token] = ce_key
         return token
 
+    def submit_h2d_batch(
+        self,
+        keys: list[ObjectKey],
+        gpu_ptrs: list[int],
+        dst_sizes: list[int],
+    ) -> list[int]:
+        """Issue H2D copies for a whole batch of CXL chunks in one call.
+
+        Collapses the per-chunk Python/lock round-trips that dominate the
+        L2-resident retrieve at long prompts: all chunk-index lookups are
+        resolved lock-free up front, every chunk's ``cudaMemcpyAsync`` is
+        enqueued on the current stream, and the token bookkeeping for the
+        whole batch happens under a single critical section. The DMAs
+        themselves pipeline on the stream exactly as before.
+
+        Each chunk still issues its own ``lmcache_memcpy_async`` (one
+        ``cudaMemcpyAsync``); only the Python-side overhead is batched. A
+        native batched-launch kernel would remove the remaining per-chunk
+        launches but is intentionally not required here.
+
+        Args:
+            keys: Object keys to copy.
+            gpu_ptrs: Destination device pointer per key.
+            dst_sizes: Destination capacity in bytes per key.
+
+        Returns:
+            One token per key in input order (``-1`` on miss / error).
+
+        Raises:
+            ValueError: If the three lists do not have equal length.
+        """
+        if not (len(keys) == len(gpu_ptrs) == len(dst_sizes)):
+            raise ValueError(
+                "submit_h2d_batch: keys, gpu_ptrs and dst_sizes must have equal length"
+            )
+
+        # Phase 1 (lock-free): resolve each chunk's host source view and
+        # enqueue its copy. Defer token assignment so the lock is taken
+        # once for the whole batch, not once per chunk.
+        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
+        copied_ce_keys: list[CacheEngineKey] = []
+        result_slots: list[int] = []  # index into copied_ce_keys, or -1 (miss)
+
+        for ce_key, gpu_ptr, dst_size in zip(ce_keys, gpu_ptrs, dst_sizes, strict=True):
+            try:
+                res = self._backend.gpu_src_view(ce_key)
+            except Exception:
+                logger.exception("CXL gpu_src_view failed for %s", ce_key)
+                res = None
+            if res is None:
+                result_slots.append(-1)
+                continue
+            n_bytes, src_ptr = res
+            n = min(n_bytes, dst_size)
+            try:
+                lmc_ops.lmcache_memcpy_async(
+                    gpu_ptr,
+                    src_ptr,
+                    n,
+                    lmc_ops.TransferDirection.H2D,
+                    0,
+                    self._backend._chunk_size_bytes,
+                )
+            except Exception:
+                logger.exception("CXL H2D memcpy failed for %s", ce_key)
+                result_slots.append(-1)
+                continue
+            result_slots.append(len(copied_ce_keys))
+            copied_ce_keys.append(ce_key)
+
+        # Phase 2: assign tokens for the copied chunks under one lock.
+        tokens: list[int] = [-1] * len(keys)
+        if copied_ce_keys:
+            with self._lock:
+                base_token = self._next_h2d_token
+                self._next_h2d_token += len(copied_ce_keys)
+                for offset, ce_key in enumerate(copied_ce_keys):
+                    self._h2d_token_to_key[base_token + offset] = ce_key
+            for i, slot in enumerate(result_slots):
+                if slot >= 0:
+                    tokens[i] = base_token + slot
+        return tokens
+
     def release_after_h2d(self, token: int) -> None:
         """Unpin the chunk whose H2D was issued under ``token``.
 
@@ -630,6 +775,35 @@ class CXLL2Adapter(L2AdapterInterface):
             self._backend.unpin(ce_key)
         except Exception:
             logger.exception("CXL release_after_h2d unpin failed for %s", ce_key)
+
+    def release_after_h2d_batch(self, tokens: list[int]) -> None:
+        """Unpin a whole batch of ``submit_h2d`` chunks in one lock pass.
+
+        Overrides the base per-token loop: resolves every token to its key
+        under a single critical section, then drops all the CXL pins via one
+        batched lock acquisition (≈ one arbiter sweep) instead of one sweep
+        per chunk — the dominant resident-retrieve teardown cost at long
+        prompts. ``-1`` tokens (``submit_h2d`` misses) are ignored.
+
+        Args:
+            tokens: Tokens returned by ``submit_h2d_batch`` (``-1`` ignored).
+        """
+        with self._lock:
+            ce_keys = [
+                ce_key
+                for token in tokens
+                if token >= 0
+                and (ce_key := self._h2d_token_to_key.pop(token, None)) is not None
+            ]
+        if not ce_keys:
+            return
+        try:
+            self._backend.unpin_batch(ce_keys)
+        except Exception:
+            logger.exception(
+                "CXL release_after_h2d batched unpin failed for %d keys",
+                len(ce_keys),
+            )
 
     # ---------------- load ----------------
 
@@ -699,9 +873,7 @@ class CXLL2Adapter(L2AdapterInterface):
                 phase_ns[j] += local_phase[j]
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         mm_ns = phase_ns[3]
-        memmove_gbps = (
-            (bytes_copied / (mm_ns / 1e9)) / 1e9 if mm_ns > 0 else 0.0
-        )
+        memmove_gbps = (bytes_copied / (mm_ns / 1e9)) / 1e9 if mm_ns > 0 else 0.0
         logger.info(
             "CXL L2 load task=%d hits=%d/%d bytes=%d elapsed_ms=%.3f "
             "lookup1_ms=%.3f refup_ms=%.3f lookup2_ms=%.3f memmove_ms=%.3f "
@@ -754,9 +926,7 @@ class CXLL2Adapter(L2AdapterInterface):
             src_t = src_t.view(torch.uint8)
         n = min(src.get_size(), dst.get_size())
         t0 = time.perf_counter_ns()
-        ctypes.memmove(
-            dst_t.data_ptr(), src_t.data_ptr(), n
-        )
+        ctypes.memmove(dst_t.data_ptr(), src_t.data_ptr(), n)
         return n, time.perf_counter_ns() - t0
 
     # ---------------- close ----------------
@@ -910,14 +1080,16 @@ def build_cxl_adapter_from_config(
         p2p_server.start()
 
         for p in config.peers:
-            peer_clients.append((
-                p["node_id"],
-                CXLP2PClient(
-                    donor_url=p["url"],
-                    recv_timeout_ms=config.cxl_p2p_timeout_ms,
-                    send_timeout_ms=config.cxl_p2p_timeout_ms,
-                ),
-            ))
+            peer_clients.append(
+                (
+                    p["node_id"],
+                    CXLP2PClient(
+                        donor_url=p["url"],
+                        recv_timeout_ms=config.cxl_p2p_timeout_ms,
+                        send_timeout_ms=config.cxl_p2p_timeout_ms,
+                    ),
+                )
+            )
         logger.info(
             "CXL adapter started donor server at %s with %d peer client(s) "
             "(timeout=%d ms)",

@@ -297,17 +297,13 @@ class CXLBackend(AllocatorBackendInterface):
             return n
         finally:
             t_rd = time.perf_counter_ns()
-            self._index_writer.ref_count_down(
-                view.slot_idx, phase_ns=refdown_sub_list
-            )
+            self._index_writer.ref_count_down(view.slot_idx, phase_ns=refdown_sub_list)
             if phase_ns is not None:
                 phase_ns[4] += time.perf_counter_ns() - t_rd
                 for j in range(3):
                     phase_ns[8 + j] += refdown_sub_list[j]
 
-    def batched_contains(
-        self, keys: List[CacheEngineKey], pin: bool = False
-    ) -> int:
+    def batched_contains(self, keys: List[CacheEngineKey], pin: bool = False) -> int:
         hit = 0
         for k in keys:
             if not self.contains(k, pin=pin):
@@ -363,9 +359,7 @@ class CXLBackend(AllocatorBackendInterface):
                     try:
                         on_complete_callback(key)
                     except Exception:
-                        logger.exception(
-                            "on_complete_callback raised for key %s", key
-                        )
+                        logger.exception("on_complete_callback raised for key %s", key)
             except Exception:
                 logger.exception("failed to put key %s; skipping", key)
         return None
@@ -377,9 +371,7 @@ class CXLBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
-        self.batched_submit_put_task(
-            keys, objs, transfer_spec, on_complete_callback
-        )
+        self.batched_submit_put_task(keys, objs, transfer_spec, on_complete_callback)
 
     def _put_one(self, key: CacheEngineKey, src: MemoryObj) -> None:
         """Full INSERT lifecycle for one key.
@@ -411,8 +403,7 @@ class CXLBackend(AllocatorBackendInterface):
             if size_bytes > self._chunk_size_bytes:
                 self._index_writer.release_slot(slot_idx)
                 raise ValueError(
-                    f"payload {size_bytes} bytes > chunk size "
-                    f"{self._chunk_size_bytes}"
+                    f"payload {size_bytes} bytes > chunk size {self._chunk_size_bytes}"
                 )
 
             try:
@@ -481,9 +472,7 @@ class CXLBackend(AllocatorBackendInterface):
         fmt = MemoryFormat(view.fmt) if view.fmt != 0 else MemoryFormat.UNDEFINED
         buf_type = ctypes.c_uint8 * self._chunk_size_bytes
         ctypes_buf = buf_type.from_address(self._pool.base + view.chunk_offset)
-        np_buf = np.frombuffer(
-            ctypes_buf, dtype=np.uint8, count=self._chunk_size_bytes
-        )
+        np_buf = np.frombuffer(ctypes_buf, dtype=np.uint8, count=self._chunk_size_bytes)
         raw_data = torch.from_numpy(np_buf)
 
         # We don't know the caller's intended (shape, dtype) at get
@@ -554,6 +543,66 @@ class CXLBackend(AllocatorBackendInterface):
             return False
         return self._index_writer.unpin(slot_idx)
 
+    def pin_batch(self, keys: List[CacheEngineKey]) -> List[bool]:
+        """Pin many keys with a single batched lock acquisition.
+
+        Resolves each key to its slot, then pins all of them under one
+        :meth:`CXLIndexWriter.pin_batch` (≈ one arbiter sweep total instead
+        of one per key). Keys with no VALID slot report False.
+
+        Args:
+            keys: Keys to pin (one pin each).
+
+        Returns:
+            Per-key success flags, parallel to ``keys``.
+        """
+        results = [False] * len(keys)
+        # Resolve keys to slots; track which input positions have a slot.
+        positions: List[int] = []
+        slot_idxs: List[int] = []
+        for i, key in enumerate(keys):
+            view = self._index.lookup(key)
+            if view is None:
+                continue
+            positions.append(i)
+            slot_idxs.append(view.slot_idx)
+        if not slot_idxs:
+            return results
+        pinned = self._index_writer.pin_batch(slot_idxs)
+        for pos, slot_idx, ok in zip(positions, slot_idxs, pinned, strict=True):
+            if ok:
+                self._cache_slot(keys[pos], slot_idx)
+                results[pos] = True
+        return results
+
+    def unpin_batch(self, keys: List[CacheEngineKey]) -> List[bool]:
+        """Unpin many keys with a single batched lock acquisition.
+
+        Release counterpart to :meth:`pin_batch`. Keys with no known slot
+        report False.
+
+        Args:
+            keys: Keys to unpin (one unpin each).
+
+        Returns:
+            Per-key success flags, parallel to ``keys``.
+        """
+        results = [False] * len(keys)
+        positions: List[int] = []
+        slot_idxs: List[int] = []
+        for i, key in enumerate(keys):
+            slot_idx = self._lookup_slot(key)
+            if slot_idx is None:
+                continue
+            positions.append(i)
+            slot_idxs.append(slot_idx)
+        if not slot_idxs:
+            return results
+        unpinned = self._index_writer.unpin_batch(slot_idxs)
+        for pos, ok in zip(positions, unpinned, strict=True):
+            results[pos] = ok
+        return results
+
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         slot_idx = self._lookup_slot(key)
         if slot_idx is None:
@@ -609,9 +658,7 @@ class CXLBackend(AllocatorBackendInterface):
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[List[MemoryObj]]:
-        return self._mem_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        return self._mem_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
     def calculate_chunk_budget(self) -> int:
         """Max in-flight chunks before we risk OOM on the CXL pool."""
@@ -681,7 +728,12 @@ class _SlotRefcountAdapter(MemoryAllocatorInterface):
         raise NotImplementedError
 
     def batched_allocate(
-        self, shapes, dtypes, batch_size, fmt=MemoryFormat.UNDEFINED, allocator_type=None
+        self,
+        shapes,
+        dtypes,
+        batch_size,
+        fmt=MemoryFormat.UNDEFINED,
+        allocator_type=None,
     ):
         raise NotImplementedError
 

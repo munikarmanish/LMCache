@@ -68,6 +68,25 @@ class ReserveOutcome(enum.Enum):
     INDEX_FULL = "INDEX_FULL"
 
 
+class CommitPin(enum.Enum):
+    """Whether ``commit_slot`` publishes the slot already pinned.
+
+    ``UNPINNED`` is the normal store path: the slot becomes VALID with
+    ``pin_count == 0`` and is immediately evictable.
+
+    ``BORN_PINNED`` publishes VALID with ``pin_count == 1`` in the same
+    critical section, so the slot is protected against eviction the instant
+    it is visible. Used by the cross-node resident-retrieve path, where the
+    committed chunk is going straight to GPU and must hold a pin for the
+    retrieve handler to release after the H2D drains. This folds the
+    requester's pin into the donor's commit, removing a separate per-chunk
+    pin round-trip on the arbiter.
+    """
+
+    UNPINNED = "UNPINNED"
+    BORN_PINNED = "BORN_PINNED"
+
+
 @dataclass
 class ReserveResult:
     outcome: ReserveOutcome
@@ -196,18 +215,14 @@ class CXLIndexWriter:
                     if line0.generation == self._handle.header.gen and bytes(
                         line0.geom_hash
                     ) == bytes(self._handle.header.geom_hash):
-                        return ReserveResult(
-                            ReserveOutcome.ALREADY_PRESENT, slot_idx
-                        )
+                        return ReserveResult(ReserveOutcome.ALREADY_PRESENT, slot_idx)
                     # Stale slot with matching hash — treat as TOMB
                     # candidate. We'll overwrite it.
                     if first_tomb is None:
                         first_tomb = slot_idx
 
                 if state == SLOT_STATE_ALLOCATING and line0.chunk_hash == needle:
-                    return ReserveResult(
-                        ReserveOutcome.WAIT_FOR_OTHER, slot_idx
-                    )
+                    return ReserveResult(ReserveOutcome.WAIT_FOR_OTHER, slot_idx)
 
                 if state == SLOT_STATE_EMPTY:
                     target = first_tomb if first_tomb is not None else slot_idx
@@ -223,9 +238,7 @@ class CXLIndexWriter:
                 return ReserveResult(ReserveOutcome.RESERVED, first_tomb)
             return ReserveResult(ReserveOutcome.INDEX_FULL, None)
 
-    def _claim(
-        self, slot_idx: int, chunk_hash: int, owner_node_id: int
-    ) -> None:
+    def _claim(self, slot_idx: int, chunk_hash: int, owner_node_id: int) -> None:
         """Write ALLOCATING to `slot_idx`. Caller holds the slot's lock."""
         slot = self._slots[slot_idx]
         slot.line0.chunk_hash = chunk_hash & 0xFFFFFFFFFFFFFFFF
@@ -256,12 +269,28 @@ class CXLIndexWriter:
         chunk_offset: int,
         chunk_len: int,
         fmt: MemoryFormat,
+        pin: CommitPin = CommitPin.UNPINNED,
     ) -> None:
         """Publish a reserved slot as VALID.
 
         Caller guarantees the chunk bytes at `chunk_offset..+chunk_len`
         are already fully written and fenced. We only flip the slot's
         metadata and transition state to VALID.
+
+        Args:
+            slot_idx: Index of the ALLOCATING slot to publish.
+            chunk_offset: Byte offset of the chunk payload in the pool.
+            chunk_len: Length of the chunk payload in bytes.
+            fmt: Memory format of the committed chunk.
+            pin: ``CommitPin.BORN_PINNED`` publishes the slot with
+                ``pin_count == 1`` in the same critical section as the VALID
+                transition, so the slot is eviction-protected the instant it
+                becomes visible (see :class:`CommitPin`). ``CommitPin.UNPINNED``
+                (default) publishes an immediately-evictable VALID slot.
+
+        Raises:
+            RuntimeError: If the slot is not ALLOCATING or not owned by this
+                node.
         """
         with self._lock.acquire(self._lock_id_for_slot(slot_idx)):
             slot = self._slots[slot_idx]
@@ -278,10 +307,102 @@ class CXLIndexWriter:
             slot.line0.chunk_offset = chunk_offset
             slot.line0.chunk_len = chunk_len
             slot.line0.fmt = fmt.value
+            slot_addr = self._slots_base_addr + slot_idx * self._slot_size
+            if pin is CommitPin.BORN_PINNED:
+                # Write and fence pin_count (line1) BEFORE publishing VALID
+                # (line0), so any reader that observes VALID also observes the
+                # pin — closing the evictable window between commit and the
+                # requester's pin. reserve initializes pin_count to 0, so a
+                # bare assignment to 1 is correct (no concurrent pinner exists
+                # while the slot is still ALLOCATING).
+                slot.line1.pin_count = 1
+                line1_addr = self._slots_base_addr + (
+                    slot_idx * self._slot_size + self._line0_size
+                )
+                self._fence.fence_after_write(line1_addr, self._line1_size)
             # Single-store state publish.
             slot.line0.state = SLOT_STATE_VALID
-            slot_addr = self._slots_base_addr + slot_idx * self._slot_size
             self._fence.fence_after_write(slot_addr, self._line0_size)
+
+    def commit_slot_batch(
+        self,
+        slot_idxs: List[int],
+        chunk_offsets: List[int],
+        chunk_lens: List[int],
+        fmts: List[MemoryFormat],
+        pin: CommitPin = CommitPin.UNPINNED,
+    ) -> List[bool]:
+        """Commit many slots under a single batched lock acquisition.
+
+        Equivalent to calling :meth:`commit_slot` per slot, but acquires all
+        the distinct slot locks together (see
+        :meth:`TwoTierLock.acquire_batch`) so the whole batch is granted in
+        ~one arbiter sweep instead of one sweep per slot — the per-chunk
+        commit cost of the cross-node donor push at long prompts.
+
+        Unlike the single-slot method, a slot that fails validation (not
+        ALLOCATING, or not owned by this node) does **not** raise: it is
+        reported as ``False`` so a partial batch still commits the slots it
+        can. This matches the donor's "longest contiguous prefix of
+        successful commits" contract.
+
+        All four parallel lists describe the slots in order; ``pin`` applies
+        uniformly (see :class:`CommitPin`).
+
+        Args:
+            slot_idxs: Slot indices to commit.
+            chunk_offsets: Byte offset of each chunk's payload in the pool.
+            chunk_lens: Length of each chunk's payload in bytes.
+            fmts: Memory format of each committed chunk.
+            pin: Whether to publish each slot born-pinned (default unpinned).
+
+        Returns:
+            Per-slot success flags, parallel to ``slot_idxs``.
+
+        Raises:
+            ValueError: If the input lists do not all have equal length.
+        """
+        n = len(slot_idxs)
+        if not (len(chunk_offsets) == len(chunk_lens) == len(fmts) == n):
+            raise ValueError(
+                "commit_slot_batch: slot_idxs, chunk_offsets, chunk_lens and "
+                "fmts must have equal length"
+            )
+        results = [False] * n
+        if n == 0:
+            return results
+        lock_ids = [self._lock_id_for_slot(s) for s in slot_idxs]
+        with self._lock.acquire_batch(lock_ids):
+            for i, slot_idx in enumerate(slot_idxs):
+                slot = self._slots[slot_idx]
+                if (
+                    slot.line0.state != SLOT_STATE_ALLOCATING
+                    or slot.line0.owner_node_id != self._node_id
+                ):
+                    logger.warning(
+                        "commit_slot_batch: slot %d not ALLOCATING(self) "
+                        "(state=%d owner=%d); skipping",
+                        slot_idx,
+                        slot.line0.state,
+                        slot.line0.owner_node_id,
+                    )
+                    continue
+                slot.line0.chunk_offset = chunk_offsets[i]
+                slot.line0.chunk_len = chunk_lens[i]
+                slot.line0.fmt = fmts[i].value
+                slot_addr = self._slots_base_addr + slot_idx * self._slot_size
+                if pin is CommitPin.BORN_PINNED:
+                    # Fence pin_count (line1) before publishing VALID (line0),
+                    # same ordering as commit_slot.
+                    slot.line1.pin_count = 1
+                    line1_addr = self._slots_base_addr + (
+                        slot_idx * self._slot_size + self._line0_size
+                    )
+                    self._fence.fence_after_write(line1_addr, self._line1_size)
+                slot.line0.state = SLOT_STATE_VALID
+                self._fence.fence_after_write(slot_addr, self._line0_size)
+                results[i] = True
+        return results
 
     def release_slot(self, slot_idx: int) -> None:
         """Abandon an ALLOCATING slot owned by self; flip back to EMPTY."""
@@ -296,9 +417,7 @@ class CXLIndexWriter:
         """
         self._release_slot_with_owner(slot_idx, expected_owner=donor_node_id)
 
-    def _release_slot_with_owner(
-        self, slot_idx: int, *, expected_owner: int
-    ) -> None:
+    def _release_slot_with_owner(self, slot_idx: int, *, expected_owner: int) -> None:
         with self._lock.acquire(self._lock_id_for_slot(slot_idx)):
             slot = self._slots[slot_idx]
             if slot.line0.state != SLOT_STATE_ALLOCATING:
@@ -333,9 +452,7 @@ class CXLIndexWriter:
                 return False
             slot.line1.pin_count += 1
             line1_addr = (
-                self._slots_base_addr
-                + slot_idx * self._slot_size
-                + self._line0_size
+                self._slots_base_addr + slot_idx * self._slot_size + self._line0_size
             )
             self._fence.fence_after_write(line1_addr, self._line1_size)
             return True
@@ -347,16 +464,82 @@ class CXLIndexWriter:
                 return False
             slot.line1.pin_count -= 1
             line1_addr = (
-                self._slots_base_addr
-                + slot_idx * self._slot_size
-                + self._line0_size
+                self._slots_base_addr + slot_idx * self._slot_size + self._line0_size
             )
             self._fence.fence_after_write(line1_addr, self._line1_size)
             return True
 
-    def ref_count_up(
-        self, slot_idx: int, phase_ns: Optional[List[int]] = None
-    ) -> bool:
+    def pin_batch(self, slot_idxs: List[int]) -> List[bool]:
+        """Pin many slots under a single batched lock acquisition.
+
+        Equivalent to calling :meth:`pin` for each slot, but acquires all
+        the distinct slot locks together (see
+        :meth:`TwoTierLock.acquire_batch`) so the whole batch resolves in
+        ~one arbiter sweep instead of one sweep per slot. This is the
+        dominant cost of the warm CXL lookup/pin at long prompts.
+
+        Args:
+            slot_idxs: Slot indices to pin (duplicates allowed; each
+                occurrence bumps pin_count once).
+
+        Returns:
+            Per-slot success flags, parallel to ``slot_idxs``: True where the
+            slot was VALID and pinned, False otherwise.
+        """
+        results = [False] * len(slot_idxs)
+        if not slot_idxs:
+            return results
+        lock_ids = [self._lock_id_for_slot(s) for s in slot_idxs]
+        with self._lock.acquire_batch(lock_ids):
+            for i, slot_idx in enumerate(slot_idxs):
+                slot = self._slots[slot_idx]
+                if slot.line0.state != SLOT_STATE_VALID:
+                    continue
+                slot.line1.pin_count += 1
+                line1_addr = (
+                    self._slots_base_addr
+                    + slot_idx * self._slot_size
+                    + self._line0_size
+                )
+                self._fence.fence_after_write(line1_addr, self._line1_size)
+                results[i] = True
+        return results
+
+    def unpin_batch(self, slot_idxs: List[int]) -> List[bool]:
+        """Unpin many slots under a single batched lock acquisition.
+
+        The release counterpart to :meth:`pin_batch`; same one-sweep
+        amortization. Used by the resident-retrieve teardown and the abort
+        path to drop a request's pins without N arbiter round-trips.
+
+        Args:
+            slot_idxs: Slot indices to unpin (duplicates allowed; each
+                occurrence drops pin_count once).
+
+        Returns:
+            Per-slot success flags, parallel to ``slot_idxs``: True where
+            pin_count was positive and decremented, False otherwise.
+        """
+        results = [False] * len(slot_idxs)
+        if not slot_idxs:
+            return results
+        lock_ids = [self._lock_id_for_slot(s) for s in slot_idxs]
+        with self._lock.acquire_batch(lock_ids):
+            for i, slot_idx in enumerate(slot_idxs):
+                slot = self._slots[slot_idx]
+                if slot.line1.pin_count <= 0:
+                    continue
+                slot.line1.pin_count -= 1
+                line1_addr = (
+                    self._slots_base_addr
+                    + slot_idx * self._slot_size
+                    + self._line0_size
+                )
+                self._fence.fence_after_write(line1_addr, self._line1_size)
+                results[i] = True
+        return results
+
+    def ref_count_up(self, slot_idx: int, phase_ns: Optional[List[int]] = None) -> bool:
         """Bump ref_count under the slot lock.
 
         Used by GET to keep the slot alive during DMA. Returns True
@@ -391,9 +574,7 @@ class CXLIndexWriter:
                 return False
             slot.line1.ref_count += 1
             line1_addr = (
-                self._slots_base_addr
-                + slot_idx * self._slot_size
-                + self._line0_size
+                self._slots_base_addr + slot_idx * self._slot_size + self._line0_size
             )
             t2 = time.perf_counter_ns()
             phase_ns[1] += t2 - t1

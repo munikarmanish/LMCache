@@ -672,6 +672,31 @@ class StorageManager:
             handle.prefetch_request_id
         )
 
+    def query_prefetch_breakdown(
+        self,
+        handle: PrefetchHandle,
+    ) -> dict[str, float]:
+        """Return the per-stage profiling breakdown for a completed prefetch.
+
+        Sidecar to :meth:`query_prefetch_status`, populated only when
+        ``LMC_PROFILE`` is set. Maps ``{stage: seconds}`` for the L2
+        lookup/pin, L1 reserve, and L2 load spans measured on the prefetch
+        thread, so the lookup handler can fold them into the per-request
+        ``PROFILE`` line. Empty when profiling is disabled or there was no L2
+        request.
+
+        Args:
+            handle: The handle of the prefetch task.
+
+        Returns:
+            ``{stage: seconds}``, or an empty dict.
+        """
+        if handle.prefetch_request_id == -1:
+            return {}
+        return self._prefetch_controller.query_prefetch_breakdown(
+            handle.prefetch_request_id
+        )
+
     def submit_h2d_for_l2_resident(
         self,
         keys: list[ObjectKey],
@@ -701,11 +726,25 @@ class StorageManager:
                 "submit_h2d_for_l2_resident: keys, adapter_indices, gpu_ptrs "
                 "and sizes must have equal length"
             )
-        tokens: list[int] = []
-        for key, adapter_idx, gpu_ptr, size in zip(
-            keys, adapter_indices, gpu_ptrs, sizes, strict=True
-        ):
-            tokens.append(self._l2_adapters[adapter_idx].submit_h2d(key, gpu_ptr, size))
+        # Group by adapter and issue one batched call per adapter, then
+        # scatter the per-adapter tokens back to input order. This keeps
+        # one token per input key while collapsing the per-chunk Python /
+        # lock round-trips inside each adapter (the dominant cost of the
+        # L2-resident retrieve at long prompts). Today there is at most one
+        # resident adapter, but grouping keeps the contract correct for N.
+        by_adapter: dict[int, list[int]] = defaultdict(list)
+        for i, adapter_idx in enumerate(adapter_indices):
+            by_adapter[adapter_idx].append(i)
+
+        tokens: list[int] = [-1] * len(keys)
+        for adapter_idx, positions in by_adapter.items():
+            adapter_tokens = self._l2_adapters[adapter_idx].submit_h2d_batch(
+                [keys[i] for i in positions],
+                [gpu_ptrs[i] for i in positions],
+                [sizes[i] for i in positions],
+            )
+            for pos, token in zip(positions, adapter_tokens, strict=True):
+                tokens[pos] = token
         return tokens
 
     def release_after_h2d(self, payload: tuple[list[int], list[int]]) -> None:
@@ -759,6 +798,57 @@ class StorageManager:
             keys (list[ObjectKey]): List of object keys to touch.
         """
         self._l1_manager.touch_keys(keys)
+
+    def l1_prefix_hit_chunks(self, keys: list[ObjectKey]) -> int:
+        """Count how many leading keys are resident in L1, stopping at the
+        first miss.
+
+        This is a read-only residency probe over the L1 index: it does not
+        pin, lock, touch, or otherwise mutate cache state. Intended for an
+        external KV-aware router to learn how long a prefix of a request is
+        already cached on this node (chunk granularity), without disturbing
+        eviction order.
+
+        Keys must be supplied in prefix order (chunk 0 first); the count
+        stops at the first key absent from L1, since a KV-cache prefix hit
+        is only useful up to the first gap.
+
+        Args:
+            keys: Object keys for the request's chunks, in prefix order.
+
+        Returns:
+            The number of leading keys present in L1 (0 to ``len(keys)``).
+        """
+        hit = 0
+        for key in keys:
+            if self._l1_manager.get_object_state(key) is None:
+                break
+            hit += 1
+        return hit
+
+    def l0_prefix_hit_chunks(self, keys: list[ObjectKey]) -> int:
+        """Count how many leading keys are resident in L0 (vLLM GPU KV cache).
+
+        L0 is the inference engine's own paged KV cache (GPU HBM). LMCache
+        does not currently maintain an L0 key->block residency index: the MP
+        server is a transfer engine into vLLM's GPU buffer and does not own
+        the paged-attention table, and the harness runs vLLM with
+        ``--no-enable-prefix-caching`` (required by the MP connector), so vLLM
+        frees a request's GPU blocks on completion and holds no cross-request
+        L0 residency. This method therefore always returns 0 today.
+
+        It exists so the routing contract (and ``/lookup_hits``) already
+        carries an L0 tier: when vLLM prefix caching is enabled or an explicit
+        L0 index is added, only this method's body needs to change -- the
+        endpoint and router need not.
+
+        Args:
+            keys: Object keys for the request's chunks, in prefix order.
+
+        Returns:
+            The number of leading keys present in L0 (currently always 0).
+        """
+        return 0
 
     def unsafe_read(
         self, keys: list[ObjectKey]

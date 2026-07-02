@@ -30,6 +30,7 @@ from lmcache.v1.storage_backend.cxl.gc import (
 )
 from lmcache.v1.storage_backend.cxl.index import CXLIndex
 from lmcache.v1.storage_backend.cxl.index_writer import (
+    CommitPin,
     CXLIndexWriter,
     ReserveOutcome,
 )
@@ -82,9 +83,7 @@ def ctx():
     with tempfile.NamedTemporaryFile(prefix="cxl-gc-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
-    cfg = CXLBootstrapConfig(
-        dev_path=path, region_size=REGION_SIZE, initialize=True
-    )
+    cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
     handle = bootstrap_pool(cfg, _metadata())
     lock = TwoTierLock(handle, node_id=0)
     mgr = LockManager(handle)
@@ -174,9 +173,7 @@ def test_orphaned_regions_are_not_re_orphaned_next_sweep(ctx):
     region_id = region_alloc.claim(node_id=4)
     layout = handle.layout
     region_lo = layout.off_regions + region_id * layout.region_size
-    iw_dead = CXLIndexWriter(
-        handle, index, TwoTierLock(handle, node_id=4), node_id=4
-    )
+    iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=4), node_id=4)
     r = iw_dead.reserve_slot(_make_key(0xEE01))
     iw_dead.commit_slot(
         r.slot_idx,
@@ -203,10 +200,8 @@ def test_sweep_flips_dead_owner_allocating_to_tomb(ctx):
     handle, region_alloc, index, iw = ctx
     # Manually stamp two ALLOCATING slots: one owned by a dead node,
     # one owned by an alive node. Scan should affect only the dead one.
-    iw_alive = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=2),
-                              node_id=2)
-    iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=9),
-                             node_id=9)
+    iw_alive = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=2), node_id=2)
+    iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=9), node_id=9)
     r_alive = iw_alive.reserve_slot(_make_key(0xAA01))
     r_dead = iw_dead.reserve_slot(_make_key(0xAA02))
     assert r_alive.outcome == ReserveOutcome.RESERVED
@@ -235,9 +230,9 @@ def test_sweep_does_not_touch_valid_slots(ctx):
     # Use an alive writer to stamp a VALID slot, then mark the writer's
     # node id as dead and confirm sweep leaves the slot alone.
     dead_node_id = 11
-    iw_dead = CXLIndexWriter(handle, index,
-                             TwoTierLock(handle, node_id=dead_node_id),
-                             node_id=dead_node_id)
+    iw_dead = CXLIndexWriter(
+        handle, index, TwoTierLock(handle, node_id=dead_node_id), node_id=dead_node_id
+    )
     r = iw_dead.reserve_slot(_make_key(0xBB10))
     assert r.outcome == ReserveOutcome.RESERVED
     iw_dead.commit_slot(
@@ -272,9 +267,7 @@ def test_orphan_kept_until_valid_slot_drains(ctx):
     region_lo = layout.off_regions + region_id * layout.region_size
 
     # Stamp a VALID slot pointing into this region.
-    iw_dead = CXLIndexWriter(
-        handle, index, TwoTierLock(handle, node_id=13), node_id=13
-    )
+    iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=13), node_id=13)
     r = iw_dead.reserve_slot(_make_key(0xCC10))
     iw_dead.commit_slot(
         r.slot_idx,
@@ -394,3 +387,98 @@ def test_region_has_no_live_slots_returns_false_when_valid_slot_inside(ctx):
         r.slot_idx, chunk_offset=lo + 256, chunk_len=128, fmt=MemoryFormat.KV_2LTD
     )
     assert not iw.region_has_no_live_slots(region_id, lo, hi)
+
+
+# ---------- batched commit ----------
+
+
+def test_commit_slot_batch_commits_all_born_pinned(ctx):
+    """commit_slot_batch publishes every slot VALID with pin_count==1."""
+    handle, region_alloc, index, iw = ctx
+    region_id = region_alloc.claim(node_id=0)
+    layout = handle.layout
+    lo = layout.off_regions + region_id * layout.region_size
+
+    n = 8
+    reserved = [iw.reserve_slot(_make_key(0xE100 + i)) for i in range(n)]
+    slot_idxs = [r.slot_idx for r in reserved]
+    results = iw.commit_slot_batch(
+        slot_idxs=slot_idxs,
+        chunk_offsets=[lo + 256 * i for i in range(n)],
+        chunk_lens=[128] * n,
+        fmts=[MemoryFormat.KV_2LTD] * n,
+        pin=CommitPin.BORN_PINNED,
+    )
+    assert results == [True] * n
+    slots = handle.slots()
+    for s in slot_idxs:
+        assert slots[s].line0.state == SLOT_STATE_VALID
+        assert slots[s].line1.pin_count == 1
+
+
+def test_commit_slot_batch_unpinned_default(ctx):
+    """Default pin mode leaves committed slots VALID with pin_count==0."""
+    handle, region_alloc, index, iw = ctx
+    region_id = region_alloc.claim(node_id=0)
+    lo = handle.layout.off_regions + region_id * handle.layout.region_size
+
+    reserved = [iw.reserve_slot(_make_key(0xE200 + i)) for i in range(3)]
+    slot_idxs = [r.slot_idx for r in reserved]
+    results = iw.commit_slot_batch(
+        slot_idxs=slot_idxs,
+        chunk_offsets=[lo + 256 * i for i in range(3)],
+        chunk_lens=[128] * 3,
+        fmts=[MemoryFormat.KV_2LTD] * 3,
+    )
+    assert results == [True, True, True]
+    slots = handle.slots()
+    for s in slot_idxs:
+        assert slots[s].line0.state == SLOT_STATE_VALID
+        assert slots[s].line1.pin_count == 0
+
+
+def test_commit_slot_batch_skips_non_allocating(ctx):
+    """A slot that is not ALLOCATING is reported False, others still commit."""
+    handle, region_alloc, index, iw = ctx
+    region_id = region_alloc.claim(node_id=0)
+    lo = handle.layout.off_regions + region_id * handle.layout.region_size
+
+    reserved = [iw.reserve_slot(_make_key(0xE300 + i)) for i in range(3)]
+    slot_idxs = [r.slot_idx for r in reserved]
+    # Pre-commit the middle slot so it is VALID (not ALLOCATING) when the
+    # batch runs.
+    iw.commit_slot(
+        slot_idxs[1], chunk_offset=lo, chunk_len=128, fmt=MemoryFormat.KV_2LTD
+    )
+
+    results = iw.commit_slot_batch(
+        slot_idxs=slot_idxs,
+        chunk_offsets=[lo + 256 * i for i in range(3)],
+        chunk_lens=[128] * 3,
+        fmts=[MemoryFormat.KV_2LTD] * 3,
+        pin=CommitPin.BORN_PINNED,
+    )
+    # Middle slot was already VALID -> skipped; the other two commit.
+    assert results == [True, False, True]
+    slots = handle.slots()
+    assert slots[slot_idxs[0]].line1.pin_count == 1
+    assert slots[slot_idxs[2]].line1.pin_count == 1
+
+
+def test_commit_slot_batch_rejects_unequal_lengths(ctx):
+    _, _, _, iw = ctx
+    with pytest.raises(ValueError, match="equal length"):
+        iw.commit_slot_batch(
+            slot_idxs=[0, 1],
+            chunk_offsets=[0],
+            chunk_lens=[1, 2],
+            fmts=[MemoryFormat.KV_2LTD, MemoryFormat.KV_2LTD],
+        )
+
+
+def test_commit_slot_batch_empty_is_noop(ctx):
+    _, _, _, iw = ctx
+    assert (
+        iw.commit_slot_batch(slot_idxs=[], chunk_offsets=[], chunk_lens=[], fmts=[])
+        == []
+    )

@@ -19,6 +19,7 @@ from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
 )
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
+from lmcache.v1.mp_observability.profile import RequestProfiler
 from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -155,6 +156,12 @@ class MPCacheEngineContext:
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
 
+        # Per-request latency-breakdown profiler. A no-op unless
+        # ``LMC_PROFILE`` is set. Shared across the lookup, prefetch, and
+        # retrieve paths (all keyed by the external request_id) so the
+        # retrieve handler can emit one compact ``PROFILE`` line per request.
+        self._profiler = RequestProfiler()
+
         # L2-resident tier info, keyed by request_id, bridging lookup ->
         # retrieve. ``lookup`` (via query_prefetch_status) sets it; ``retrieve``
         # and the abort path (``free_lookup_locks``) consume and pop it. Held
@@ -191,6 +198,11 @@ class MPCacheEngineContext:
     def layout_desc_registry(self) -> LayoutDescRegistry:
         """Registry mapping (model_name, world_size) to MemoryLayoutDesc."""
         return self._layout_desc_registry
+
+    @property
+    def profiler(self) -> RequestProfiler:
+        """Per-request latency-breakdown profiler (``LMC_PROFILE`` gated)."""
+        return self._profiler
 
     def resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.

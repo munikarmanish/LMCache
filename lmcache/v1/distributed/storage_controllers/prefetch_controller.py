@@ -19,9 +19,11 @@ from typing import Iterable
 import enum
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.mp_observability.profile import PROFILE_ENABLED
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey, TrimPolicy
 from lmcache.v1.distributed.error import L1Error
@@ -172,6 +174,15 @@ class InFlightPrefetchRequest:
     write_reserved_keys: list[ObjectKey] = field(default_factory=list)
     write_reserved_objs: dict[ObjectKey, MemoryObj] = field(default_factory=dict)
 
+    # Profiling (only populated when ``LMC_PROFILE`` is set). Absolute
+    # ``time.perf_counter`` instants captured at phase boundaries on the
+    # prefetch thread; differences are reported via query_prefetch_breakdown.
+    prof_lookup_submit_at: float = 0.0
+    prof_lookup_done_at: float = 0.0
+    prof_l1_reserve_seconds: float = 0.0
+    prof_load_submit_at: float = 0.0
+    prof_load_done_at: float = 0.0
+
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
 
@@ -263,6 +274,11 @@ class PrefetchController(StorageControllerInterface):
         # (the bitmap contract is unchanged). Keyed by request id; populated
         # in _complete_request, popped by query_prefetch_tier_info.
         self._completed_tier_info: dict[PrefetchRequestId, L2ResidentTierInfo] = {}
+        # Per-request profiling breakdown (``LMC_PROFILE`` only): maps
+        # ``{stage: seconds}`` for the L2 lookup/pin, L1 reserve, and L2 load
+        # spans measured on the prefetch thread. Populated in _complete_request,
+        # popped by query_prefetch_breakdown (folded into the external profile).
+        self._completed_breakdowns: dict[PrefetchRequestId, dict[str, float]] = {}
 
         # Map eventfds to adapter indices for quick lookup in poll.
         # Relies on the L2AdapterInterface contract that every adapter
@@ -426,6 +442,28 @@ class PrefetchController(StorageControllerInterface):
         """
         with self._prefetch_results_lock:
             return self._completed_tier_info.pop(request_id, L2ResidentTierInfo())
+
+    def query_prefetch_breakdown(
+        self, request_id: PrefetchRequestId
+    ) -> dict[str, float]:
+        """Pop the per-stage profiling breakdown for a completed request.
+
+        Sidecar to :meth:`query_prefetch_result`, populated only when
+        ``LMC_PROFILE`` is set. Returns ``{stage: seconds}`` for the L2
+        lookup/pin (``l2lk``), L1 reserve (``l1rsv``), and L2 load
+        (``l2load``) spans measured on the prefetch thread, or an empty dict
+        when profiling is disabled or the request is unknown.
+
+        Thread-safe. Each request's breakdown can only be retrieved once.
+
+        Args:
+            request_id: The request ID from submit_prefetch_request.
+
+        Returns:
+            ``{stage: seconds}``, or an empty dict.
+        """
+        with self._prefetch_results_lock:
+            return self._completed_breakdowns.pop(request_id, {})
 
     def report_status(self) -> dict:
         """Return a status dict for the prefetch controller."""
@@ -622,6 +660,7 @@ class PrefetchController(StorageControllerInterface):
             self._complete_request(request_id, Bitmap(len(keys)))
             return
 
+        lookup_submit_at = time.perf_counter() if PROFILE_ENABLED else 0.0
         pending_lookup_tasks: dict[int, L2TaskId] = {}
         for i, adapter in enumerate(self._l2_adapters):
             task_id = adapter.submit_lookup_and_lock_task(keys)
@@ -635,6 +674,7 @@ class PrefetchController(StorageControllerInterface):
             extra_count=extra_count,
             policy=policy,
             pending_lookup_tasks=pending_lookup_tasks,
+            prof_lookup_submit_at=lookup_submit_at,
         )
         self._in_flight_requests[request_id] = request
         self._status_in_flight_count += 1
@@ -657,6 +697,8 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Compute load plan, reserve L1 buffers, and submit load tasks."""
+        if PROFILE_ENABLED:
+            request.prof_lookup_done_at = time.perf_counter()
         request.phase = PrefetchPhase.PLAN_AND_LOAD
         self._status_lookup_phase_count -= 1
         self._status_load_phase_count += 1
@@ -713,12 +755,15 @@ class PrefetchController(StorageControllerInterface):
         retentions = self._policy.select_l1_retentions(
             keys_to_reserve,
         )
+        reserve_start = time.perf_counter() if PROFILE_ENABLED else 0.0
         write_results = l1_mgr.reserve_write(
             keys=keys_to_reserve,
             is_temporary=[not r for r in retentions],
             layout_desc=request.layout_desc,
             mode="new",
         )
+        if PROFILE_ENABLED:
+            request.prof_l1_reserve_seconds += time.perf_counter() - reserve_start
 
         # Step 4: filter to successfully reserved keys
         reserved_key_set: set[ObjectKey] = set()
@@ -816,6 +861,8 @@ class PrefetchController(StorageControllerInterface):
             return
 
         ## Step 7: submit load tasks per adapter
+        if PROFILE_ENABLED:
+            request.prof_load_submit_at = time.perf_counter()
         for adapter_idx, bitmap in trimmed_plan.items():
             per_adapter_keys = bitmap.gather(request.keys)
             per_adapter_objs = [
@@ -964,6 +1011,8 @@ class PrefetchController(StorageControllerInterface):
         Partial load failures can create gaps, so a loaded key may fall
         outside the policy's retained set; its read lock must be released.
         """
+        if PROFILE_ENABLED:
+            request.prof_load_done_at = time.perf_counter()
         num_keys = len(request.keys)
 
         # Scatter per-adapter local load results into global positions.
@@ -1129,10 +1178,28 @@ class PrefetchController(StorageControllerInterface):
                     adapter_indices=tuple(resident_adapters),
                 )
 
+        breakdown: dict[str, float] = {}
+        if PROFILE_ENABLED and removed is not None:
+            # l2lk: lookup/pin span (submit -> all lookup results in).
+            # l2load: load span (load submit -> load done); 0 when nothing
+            # was loaded into L1 (e.g. all keys served L2-resident). l1rsv:
+            # the L1 write-reserve cost folded into the load phase.
+            if removed.prof_lookup_done_at and removed.prof_lookup_submit_at:
+                breakdown["l2lk"] = (
+                    removed.prof_lookup_done_at - removed.prof_lookup_submit_at
+                )
+            if removed.prof_load_done_at and removed.prof_load_submit_at:
+                breakdown["l2load"] = (
+                    removed.prof_load_done_at - removed.prof_load_submit_at
+                )
+            breakdown["l1rsv"] = removed.prof_l1_reserve_seconds
+
         with self._prefetch_results_lock:
             self._completed_results[request_id] = result
             if tier_info.keys:
                 self._completed_tier_info[request_id] = tier_info
+            if breakdown:
+                self._completed_breakdowns[request_id] = breakdown
 
         if removed is not None:
             self._status_in_flight_count -= 1

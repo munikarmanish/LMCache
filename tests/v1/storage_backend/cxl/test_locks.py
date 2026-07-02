@@ -61,9 +61,7 @@ def handle():
     with tempfile.NamedTemporaryFile(prefix="cxl-lock-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
-    cfg = CXLBootstrapConfig(
-        dev_path=path, region_size=REGION_SIZE, initialize=True
-    )
+    cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
     h = bootstrap_pool(cfg, _metadata())
     try:
         yield h
@@ -344,9 +342,7 @@ def test_fairness_smallest_seq_wins(handle):
 
 def test_waiter_times_out_if_no_manager(handle):
     """Without a manager to grant, acquire() eventually raises."""
-    lock = TwoTierLock(
-        handle, node_id=0, config=LockConfig(acquire_timeout_s=0.1)
-    )
+    lock = TwoTierLock(handle, node_id=0, config=LockConfig(acquire_timeout_s=0.1))
     with pytest.raises(LockAcquisitionTimeout):
         with lock.acquire(lock_id=13):
             pytest.fail("should not enter critical section")
@@ -430,7 +426,9 @@ def test_concurrent_soak_has_no_overlap(handle):
                     inside["n"] -= 1
 
     with _running_manager(handle, sweep_interval_s=0.0001):
-        threads = [threading.Thread(target=worker, args=(locks[n],)) for n in range(nodes)]
+        threads = [
+            threading.Thread(target=worker, args=(locks[n],)) for n in range(nodes)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -438,3 +436,106 @@ def test_concurrent_soak_has_no_overlap(handle):
 
     assert overlaps == [], f"overlapping critical sections: {overlaps[:5]}"
     assert counter["n"] == nodes * acquires_per_thread
+
+
+# ---------- batched acquire ----------
+
+
+def test_acquire_batch_grants_all_in_one_sweep(handle):
+    """N distinct lock_ids are granted by a single manager sweep.
+
+    This is the property that makes batched pin O(1) sweeps instead of
+    O(N): all rows are published WAITING before any wait, so one
+    sweep_once() — which arbitrates every lock_id independently — grants
+    the whole batch.
+    """
+    lock = TwoTierLock(handle, node_id=0, config=LockConfig(acquire_timeout_s=5))
+    mgr = LockManager(handle)
+
+    lock_ids = [3, 11, 27, 42, 99]
+    entered = threading.Event()
+    released = threading.Event()
+
+    def waiter():
+        with lock.acquire_batch(lock_ids):
+            entered.set()
+            released.wait(2)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+
+    # Wait until every row is published WAITING (Phase 2 done).
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if all(lock._row(i, 0).state == LOCK_STATE_WAITING for i in lock_ids):
+            break
+        time.sleep(0.001)
+    assert all(lock._row(i, 0).state == LOCK_STATE_WAITING for i in lock_ids)
+
+    # A SINGLE sweep grants all of them (distinct lock_ids, one grant each).
+    grants = mgr.sweep_once()
+    assert grants == len(lock_ids)
+    assert entered.wait(2)
+    released.set()
+    t.join(2)
+
+    # All rows dropped back to IDLE on exit.
+    for i in lock_ids:
+        assert lock._row(i, 0).state == LOCK_STATE_IDLE
+
+
+def test_acquire_batch_dedups_and_sorts(handle):
+    """Duplicate lock_ids collapse to one hold; empty input is a no-op."""
+    lock = TwoTierLock(handle, node_id=0, config=LockConfig(acquire_timeout_s=5))
+
+    # Empty batch: no-op, yields immediately without a manager.
+    with lock.acquire_batch([]):
+        pass
+
+    with _running_manager(handle, sweep_interval_s=0.0001):
+        # Duplicates and unsorted order resolve fine (single distinct lock).
+        with lock.acquire_batch([5, 5, 5]):
+            assert lock._row(5, 0).state == LOCK_STATE_LOCKED
+    assert lock._row(5, 0).state == LOCK_STATE_IDLE
+
+
+def test_acquire_batch_releases_on_exception(handle):
+    """All rows drop to IDLE even if the critical section raises."""
+    lock = TwoTierLock(handle, node_id=0, config=LockConfig(acquire_timeout_s=5))
+    lock_ids = [2, 8, 16]
+
+    with _running_manager(handle, sweep_interval_s=0.0001):
+        with pytest.raises(RuntimeError, match="boom"):
+            with lock.acquire_batch(lock_ids):
+                for i in lock_ids:
+                    assert lock._row(i, 0).state == LOCK_STATE_LOCKED
+                raise RuntimeError("boom")
+    for i in lock_ids:
+        assert lock._row(i, 0).state == LOCK_STATE_IDLE
+
+
+def test_acquire_batch_concurrent_no_deadlock(handle):
+    """Two batch callers with overlapping, opposite-order sets don't deadlock.
+
+    The sorted global acquisition order prevents the classic AB/BA cycle.
+    """
+    lock = TwoTierLock(handle, node_id=0, config=LockConfig(acquire_timeout_s=10))
+    done = []
+
+    def worker(ids):
+        with lock.acquire_batch(ids):
+            time.sleep(0.001)
+        done.append(tuple(ids))
+
+    with _running_manager(handle, sweep_interval_s=0.0001):
+        # Same two locks, requested in opposite order — would deadlock
+        # without the internal sort.
+        t1 = threading.Thread(target=worker, args=([4, 9],))
+        t2 = threading.Thread(target=worker, args=([9, 4],))
+        t1.start()
+        t2.start()
+        t1.join(5)
+        t2.join(5)
+
+    assert len(done) == 2
+    assert not t1.is_alive() and not t2.is_alive()

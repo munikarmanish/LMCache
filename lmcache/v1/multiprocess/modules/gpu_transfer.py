@@ -4,7 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from itertools import islice
-from typing import Generator
+from typing import Any, Generator
 import time
 
 # First Party
@@ -579,6 +579,9 @@ class GPUTransferModule:
             ValueError: If no GPU context is registered for the given instance ID.
         """
         st = time.perf_counter()
+        # Close the ``pf_wait`` span: the retrieve handler has picked up the
+        # request now that the prefetch has completed.
+        self._ctx.profiler.mark_retrieve_start(key.request_id)
         obj_keys = self._ctx.resolve_obj_keys(key)
 
         entry = self._cache_contexts.get(instance_id)
@@ -627,7 +630,37 @@ class GPUTransferModule:
         h2d_tokens: list[int] = []
         h2d_token_adapters: list[int] = []
 
+        # Profiling accumulators. Closed over by _retrieve_loop; only written
+        # when profiling is enabled.
+        #
+        # CPU-side launch cost (seconds): ``prof_fill_s`` is the H2D enqueue
+        # (L1 bounce + L2-resident submit_h2d), ``prof_scatter_s`` the
+        # multi_layer_block_kv_transfer kernel enqueue. These are pure Python /
+        # launch overhead — the copy returns before the DMA runs.
+        #
+        # GPU-side device time: ``prof_fill_events`` / ``prof_scatter_events``
+        # collect per-batch (start, end) CUDA event pairs recorded on the
+        # retrieve stream. After the loop we synchronize once and sum each
+        # pair's elapsed_time to get the actual DMA / kernel time on the
+        # device (reported as ret_h2d / ret_scat; the CPU launch cost is
+        # reported separately as h2d_cpu / scat_cpu).
+        #
+        # ``resident_bytes`` accumulates the L2-resident payload, which never
+        # appears in L1 ``memory_objs`` (so ``gb`` would otherwise be 0 for the
+        # all-resident CXL path).
+        profiler = self._ctx.profiler
+        prof_fill_s = 0.0
+        prof_scatter_s = 0.0
+        prof_resident_bytes = 0
+        prof_fill_events: list[tuple[Any, Any]] = []
+        prof_scatter_events: list[tuple[Any, Any]] = []
+
+        def _new_timing_event() -> Any:
+            """Create a CUDA timing event (records on the current stream)."""
+            return torch_dev.Event(enable_timing=True)
+
         def _retrieve_loop(sources: list[object]) -> None:
+            nonlocal prof_fill_s, prof_scatter_s, prof_resident_bytes
             _BATCH_SIZE = cache_context.max_batch_size
             groups = cache_context.kv_layer_groups_manager.kv_layer_groups
             for batch_idx, source_batch in enumerate(
@@ -664,20 +697,51 @@ class GPUTransferModule:
                 # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
                 # H2D copy: each source maps to its own batch slot. L1 sources
                 # bounce through the memory object; L2-resident sources DMA
-                # straight from the CXL pool into the same staging slot.
+                # straight from the L2 pool into the same staging slot.
+                #
+                # Gather all L2-resident sources in this batch and issue ONE
+                # batched submit_h2d call, instead of one call per chunk:
+                # the per-chunk Python/lock round-trips dominate the resident
+                # retrieve at long prompts. L1 sources keep their inline copy.
+                fill_start = time.perf_counter() if profiler.enabled else 0.0
+                if profiler.enabled:
+                    # Record device time for this batch's H2D fill on the
+                    # retrieve stream. fill_ev_end doubles as the scatter
+                    # start marker.
+                    fill_ev_start = _new_timing_event()
+                    fill_ev_end = _new_timing_event()
+                    scatter_ev_end = _new_timing_event()
+                    fill_ev_start.record()
+                resident_keys: list[object] = []
+                resident_adapters: list[int] = []
+                resident_ptrs: list[int] = []
+                resident_sizes: list[int] = []
                 for chunk_idx, source in enumerate(source_batch):
                     staging = cache_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx)
                     if isinstance(source, _ResidentSource):
-                        tokens = self._ctx.storage_manager.submit_h2d_for_l2_resident(
-                            [source.key],
-                            [source.adapter_idx],
-                            [staging.data_ptr()],
-                            [staging.nbytes],
-                        )
-                        h2d_tokens.append(tokens[0])
-                        h2d_token_adapters.append(source.adapter_idx)
+                        resident_keys.append(source.key)
+                        resident_adapters.append(source.adapter_idx)
+                        resident_ptrs.append(staging.data_ptr())
+                        resident_sizes.append(staging.nbytes)
                     else:
                         lmcache_memcpy_async_h2d(source, staging)
+                if resident_keys:
+                    batch_tokens = self._ctx.storage_manager.submit_h2d_for_l2_resident(
+                        resident_keys,
+                        resident_adapters,
+                        resident_ptrs,
+                        resident_sizes,
+                    )
+                    h2d_tokens.extend(batch_tokens)
+                    h2d_token_adapters.extend(resident_adapters)
+                if profiler.enabled:
+                    now = time.perf_counter()
+                    prof_fill_s += now - fill_start
+                    prof_resident_bytes += sum(resident_sizes)
+                    scatter_start = now
+                    # Marks end of fill / start of scatter on the stream.
+                    fill_ev_end.record()
+                    prof_fill_events.append((fill_ev_start, fill_ev_end))
                 for group_idx, group in enumerate(groups):
                     bpc = cache_context.blocks_for_tokens(
                         self._ctx.chunk_size, group_idx
@@ -718,6 +782,10 @@ class GPUTransferModule:
                         cache_context.gpu_kv_format_,
                         group_skip_blocks,
                     )
+                if profiler.enabled:
+                    prof_scatter_s += time.perf_counter() - scatter_start
+                    scatter_ev_end.record()
+                    prof_scatter_events.append((fill_ev_end, scatter_ev_end))
 
         with (
             torch_dev.device(cache_context.device),
@@ -744,9 +812,16 @@ class GPUTransferModule:
             retrieve_succeeded = False
             total_bytes = 0
             try:
+                ret_l1_start = time.perf_counter() if profiler.enabled else 0.0
                 with self._ctx.storage_manager.read_prefetched_results(
                     l1_keys
                 ) as memory_objs:
+                    if profiler.enabled:
+                        profiler.add(
+                            key.request_id,
+                            "ret_l1",
+                            time.perf_counter() - ret_l1_start,
+                        )
                     # read_prefetched_results yields None on an L1 miss and an
                     # empty list when l1_keys is empty (the all-L2-resident
                     # case, which is valid — those keys go straight to GPU via
@@ -770,6 +845,39 @@ class GPUTransferModule:
                     prefetched_keys = l1_keys[: len(memory_objs)]
                     total_bytes = sum(mo.get_size() for mo in memory_objs)
                     _retrieve_loop(sources)
+                    if profiler.enabled:
+                        # Drain the retrieve stream so the CUDA timing events
+                        # have all completed, then sum each batch's elapsed
+                        # device time. This sync is profiling-only overhead.
+                        cache_context.stream.synchronize()
+
+                        def _sum_events(pairs: list[tuple[object, object]]) -> float:
+                            total_ms = 0.0
+                            for ev_start, ev_end in pairs:
+                                total_ms += ev_start.elapsed_time(ev_end)
+                            return total_ms / 1000.0
+
+                        # ret_h2d / ret_scat = actual device DMA / kernel time.
+                        profiler.add(
+                            key.request_id, "ret_h2d", _sum_events(prof_fill_events)
+                        )
+                        profiler.add(
+                            key.request_id,
+                            "ret_scat",
+                            _sum_events(prof_scatter_events),
+                        )
+                        # h2d_cpu / scat_cpu = CPU-side launch overhead (the
+                        # async copies return before the DMA runs).
+                        profiler.add(key.request_id, "h2d_cpu", prof_fill_s)
+                        profiler.add(key.request_id, "scat_cpu", prof_scatter_s)
+                        # Resident (CXL) keys are copied GPU-direct and never
+                        # appear in L1 ``memory_objs``; add their bytes so ``gb``
+                        # reflects the full payload, not just the L1 subset.
+                        profiler.set_payload(
+                            key.request_id,
+                            len(sources),
+                            total_bytes + prof_resident_bytes,
+                        )
                 # Only set True when with-block exits normally
                 retrieve_succeeded = True
             except Exception:
@@ -777,6 +885,7 @@ class GPUTransferModule:
                 return event.ipc_handle(), False
             finally:
                 event.record()
+                unpin_start = time.perf_counter() if profiler.enabled else 0.0
                 if retrieve_succeeded:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
@@ -790,6 +899,12 @@ class GPUTransferModule:
                             "release_after_h2d",
                             (h2d_tokens, h2d_token_adapters),
                         )
+                    if profiler.enabled:
+                        profiler.add(
+                            key.request_id,
+                            "unpin",
+                            time.perf_counter() - unpin_start,
+                        )
                 elif resident_by_key:
                     # Failure path: no stream callback will run, so release
                     # the resident pins synchronously or they leak and block
@@ -801,6 +916,10 @@ class GPUTransferModule:
                 # Tier info is consumed exactly once per request — drop it so
                 # it can't leak (which would strand a CXL pin).
                 self._ctx.pop_tier_info(key.request_id)
+                # On a failed retrieve (early return) the PROFILE line is never
+                # emitted, so drop the profile entry here to avoid a leak.
+                if not retrieve_succeeded:
+                    self._ctx.profiler.discard(key.request_id)
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -823,5 +942,9 @@ class GPUTransferModule:
             tokens_retrieved,
             ed - st,
         )
+
+        # Emit the compact per-request PROFILE line (no-op unless LMC_PROFILE
+        # is set). End of the TTFT-critical retrieve path.
+        self._ctx.profiler.finish(key.request_id)
 
         return event.ipc_handle(), True

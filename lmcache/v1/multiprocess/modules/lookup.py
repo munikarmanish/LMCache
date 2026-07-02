@@ -176,6 +176,8 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA multi-reader locking.
         """
         model_name, world_size = key.model_name, key.world_size
+        self._ctx.profiler.begin(key.request_id)
+        look_start = time.perf_counter()
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_START,
@@ -275,6 +277,11 @@ class LookupModule:
             extra_count=extra_count,
             external_request_id=key.request_id,
         )
+        # ``look`` = synchronous lookup-handler cost (hash + submit);
+        # ``mark_submit`` anchors the async ``pf_wait`` span that the retrieve
+        # handler later closes.
+        self._ctx.profiler.add(key.request_id, "look", time.perf_counter() - look_start)
+        self._ctx.profiler.mark_submit(key.request_id)
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
@@ -354,6 +361,16 @@ class LookupModule:
         # the handle is still valid for the tier-info query.
         tier_info = self._ctx.storage_manager.query_prefetch_tier_info(job.handle)
         self._ctx.set_tier_info(request_id, tier_info)
+
+        # Fold the prefetch-thread stage breakdown (L2 lookup/pin, L1
+        # reserve, L2 load) into the per-request profile. These spans run
+        # concurrently inside the ``pf_wait`` window and are reported
+        # alongside it. Cheap no-op when profiling is off.
+        if self._ctx.profiler.enabled:
+            for stage, seconds in self._ctx.storage_manager.query_prefetch_breakdown(
+                job.handle
+            ).items():
+                self._ctx.profiler.add(request_id, stage, seconds)
 
         # NOTE(Kuntai): this assumes two things:
         # 1. the world size is the same between keys

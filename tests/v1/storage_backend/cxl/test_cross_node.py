@@ -208,9 +208,7 @@ class _FakeLocalTier:
             pin_count=0,
             fmt=fmt,
         )
-        return TensorMemoryObj(
-            raw_data=data, metadata=meta, parent_allocator=None
-        )
+        return TensorMemoryObj(raw_data=data, metadata=meta, parent_allocator=None)
 
 
 def _build_donor(backend: CXLBackend, local: _FakeLocalTier) -> CXLDonor:
@@ -392,3 +390,188 @@ def test_remote_fetch_releases_slots_when_donor_partial(two_node_pool):
     b.batched_submit_put_task(keys[1:], [_make_source_obj(256, 0x99) for _ in range(2)])
     for k in keys[1:]:
         assert b.contains(k)
+
+
+# ---------- commit-with-pin (born-pinned cross-node fetch) ----------
+
+
+def _pin_count(backend: CXLBackend, key: CacheEngineKey) -> int:
+    """Read the on-CXL pin_count for ``key`` (-1 if no VALID slot)."""
+    view = backend._index.lookup(key)
+    if view is None:
+        return -1
+    return int(backend._pool.slots()[view.slot_idx].line1.pin_count)
+
+
+def test_remote_fetch_commits_born_pinned(two_node_pool):
+    """Donor-committed slots land VALID with pin_count==1 in one step.
+
+    The requester's resident retrieve will release this pin after the H2D
+    drains, so the slot must already be pinned (eviction-protected) the
+    instant it is visible — no separate pin round-trip.
+    """
+    a, b = two_node_pool
+    a_local = _FakeLocalTier()
+    a_donor = _build_donor(a, a_local)
+
+    keys = [_make_key(0xCC01 + i) for i in range(3)]
+    for i, k in enumerate(keys):
+        a_local.put(k, bytes([i & 0xFF] * 1024))
+
+    result = remote_fetch(
+        requester_node_id=b._node_id,
+        keys=keys,
+        index_writer=b._index_writer,
+        donor_node_id=a._node_id,
+        donor=a_donor,
+        sender_id="node-b",
+        epoch=int(b._pool.header.gen),
+    )
+    assert result.num_satisfied == 3
+    assert result.status == PushStatus.OK
+    # Every freshly-committed slot is born-pinned.
+    assert result.born_pinned == [True, True, True]
+    for k in keys:
+        assert _pin_count(b, k) == 1
+
+
+def test_born_pinned_slot_survives_eviction(two_node_pool):
+    """A born-pinned slot refuses eviction until the pin is dropped.
+
+    This is the property the resident retrieve relies on: between commit
+    and the H2D drain, nothing may reclaim the slot.
+    """
+    a, b = two_node_pool
+    a_local = _FakeLocalTier()
+    a_donor = _build_donor(a, a_local)
+
+    key = _make_key(0xCC20)
+    a_local.put(key, b"\x5a" * 1024)
+
+    result = remote_fetch(
+        requester_node_id=b._node_id,
+        keys=[key],
+        index_writer=b._index_writer,
+        donor_node_id=a._node_id,
+        donor=a_donor,
+        sender_id="node-b",
+        epoch=int(b._pool.header.gen),
+    )
+    assert result.num_satisfied == 1
+    assert _pin_count(b, key) == 1
+
+    # Eviction must refuse while pinned (from either node's writer).
+    assert not a.remove(key)
+    assert not b.remove(key)
+
+    # Drop the pin (what the resident retrieve does after H2D drains);
+    # now the slot is reclaimable.
+    assert b.unpin(key)
+    assert _pin_count(b, key) == 0
+    assert b.remove(key)
+
+
+def test_already_present_slot_not_born_pinned(two_node_pool):
+    """ALREADY_PRESENT keys are not born-pinned by the fetch.
+
+    The slot was committed by an earlier (warm) put with pin_count==0, so
+    the fetch reports born_pinned=False and the caller must pin it itself.
+    """
+    a, b = two_node_pool
+    a_local = _FakeLocalTier()
+    a_donor = _build_donor(a, a_local)
+
+    key = _make_key(0xCC30)
+    a.batched_submit_put_task([key], [_make_source_obj(512, 0x77)])
+    assert _pin_count(b, key) == 0  # warm put leaves it unpinned
+
+    result = remote_fetch(
+        requester_node_id=b._node_id,
+        keys=[key],
+        index_writer=b._index_writer,
+        donor_node_id=a._node_id,
+        donor=a_donor,
+        sender_id="node-b",
+        epoch=int(b._pool.header.gen),
+    )
+    assert result.num_satisfied == 1
+    assert result.born_pinned == [False]
+    # Still unpinned — the caller (lookup path) is responsible for pinning.
+    assert _pin_count(b, key) == 0
+
+
+def test_partial_fetch_does_not_leave_pinned_uncommitted_slots(two_node_pool):
+    """Past-prefix slots the donor didn't return are not left pinned.
+
+    With only a 1-key local prefix, keys[1:] are not committed; their
+    reserved slots must be released (EMPTY), never stranded as a pinned
+    VALID slot that blocks eviction forever.
+    """
+    a, b = two_node_pool
+    a_local = _FakeLocalTier()
+    a_donor = _build_donor(a, a_local)
+
+    keys = [_make_key(0xCC50 + i) for i in range(3)]
+    a_local.put(keys[0], b"\x10" * 256)  # only 1 of 3
+
+    result = remote_fetch(
+        requester_node_id=b._node_id,
+        keys=keys,
+        index_writer=b._index_writer,
+        donor_node_id=a._node_id,
+        donor=a_donor,
+        sender_id="node-b",
+        epoch=int(b._pool.header.gen),
+    )
+    assert result.num_satisfied == 1
+    assert result.born_pinned == [True]
+    assert _pin_count(b, keys[0]) == 1
+    # The uncommitted keys have no VALID slot (released to EMPTY).
+    assert _pin_count(b, keys[1]) == -1
+    assert _pin_count(b, keys[2]) == -1
+
+
+def test_batched_alloc_multi_chunk_fetch(two_node_pool):
+    """A multi-chunk fetch commits the whole batch via the donor alloc_batch.
+
+    Exercises ``handle_push``'s batched-allocation path: a batch larger than
+    one chunk is allocated in a single heap lock hold, every chunk is
+    committed VALID+born-pinned, and B reads each back with the right
+    payload. The donor consumes exactly ``n`` chunks for the committed batch.
+    """
+    a, b = two_node_pool
+    a_local = _FakeLocalTier()
+    a_donor = _build_donor(a, a_local)
+
+    n = 16
+    keys = [_make_key(0xCD00 + i) for i in range(n)]
+    for i, k in enumerate(keys):
+        a_local.put(k, bytes([i & 0xFF] * 2048))
+
+    used_before = a._heap.stats().total_slots - a._heap.stats().free_slots
+    result = remote_fetch(
+        requester_node_id=b._node_id,
+        keys=keys,
+        index_writer=b._index_writer,
+        donor_node_id=a._node_id,
+        donor=a_donor,
+        sender_id="node-b",
+        epoch=int(b._pool.header.gen),
+    )
+    assert result.num_satisfied == n
+    assert result.status == PushStatus.OK
+    assert result.born_pinned == [True] * n
+
+    # The donor consumed exactly n chunks for the committed batch (used-slot
+    # count grew by n, regardless of lazy region claims).
+    stats = a._heap.stats()
+    assert stats.total_slots - stats.free_slots == used_before + n
+
+    # B reads every chunk back with the right payload, and each is pinned.
+    for i, k in enumerate(keys):
+        assert b.contains(k)
+        assert _pin_count(b, k) == 1
+        got = b.get_blocking(k)
+        assert got is not None
+        assert int(got.raw_data[0]) == (i & 0xFF)
+        got.ref_count_down()
