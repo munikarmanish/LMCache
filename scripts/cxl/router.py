@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Lightweight KV-aware router for the 2-node cxl_e2e harness.
+"""Lightweight KV-aware router for the 2-node cxl harness.
 
 Sits in front of N vLLM nodes (static list passed at startup) and forwards
 OpenAI-compatible requests to one of them per a selectable routing strategy.
@@ -536,7 +536,7 @@ def build_app(cfg: RouterConfig) -> FastAPI:
         scraper.cancel()
         await app.state.client.aclose()
 
-    app = FastAPI(title="cxl_e2e lightweight router", lifespan=lifespan)
+    app = FastAPI(title="cxl lightweight router", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict:

@@ -17,11 +17,11 @@ no control plane, no index translation — just the data path in question.
 Roles (run donor first, then reader; both on the lmcache venv python):
 
   # on c1 (donor):
-  ~/.virtualenvs/lmcache/bin/python scripts/cxl_e2e/probe_nixl_rdma.py donor \
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/probe_nixl_rdma.py donor \
       --bind 0.0.0.0:9600 --chunk-mib 32 --chunks 105
 
   # on c2 (reader), pointing at c1:
-  ~/.virtualenvs/lmcache/bin/python scripts/cxl_e2e/probe_nixl_rdma.py reader \
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/probe_nixl_rdma.py reader \
       --peer-init <c1-ip>:9600 --chunk-mib 32 --chunks 105 --iters 5
 
 The reader prints, per iteration: transfer ms, GB/s, and whether every

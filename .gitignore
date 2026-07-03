@@ -81,7 +81,7 @@ lmcache/experimental/tests
 
 # benchmark results
 *.csv
-scripts/cxl_e2e/results/
+scripts/cxl/results/
 
 # disk cache
 /remote_disk

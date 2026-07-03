@@ -15,7 +15,7 @@
 #     the pool is a single shared /dev/dax mmap both nodes read/write, so a
 #     live wipe from one node would corrupt the peer's in-flight reads.
 #   To get a cold CXL pool, RESTART node0 with "initialize": true in its CXL
-#   config (scripts/cxl_e2e/config/cxl.node0.json already sets this) — the
+#   config (scripts/cxl/config/cxl.node0.json already sets this) — the
 #   bootstrap then zeroes the header, region bitmap, descriptors, and index.
 #   i.e. re-run: ./launch_node.sh 0 cxl   (node0 is the CXL initializer)
 #

@@ -32,8 +32,8 @@ into the LLC and is written back to media asynchronously; see _time_copy.)
 
 Run on a CUDA box (lmcache venv). For the CXL source, run where the DAX
 device is mappable (not in a sandbox that SIGBUSes on DAX mmap):
-  ~/.virtualenvs/lmcache/bin/python scripts/cxl_e2e/bench_h2d.py
-  ~/.virtualenvs/lmcache/bin/python scripts/cxl_e2e/bench_h2d.py \
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_h2d.py
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_h2d.py \
       --cxl-dev /dev/dax0.0
 """
 

@@ -27,7 +27,7 @@ Methods:
 Run on a node with the real CXL device (NOT in a sandbox that SIGBUSes on
 DAX mmap). Use the lmcache venv python:
 
-  ~/.virtualenvs/lmcache/bin/python scripts/cxl_e2e/bench_cxl_write.py \
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_cxl_write.py \
       --dev /dev/dax0.0 --chunk-mib 32 --chunks 105 --iters 5
 
 Reports GB/s per method (median of ``--iters``). Higher is better.
