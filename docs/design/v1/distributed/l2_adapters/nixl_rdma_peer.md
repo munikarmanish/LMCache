@@ -10,10 +10,11 @@ and is wired into the MP-mode `StorageManager` as a `--l2-adapter` type
 (`nixl_peer`) alongside `cxl`, `nixl_store`, and `mock`.
 
 It is the network analogue of the
-[CXL adapter](lmcache/v1/distributed/l2_adapters/cxl_l2_adapter.py): same
+[CXL adapter](docs/design/v1/distributed/l2_adapters/cxl_l2_adapter.md): same
 "L1-first, L2 fetches the misses from peers and prefetches them into L1"
 shape, but the peers are on other hosts reachable by RDMA rather than a
-shared CXL pool.
+shared CXL pool. (One difference: the CXL adapter can also serve a hit
+GPU-direct; this adapter always lands chunks in L1 first.)
 
 ---
 
@@ -121,28 +122,51 @@ control RPC must: (1) resolve hash → page indices on the peer, and
 how `pd_backend` exchanges `remote_indexes` via an alloc/query RPC before
 its RDMA transfer.
 
-**Addressing: byte offset → descriptor index.** A NIXL prepped transfer
-is addressed by *descriptor index* — the channel registers one descriptor
-per `align_bytes` (one chunk) of the L1 buffer, so descriptor `i` covers
-bytes `[i·align_bytes, (i+1)·align_bytes)`. But the v1 L1 allocator
+**Addressing: byte offset → descriptor index, and the 2 MiB page.** A NIXL
+prepped transfer is addressed by *descriptor index*. The channel registers
+one descriptor per **`page_size` bytes** of the L1 buffer, so descriptor
+`i` covers bytes `[i·page_size, (i+1)·page_size)`. The v1 L1 allocator
 (`TensorMemoryAllocator`) stores `MemoryObj.meta.address` as a **byte
-offset**, not a page index. So a chunk's descriptor index is
-`meta.address // align_bytes`:
+offset**, so a chunk's *base* descriptor index is `meta.address // page_size`.
 
-- the **donor** converts its chunk's offset to an index in
-  `RemoteLookupResp.page_indices` ([`nixl_peer_donor.py`](lmcache/v1/distributed/l2_adapters/nixl_peer_donor.py));
-- the **requester** converts each local destination buffer's offset the
-  same way before the READ (`_NixlReadChannel.read_chunks` in
-  [`nixl_peer_l2_adapter.py`](lmcache/v1/distributed/l2_adapters/nixl_peer_l2_adapter.py)).
+`page_size` is a **fixed 2 MiB constant** (`nixl_page_bytes`), set once in
+`build_nixl_peer_adapter_from_config` and shared by both the read channel
+and the donor — **not** derived from the L1 allocator's `align_bytes`.
+Rationale (see the comment at
+[`nixl_peer_l2_adapter.py`](lmcache/v1/distributed/l2_adapters/nixl_peer_l2_adapter.py),
+`build_nixl_peer_adapter_from_config`):
 
-This is why the adapter drives `make_prepped_xfer` through its own
-`_NixlReadChannel` wrapper rather than `NixlChannel.batched_read`: the
-latter passes `meta.address` (the byte offset) to NIXL verbatim, which is
-correct only for a *paged* allocator (where `meta.address` already is the
-index, as in `pd_backend`) and produces a "local index out of range" error
-for the byte-offset L1 allocator used here. Both nodes must register L1
-with the same `align_bytes`, which holds when the rack shares model
-geometry + dtype.
+- A KV chunk is much larger than a page (e.g. 32 MiB), so it spans
+  `chunk_bytes / 2 MiB` descriptors (16, not thousands as with a 4 KiB
+  page). Each transfer is then a handful of large RDMA ops at ~line rate,
+  and the per-chunk index expansion stays tiny.
+- **This is a cross-node wire contract.** The donor returns
+  `meta.address // page_size` as a chunk's base index; the requester expands
+  by `chunk_bytes // page_size`. Both nodes MUST use the same `page_size` or
+  the index arithmetic desyncs and corrupts KV. It is a hardcoded constant
+  precisely so all nodes agree — not left to per-node geometry.
+- The factory **fails loudly** (`ValueError`) if the L1 buffer size is not a
+  multiple of 2 MiB, rather than silently picking a desyncing size. Size the
+  L1 buffer (`--l1-size-gb`) so it tiles evenly at 2 MiB.
+
+**A chunk spans MANY descriptors — expand them all.** Because a chunk is
+`pages_per_chunk = chunk_bytes // page_size` descriptors wide,
+`_NixlReadChannel.read_chunks`
+([`nixl_peer_l2_adapter.py`](lmcache/v1/distributed/l2_adapters/nixl_peer_l2_adapter.py))
+expands each chunk's *base* index into all `pages_per_chunk` consecutive
+descriptor indices — both local and remote, paired in order — before the
+READ. It guards that each local address is page-aligned and each chunk size
+is a whole number of pages (`ValueError` otherwise). **This is a correctness
+fix, not just a perf change:** without the expansion, NIXL paired only each
+chunk's first descriptor and transferred **only the first page of each
+chunk** — the bug that made a 3.3 GB READ "complete" in ~1.6 ms with corrupt
+tails.
+
+This is also why the adapter drives `make_prepped_xfer` through its own
+`_NixlReadChannel` wrapper rather than `NixlChannel.batched_read`: it needs
+the base-index → full-descriptor-range expansion, which `batched_read`
+(which passes `meta.address` verbatim, correct only for a *paged* allocator
+like `pd_backend`) does not do.
 
 ---
 
@@ -179,16 +203,20 @@ leak a remote read-lock.
 
 ```
 - For each key the controller asks us to load, look up its entry in the
-  remote pin table -> (peer_id, remote_index).
-- Group by peer. For each peer, one NixlChannel.batched_read:
-      local_indices  = [dst.meta.address for dst in that peer's l1_buffers]
-      remote_indexes = [entry.remote_index for those keys]
-      channel.batched_read(l1_buffers,
-                           {"sender_id": peer_id,
-                            "remote_indexes": remote_indexes})
+  remote pin table -> (peer_id, remote_base_index).
+- Group by peer. For each peer, one _NixlReadChannel.read_chunks(buffers,
+  remote_base_indices, peer_id):
+      * expand each (dst buffer, remote_base) into all pages_per_chunk
+        consecutive (local_index, remote_index) descriptor pairs (see §3);
+      * make_prepped_xfer("READ", ...) over the fully-expanded index lists;
+        transfer + busy-wait until the xfer state is DONE.
   This is a one-sided RDMA READ: peer bytes -> our L1 buffer. No peer CPU.
-- set bitmap bit per key whose READ returned DONE.
+- set bitmap bit per key whose READ completed.
 ```
+
+(Historical note: an earlier design called `NixlChannel.batched_read`
+directly. That is gone — it cannot do the per-chunk base-index → descriptor
+expansion the 2 MiB page requires, §3.)
 
 The destination `l1_buffers` are the write-locked L1 objects the
 `PrefetchController` reserved. After the READ lands, the controller flips
@@ -201,11 +229,19 @@ load plan** once load completes (`_unlock_all_plan_keys`). That is our
 hook to release the peer's read-lock:
 
 ```
-- Group the keys by the peer that holds their pin (from the pin table).
-- Per peer: RemoteUnlockReq{hashes[]} --ZMQ--> peer
-      peer: for each hash, finish_read its L1 chunk (drop the read-lock).
+- Group the keys by (peer, lease_id) from the pin table.
+- Per group: RemoteUnlockReq{sender_id, lease_id, hashes[]} --ZMQ--> peer
+      peer: for each hash under that lease, finish_read its L1 chunk
+            (drop the read-lock).
 - Drop the entries from the local remote pin table.
 ```
+
+Each lookup stamps a monotonic `lease_id` (a first-class wire field on
+`RemoteLookupReq`/`RemoteUnlockReq`, see
+[`nixl_peer_messages.py`](lmcache/v1/distributed/l2_adapters/nixl_peer_messages.py)).
+The donor keys its pins by `(lease_id, ObjectKey)`, so unlock releases
+exactly the pins this request took even if the same chunk is concurrently
+locked under another lease.
 
 `submit_unlock` is fire-and-forget per the interface contract: it must
 *eventually* succeed and never be retried by the caller, so the adapter
@@ -258,22 +294,33 @@ only what already lives in their own L1 from their own traffic.
       "init_url":    "tcp://hostB:8501" } // peer's NIXL handshake side-channel
   ],
   "control_bind_url": "tcp://0.0.0.0:8500", // our control REP server
-  "init_bind_url":    "tcp://0.0.0.0:8501", // our NIXL handshake server
+  "init_bind_url":    "0.0.0.0:8501",   // our NIXL handshake server (bare host:port ok)
   "nixl_backends": ["UCX"],             // NIXL data-plane backend(s)
   "control_timeout_ms": 30000,
   "lease_ms": 60000,                    // remote read-lock lease / sweep window
+  "device": "cpu",                      // device the L1 buffer lives on
 
-  // geometry — must match across the rack (page-size / dtype agreement)
+  // geometry — must match across the rack
   "model_name": "...", "world_size": 8,
   "kv_dtype_str": "torch.bfloat16",
   "kv_shape": [32, 2, 256, 8, 128],
-  "use_mla": false, "cluster_chunk_size": 256
+  "use_mla": false, "cluster_chunk_size": 256,
+
+  // worker identity (not part of geometry)
+  "worker_id": 0, "local_world_size": 1, "local_worker_id": 0
 }
 ```
 
 The factory needs both `l1_memory_desc` (to register the L1 buffer with
 NIXL for RDMA) and `l1_manager` (for the donor side to read-lock/serve
 local chunks) — it opts into both kwargs, which the registry forwards.
+
+**Deployment constraint:** the L1 buffer size must be a multiple of the
+2 MiB NIXL descriptor size (§3), or the factory raises `ValueError`. Size
+`--l1-size-gb` so the buffer tiles evenly at 2 MiB. The `page_size` is no
+longer derived from geometry — geometry still must agree for a *hit*, but
+descriptor agreement is guaranteed by the fixed 2 MiB constant, not by
+`align_bytes`.
 
 ---
 
@@ -286,7 +333,8 @@ local chunks) — it opts into both kwargs, which the registry forwards.
 | Control RPC to a peer times out | ZMQ recv timeout | That peer contributes no hits this round; other peers still consulted. Logged. |
 | RDMA READ errors (`status == ERR`) | `NixlChannel.batched_read` raises | Affected keys' bitmap bits stay 0 (load miss); pins still released via `submit_unlock`. |
 | Requester dies between lookup and unlock | Donor lease expires | Donor sweep calls `finish_read` on expired pins; chunk becomes evictable again. |
-| Geometry / page-size mismatch between peers | Rejected at handshake (page size disagreement) or guarded by geometry fields | Peer connection refused; logged. |
+| L1 buffer not a multiple of the 2 MiB descriptor size | Factory `ValueError` at startup (§3) | Fail loud — adjust `--l1-size-gb`. Prevents a node silently picking a desyncing page size. |
+| Geometry mismatch between peers (wrong model/dtype) | Guarded by geometry fields; a chunk simply won't match | Key stays a miss; logged. |
 
 ---
 
@@ -294,8 +342,10 @@ local chunks) — it opts into both kwargs, which the registry forwards.
 
 - [`NixlChannel`](lmcache/v1/transfer_channel/nixl_channel.py) —
   agent↔agent handshake (`lazy_init_peer_connection`,
-  `get_agent_metadata`/`add_remote_agent`) and `batched_read`
-  (one-sided RDMA READ by page index). Already used by `pd_backend`.
+  `get_agent_metadata`/`add_remote_agent`) and the underlying
+  `make_prepped_xfer` READ primitive. Its `batched_read` helper is used by
+  `pd_backend`; this adapter instead drives `make_prepped_xfer` directly
+  through `_NixlReadChannel` for the 2 MiB descriptor expansion (§3).
 - The donor read-lock pattern from
   [`cxl_l1_donor.py`](lmcache/v1/distributed/l2_adapters/cxl_l1_donor.py)
   (`reserve_read` → serve → `finish_read`).
