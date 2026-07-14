@@ -42,7 +42,9 @@ REGION_SIZE = 2 * (1 << 20)
 CHUNK_SIZE = 64 * 1024
 
 
-def _make_config(path: str, *, initialize: bool, run_lock_manager: bool) -> CXLL2AdapterConfig:
+def _make_config(
+    path: str, *, initialize: bool, run_lock_manager: bool
+) -> CXLL2AdapterConfig:
     return CXLL2AdapterConfig(
         dev_path=path,
         node_id=0,
@@ -137,7 +139,11 @@ def test_factory_dispatches_cxl_config(tmp_path):
     try:
         assert isinstance(a, CXLL2Adapter)
         # Distinct event fds (per base-class invariant).
-        fds = {a.get_store_event_fd(), a.get_lookup_and_lock_event_fd(), a.get_load_event_fd()}
+        fds = {
+            a.get_store_event_fd(),
+            a.get_lookup_and_lock_event_fd(),
+            a.get_load_event_fd(),
+        }
         assert len(fds) == 3
     finally:
         a.close()
@@ -414,9 +420,7 @@ def test_concurrent_store_and_load(adapter):
 
                 dst = _empty_dst_obj(256)
                 load_id = adapter.submit_load_task([key], [dst])
-                load_bm = _poll_until(
-                    lambda: adapter.query_load_result(load_id)
-                )
+                load_bm = _poll_until(lambda: adapter.query_load_result(load_id))
                 assert load_bm.test(0)
                 assert int(dst.raw_data[0]) == base & 0xFF
 
@@ -438,3 +442,207 @@ def test_concurrent_store_and_load(adapter):
     finally:
         stop_dispatcher.set()
         dispatcher.join(2)
+
+
+# ---------- eviction spill (synchronous store path) ----------
+
+
+def test_spill_store_round_trip(adapter):
+    """spill_store lands bytes identically to submit_store_task."""
+    keys = [_make_object_key(0x5001 + i) for i in range(3)]
+    payloads = [_make_payload_obj(1024, fill_byte=0x70 + i) for i in range(3)]
+
+    result = adapter.spill_store(keys, payloads, timeout_s=5.0)
+    assert result.is_successful()
+    assert result.bytes_transferred() == sum(p.get_size() for p in payloads)
+
+    # Lookup-and-lock, then load, and verify byte-equality with the source.
+    lookup_id = adapter.submit_lookup_and_lock_task(keys)
+    _wait_efd(adapter.get_lookup_and_lock_event_fd())
+    bitmap = adapter.query_lookup_and_lock_result(lookup_id)
+    assert bitmap is not None and bitmap.popcount() == 3
+
+    dst_objs = [_empty_dst_obj(1024) for _ in range(3)]
+    load_id = adapter.submit_load_task(keys, dst_objs)
+    _wait_efd(adapter.get_load_event_fd())
+    load_bitmap = adapter.query_load_result(load_id)
+    assert load_bitmap is not None and load_bitmap.popcount() == 3
+    for i, dst in enumerate(dst_objs):
+        assert int(dst.raw_data[0]) == 0x70 + i, f"dst[{i}] wrong fill"
+
+    adapter.submit_unlock(keys)
+
+
+def test_spill_store_does_not_touch_completion_channel(adapter):
+    """Contention regression: spill_store must NOT populate the map drained
+    by pop_completed_store_tasks, and must NOT steal an async store's result.
+
+    This guards the core correctness property — the async store controller
+    and the synchronous eviction spill share only the backend, never the
+    completion bookkeeping.
+    """
+    # 1. A spill on its own leaves the async completion map empty.
+    spill_keys = [_make_object_key(0x6001 + i) for i in range(2)]
+    spill_payloads = [_make_payload_obj(256, 0x11) for _ in range(2)]
+    assert adapter.spill_store(spill_keys, spill_payloads, 5.0).is_successful()
+    assert adapter.pop_completed_store_tasks() == {}
+
+    # 2. Submit an async store, then spill, then drain: the async store's
+    #    result must still be present and intact (spill didn't steal it).
+    async_keys = [_make_object_key(0x6100 + i) for i in range(2)]
+    async_payloads = [_make_payload_obj(256, 0x22) for _ in range(2)]
+    store_id = adapter.submit_store_task(async_keys, async_payloads)
+
+    more_spill_keys = [_make_object_key(0x6200 + i) for i in range(2)]
+    more_spill_payloads = [_make_payload_obj(256, 0x33) for _ in range(2)]
+    assert adapter.spill_store(
+        more_spill_keys, more_spill_payloads, 5.0
+    ).is_successful()
+
+    _wait_efd(adapter.get_store_event_fd())
+    completed = adapter.pop_completed_store_tasks()
+    assert store_id in completed
+    assert completed[store_id].is_successful()
+    # Only the async task is present; the two spills never registered a task.
+    assert list(completed.keys()) == [store_id]
+
+
+# ---------- standalone / dead-peer operation ----------
+
+
+class _FakeCXLPeerClient:
+    """Stand-in for a CXLP2PClient whose donor server is down.
+
+    ``handle_push`` (invoked by ``remote_fetch``) records that it was
+    called so a test can assert a dead peer is skipped, and raises when
+    ``up`` is False. ``ping`` reports liveness for the monitor.
+    """
+
+    def __init__(self):
+        self.up = False
+        self.push_calls = 0
+        self.pings = 0
+
+    def handle_push(self, msg):
+        self.push_calls += 1
+        if not self.up:
+            raise RuntimeError("donor server down")
+        # First Party
+        from lmcache.v1.storage_backend.cxl.p2p_messages import (
+            PushKVToCXLRetMsg,
+            PushStatus,
+        )
+
+        return PushKVToCXLRetMsg(num_committed=0, status=PushStatus.ALL_NACK)
+
+    def ping(self, sender_id, timeout_ms):
+        self.pings += 1
+        return self.up
+
+    def close(self):
+        pass
+
+
+def _make_adapter_with_fake_peer(path, control, *, probe_interval_s=0.05):
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
+    from lmcache.v1.metadata import LMCacheMetadata
+    from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
+
+    backend_config = CXLBackendConfig(
+        dev_path=path,
+        node_id=0,
+        chunk_size_bytes=CHUNK_SIZE,
+        region_size=REGION_SIZE,
+        initialize=True,
+        generation=1,
+        run_lock_manager=True,
+    )
+    metadata = LMCacheMetadata(
+        model_name="cxl-l2-test",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float16,
+        kv_shape=(4, 2, 16, 4, 64),
+        use_mla=False,
+        chunk_size=16,
+    )
+    backend = CXLBackend(backend_config, metadata)
+
+    peer_clients = [(1, control)]
+    monitor = PeerHealthMonitor(
+        num_peers=1,
+        probe_fn=lambda i: control.ping("node-0", 200),
+        probe_interval_s=probe_interval_s,
+        name="test-cxl-health",
+    )
+    adapter = CXLL2Adapter(
+        backend=backend,
+        metadata=metadata,
+        p2p_server=None,
+        peer_clients=peer_clients,
+        health_monitor=monitor,
+    )
+    return adapter, control
+
+
+def _run_cxl_lookup(adapter, keys, timeout_s=5.0):
+    task_id = adapter.submit_lookup_and_lock_task(keys)
+    _wait_efd(adapter.get_lookup_and_lock_event_fd(), timeout_s)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        bm = adapter.query_lookup_and_lock_result(task_id)
+        if bm is not None:
+            return bm
+        time.sleep(0.005)
+    raise AssertionError("lookup result not ready")
+
+
+def test_cxl_dead_peer_is_skipped_on_miss():
+    # A local miss would normally trigger remote_fetch -> handle_push. With
+    # the peer marked dead, the lookup must skip it (never call handle_push)
+    # and return all-miss promptly instead of blocking on the donor.
+    with tempfile.NamedTemporaryFile(prefix="cxl-l2-", delete=False) as f:
+        f.truncate(POOL_SIZE)
+        path = f.name
+    control = _FakeCXLPeerClient()  # up=False
+    adapter, control = _make_adapter_with_fake_peer(path, control)
+    try:
+        time.sleep(0.2)  # let the prober run a (failing) sweep
+        bm = _run_cxl_lookup(adapter, [_make_object_key(0xDEAD)])
+        assert bm.popcount() == 0
+        assert control.push_calls == 0  # dead peer skipped
+        assert control.pings >= 1  # but probed in the background
+    finally:
+        adapter.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_cxl_peer_consulted_once_online():
+    # When the peer comes online, the prober promotes it and a subsequent
+    # miss lookup consults it (handle_push is called).
+    with tempfile.NamedTemporaryFile(prefix="cxl-l2-", delete=False) as f:
+        f.truncate(POOL_SIZE)
+        path = f.name
+    control = _FakeCXLPeerClient()
+    adapter, control = _make_adapter_with_fake_peer(path, control)
+    try:
+        time.sleep(0.2)
+        control.up = True
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not adapter._health_monitor.is_alive(0):
+            time.sleep(0.01)
+        assert adapter._health_monitor.is_alive(0)
+        _run_cxl_lookup(adapter, [_make_object_key(0xBEEF)])
+        assert control.push_calls >= 1
+    finally:
+        adapter.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass

@@ -134,11 +134,12 @@ wait_for_http() {
 # 1. MP server -> terminal AND log file.
 # ---------------------------------------------------------------------------
 export LMC_PROFILE=0
+
 L2_JSON="$(jq -c -s '.[0] * .[1]' "$BASE" "$OVERRIDE" \
     | sed -e "s/NODE0_HOST/${NODE0_HOST}/g" -e "s/NODE1_HOST/${NODE1_HOST}/g")"
 
-L2_STORE_POLICY="default"
-#L2_STORE_POLICY="lazy"
+# L2_STORE_POLICY="default"
+L2_STORE_POLICY="lazy"
 
 L2_PREFETCH_POLICY="default"
 #L2_PREFETCH_POLICY="retain"
@@ -147,7 +148,7 @@ lmcache server \
     --host localhost --port "$LMC_ZMQ_PORT" \
     --http-host 0.0.0.0 --http-port "$LMC_HTTP_PORT" \
     --hash-algorithm builtin \
-    --l1-size-gb 92 --eviction-policy LRU \
+    --l1-size-gb 64 --eviction-policy LRU \
     --l2-store-policy "$L2_STORE_POLICY" \
     --l2-prefetch-policy "$L2_PREFETCH_POLICY" \
     --l2-adapter "$L2_JSON" \

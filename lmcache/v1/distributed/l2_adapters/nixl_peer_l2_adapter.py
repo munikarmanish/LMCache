@@ -69,6 +69,7 @@ from lmcache.v1.distributed.l2_adapters.nixl_peer_messages import (
     RemoteLookupReq,
     RemoteUnlockReq,
 )
+from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
 from lmcache.v1.distributed.l2_adapters.nixl_peer_transport import (
     NixlPeerControlClient,
 )
@@ -384,6 +385,15 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
         nixl_backends: list[str] | None = None,
         control_timeout_ms: int = 30000,
         lease_ms: int = 60000,
+        # Peer liveness / background reconnection (see PeerHealthMonitor).
+        # A configured peer that is down is marked dead and SKIPPED on the
+        # lookup path so a lookup never pays its control_timeout_ms; a
+        # background thread pings dead peers every peer_probe_interval_ms
+        # with a short peer_probe_timeout_ms and promotes any that answer,
+        # so a node launched alone works standalone and picks up peers that
+        # come online later.
+        peer_probe_interval_ms: int = 5000,
+        peer_probe_timeout_ms: int = 1000,
         device: str = "cpu",
         model_name: str = "",
         world_size: int = 1,
@@ -430,6 +440,10 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("control_timeout_ms must be a positive integer")
         if not isinstance(lease_ms, int) or lease_ms <= 0:
             raise ValueError("lease_ms must be a positive integer")
+        if not isinstance(peer_probe_interval_ms, int) or peer_probe_interval_ms <= 0:
+            raise ValueError("peer_probe_interval_ms must be a positive integer")
+        if not isinstance(peer_probe_timeout_ms, int) or peer_probe_timeout_ms <= 0:
+            raise ValueError("peer_probe_timeout_ms must be a positive integer")
 
         self.node_id = node_id
         self.peers = peers_list
@@ -438,6 +452,8 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
         self.nixl_backends = list(nixl_backends) if nixl_backends else ["UCX"]
         self.control_timeout_ms = control_timeout_ms
         self.lease_ms = lease_ms
+        self.peer_probe_interval_ms = peer_probe_interval_ms
+        self.peer_probe_timeout_ms = peer_probe_timeout_ms
         self.device = device
         self.model_name = model_name
         self.world_size = world_size
@@ -474,6 +490,8 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             nixl_backends=nixl_backends,
             control_timeout_ms=int(d.get("control_timeout_ms", 30000)),
             lease_ms=int(d.get("lease_ms", 60000)),
+            peer_probe_interval_ms=int(d.get("peer_probe_interval_ms", 5000)),
+            peer_probe_timeout_ms=int(d.get("peer_probe_timeout_ms", 1000)),
             device=d.get("device", "cpu"),
             model_name=d.get("model_name", ""),
             world_size=int(d.get("world_size", 1)),
@@ -504,6 +522,11 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             "- control_timeout_ms (int): control RPC timeout (default 30000)\n"
             "- lease_ms (int): remote read-lock lease before donor reclaim "
             "(default 60000)\n"
+            "- peer_probe_interval_ms (int): background ping interval for dead "
+            "peers (default 5000). Dead peers are skipped on the lookup path "
+            "so a lone node never blocks on them.\n"
+            "- peer_probe_timeout_ms (int): timeout for a single liveness ping "
+            "(default 1000; far shorter than control_timeout_ms)\n"
             "- device (str): L1 buffer device registered with NIXL "
             "(default 'cpu')\n"
             "- model_name, world_size, kv_dtype_str, kv_shape, use_mla, "
@@ -544,6 +567,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         connect_timeout_s: float = 10.0,
         register_peer_callback: bool = True,
         eager_connect: bool = True,
+        health_monitor: PeerHealthMonitor | None = None,
     ):
         """Initialize the adapter.
 
@@ -564,6 +588,12 @@ class NixlPeerL2Adapter(L2AdapterInterface):
             eager_connect: If ``True``, kick off a background outbound
                 handshake to each peer at startup. Tests may pass
                 ``False`` to isolate the lazy-on-hit path.
+            health_monitor: Optional peer-liveness monitor. When present,
+                ``_do_lookup`` skips peers it marks dead (so a lookup never
+                pays a dead peer's ``control_timeout_ms``) and its
+                background thread pings dead peers to pick them up when
+                they come online. ``None`` in tests that drive liveness
+                directly.
         """
         # Pull-only tier: no aggregate capacity, no global eviction.
         super().__init__(max_capacity_bytes=0)
@@ -574,6 +604,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         self._sender_id = f"node-{node_id}"
         self._control_server = control_server
         self._connect_timeout_s = connect_timeout_s
+        self._health_monitor = health_monitor
 
         # Index peers by their data-channel id so the inbound-handshake
         # callback can mark the right one connected.
@@ -614,6 +645,12 @@ class NixlPeerL2Adapter(L2AdapterInterface):
                 asyncio.run_coroutine_threadsafe(
                     self._ensure_peer_connected(peer), self._loop
                 )
+
+        # Start the background peer prober (if configured). It pings dead
+        # peers so a peer that is down at startup — or dies mid-run — is
+        # skipped on the lookup path and picked back up when it recovers.
+        if self._health_monitor is not None:
+            self._health_monitor.start()
 
     # ---------------- event fds ----------------
 
@@ -676,6 +713,16 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         for peer_index, peer in enumerate(self._peers):
             if not pending:
                 break
+            # Skip peers the health monitor believes are dead: a live
+            # lookup RPC to a down peer would block for the full
+            # control_timeout_ms. A node running alone (all peers dead)
+            # therefore returns an all-miss bitmap immediately, and the
+            # background prober flips a peer back to alive once it answers
+            # a ping.
+            if self._health_monitor is not None and not self._health_monitor.is_alive(
+                peer_index
+            ):
+                continue
             lease_id = f"{self._sender_id}-{next(self._lease_counter)}"
             wire_keys = [object_key_to_wire_key(keys[i]) for i in pending]
             req = RemoteLookupReq(
@@ -687,8 +734,16 @@ class NixlPeerL2Adapter(L2AdapterInterface):
             try:
                 resp = await self._loop.run_in_executor(None, peer.control.lookup, req)
             except Exception:
+                # A live peer just failed to answer: demote it so the next
+                # lookup skips it instead of paying the timeout again.
+                if self._health_monitor is not None:
+                    self._health_monitor.record_failure(peer_index)
                 logger.debug("RemoteLookup to peer node_id=%d failed", peer.node_id)
                 continue
+
+            # The peer answered — it is reachable.
+            if self._health_monitor is not None:
+                self._health_monitor.record_success(peer_index)
 
             hit_positions = [
                 local_pos
@@ -982,6 +1037,15 @@ class NixlPeerL2Adapter(L2AdapterInterface):
     # ---------------- close ----------------
 
     def close(self) -> None:
+        # Stop the background peer prober before closing the control
+        # clients it probes through.
+        if self._health_monitor is not None:
+            try:
+                self._health_monitor.stop()
+            except Exception:
+                logger.exception("PeerHealthMonitor.stop failed during shutdown")
+            self._health_monitor = None
+
         if self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join(timeout=5)
@@ -1191,12 +1255,35 @@ def build_nixl_peer_adapter_from_config(
         config.nixl_backends,
     )
 
+    # Peer liveness monitor: probes dead peers' control servers off the
+    # lookup path so a node launched alone (or before its peers) never
+    # blocks on them, and picks a peer back up when it comes online.
+    health_monitor: PeerHealthMonitor | None = None
+    if peers:
+        sender_id = f"node-{config.node_id}"
+        probe_timeout_ms = config.peer_probe_timeout_ms
+
+        def _probe_peer(peer_index: int) -> bool:
+            return peers[peer_index].control.ping(sender_id, probe_timeout_ms)
+
+        def _describe_peer(peer_index: int) -> str:
+            return f"peer node_id={peers[peer_index].node_id}"
+
+        health_monitor = PeerHealthMonitor(
+            num_peers=len(peers),
+            probe_fn=_probe_peer,
+            probe_interval_s=config.peer_probe_interval_ms / 1000.0,
+            name="nixl-peer-health",
+            describe_fn=_describe_peer,
+        )
+
     return NixlPeerL2Adapter(
         peers=peers,
         data_channel=read_channel,
         node_id=config.node_id,
         control_server=control_server,
         connect_timeout_s=config.control_timeout_ms / 1000.0,
+        health_monitor=health_monitor,
     )
 
 

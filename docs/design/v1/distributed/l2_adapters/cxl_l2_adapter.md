@@ -197,6 +197,39 @@ retried by the caller). Drops the pins taken in lookup via
 `self._backend.unpin_batch(ce_keys)` — again **one batched lock acquisition**
 for the whole set instead of one sweep per key.
 
+### 4.4 SPILL STORE (`spill_store` → `_do_spill_store`)
+
+Used by the `L1EvictionController` to spill an L1-evicted chunk into CXL when
+`eviction_destination == "L2_CACHE"` (see
+[`l2_eviction.md`](docs/design/v1/distributed/l2_adapters/l2_eviction.md)). It is
+the **only synchronous, blocking** store entry point on the adapter:
+`spill_store(keys, objects, timeout_s) -> L2StoreResult`.
+
+Unlike the async `submit_store_task`/`pop_completed_store_tasks` pair (used by
+`StoreController`), `spill_store`:
+
+- Runs the *same* backend write — `batched_submit_put_task` on the adapter's
+  asyncio loop — but blocks on its own `concurrent.futures.Future` and returns the
+  `L2StoreResult` directly.
+- **Never** allocates a shared `L2TaskId`, **never** writes `_completed_store`,
+  and **never** signals `_store_efd`. This is deliberate: the async store
+  controller and the synchronous eviction loop both run against this adapter, and
+  `pop_completed_store_tasks()` drains *all* completions — sharing the channel
+  would let one thread steal the other's results and leak read locks. The two
+  paths share only `CXLBackend`, never the completion bookkeeping.
+- Fires `_notify_keys_stored(keys, sizes)` so the adapter's own L2 eviction
+  accounting tracks the newly resident bytes (these bytes never went through the
+  normal `StoreController` write path). This is why `__init__` now calls
+  `super().__init__()` — to initialize the base listener list and byte counters.
+- **Timeout caveat:** on `timeout_s` expiry `spill_store` cancels the future and
+  reports failure, but a `batched_submit_put_task` already in flight is not
+  cancellable mid-C-call and may still land. Because the controller
+  discards-on-failure, the key is deleted from L1 while the copy may still be
+  landing in CXL — the net effect is simply that the "failed" spill actually
+  succeeded (the chunk is in CXL and gone from L1). No data loss; a later store
+  of the same `chunk_hash` is idempotent at the shared index (`ALREADY_PRESENT`).
+  Set `spill_timeout_s` generously for large chunks so this stays rare.
+
 ---
 
 ## 5. Cross-node `PushKVToCXL` (when only a peer's DRAM has the chunk)
@@ -242,6 +275,34 @@ truncates it; committed-but-past-the-gap slots are unpinned, evicted to `TOMB`,
 and their chunks freed so the requester only ever sees a clean prefix. `status`
 is `OK` (all keys), `PARTIAL` (short prefix — the requester may retry the tail on
 the next peer), `ALL_NACK`, or `EPOCH_STALE`.
+
+### 5.1 Peer liveness — never block on a dead peer
+
+The peer list is *static*, so a configured peer may be down: the operator
+launched this node first, the peer crashed, or it is simply unreachable. Without
+liveness tracking, **every** lookup miss would issue `remote_fetch` →
+`CXLP2PClient.handle_push` and block for the full `cxl_p2p_timeout_ms` (seconds)
+before falling through — a node launched alone would stall on every miss.
+
+A
+[`PeerHealthMonitor`](lmcache/v1/distributed/l2_adapters/peer_health.py) (shared
+with the NIXL peer adapter) keeps that cost off the request path:
+
+- Each peer carries an `alive` flag. `_try_remote_fetch_misses` **skips** peers
+  marked dead — an instant fall-through, no RPC. A node whose peers are all dead
+  therefore serves misses at local-miss speed and never blocks.
+- The request path reports outcomes: a `remote_fetch` that raises **demotes** the
+  peer immediately (so at most one lookup pays the timeout when a live peer
+  dies); any answer — even `ALL_NACK` — **promotes** it.
+- A background daemon thread pings the *dead* peers every
+  `peer_probe_interval_ms` via `CXLP2PClient.ping` (a `PingMsg`/`PingRetMsg`
+  round-trip on the short `peer_probe_timeout_ms`, touching no pool state). A peer
+  that answers is promoted back to alive. This is what lets a lone node pick up a
+  peer that comes online later — with no request ever blocking. The first sweep
+  runs immediately at startup, so peers that are already up are promoted within
+  one ping timeout, off-path. Peers start **dead** (optimism would let the very
+  first miss block), so cross-node fetch is available a probe-interval after
+  startup at the latest.
 
 ---
 
@@ -345,6 +406,8 @@ class from the registry.
   "peers": [ { "node_id": 1, "url": "tcp://NODE1_HOST:8447" } ],  // peer's CXLP2PServer
   "cxl_p2p_bind_url": "tcp://0.0.0.0:8447",  // our donor server bind
   "cxl_p2p_timeout_ms": 30000,               // requester ZMQ timeout (donor push can take seconds)
+  "peer_probe_interval_ms": 5000,            // background liveness-ping interval for DEAD peers
+  "peer_probe_timeout_ms": 1000,             // single-ping timeout (far shorter than cxl_p2p_timeout_ms)
 
   // geom_hash inputs — MUST match across the rack:
   "model_name": "meta-llama/Llama-3.1-8B-Instruct",
@@ -356,8 +419,10 @@ class from the registry.
 
 `build_cxl_adapter_from_config` builds the `CXLBackend`, and — only if `peers`
 *and* an `l1_manager` are present — an `L1LocalCopyProvider`, a `CXLDonor`, a
-`CXLP2PServer` at `cxl_p2p_bind_url`, and one `CXLP2PClient` per peer. With peers
-but no `l1_manager` it warns and disables cross-node fetch.
+`CXLP2PServer` at `cxl_p2p_bind_url`, and one `CXLP2PClient` per peer. When any
+peer clients exist it also builds a `PeerHealthMonitor` that pings dead peers
+off-path (§5.1). With peers but no `l1_manager` it warns and disables cross-node
+fetch.
 
 ---
 
@@ -366,6 +431,7 @@ but no `l1_manager` it warns and disables cross-node fetch.
 | What fails | Detection | Recovery |
 |---|---|---|
 | Chunk not in pool nor any peer | `pin_batch` miss + all peers `found=0` | Key stays a miss; retrieve recomputes. |
+| Peer down (never launched, crashed, unreachable) | `PeerHealthMonitor` ping fails / a live `remote_fetch` raises | Peer marked **dead** and skipped on the request path (no timeout stall); background prober re-pings every `peer_probe_interval_ms` and promotes it when it answers (§5.1). |
 | Controller restart (stale generation) | donor `msg.epoch != header.gen` → `EPOCH_STALE`; slot re-check on `reserve` | Requester releases all reserved slots; stale-but-matching slots become `TOMB` candidates. |
 | Heap out of regions mid-push | `alloc_batch` short prefix | `effective` capped → `PARTIAL`; requester retries tail on next peer. |
 | Born-pinned slot not `VALID` at verify | requester's verify step | Requester unpins the orphaned pin so it doesn't leak. |

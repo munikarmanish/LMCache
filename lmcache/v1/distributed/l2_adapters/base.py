@@ -231,6 +231,41 @@ class L2AdapterInterface(ABC):
         """
         pass
 
+    def spill_store(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        timeout_s: float,
+    ) -> L2StoreResult:
+        """Synchronously store objects into L2 for an L1-eviction spill.
+
+        Unlike :meth:`submit_store_task`, this method BLOCKS until the store
+        finishes (or ``timeout_s`` elapses) and returns the result directly.
+        It must NOT allocate a shared ``L2TaskId`` and must NOT deposit the
+        result into the map drained by :meth:`pop_completed_store_tasks`. This
+        lets a synchronous caller (the L1 eviction loop) wait for completion
+        without racing the asynchronous store controller for the shared
+        completion channel: the two paths share only the underlying storage,
+        never the completion bookkeeping.
+
+        The default implementation declines by returning a failure result, so
+        adapters that cannot serve as an eviction spill target opt out
+        automatically and the caller falls back to discarding the keys.
+
+        Args:
+            keys (list[ObjectKey]): the keys to be stored. Must be the same
+                length as ``objects``.
+            objects (list[MemoryObj]): the caller-owned memory objects to be
+                stored. The caller keeps them alive (read-locked) for the
+                duration of this call.
+            timeout_s (float): maximum seconds to wait for the store to
+                complete before reporting failure.
+
+        Returns:
+            L2StoreResult: success flag plus bytes actually transferred.
+        """
+        return L2StoreResult(success=False, bytes_transferred=0)
+
     #####################
     # Lookup and Lock Interface
     #####################

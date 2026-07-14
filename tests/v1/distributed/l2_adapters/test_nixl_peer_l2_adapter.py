@@ -807,6 +807,173 @@ def test_adapter_no_peers_returns_all_miss():
 
 
 # ---------------------------------------------------------------------------
+# Standalone operation: a peer that is down must not block lookups, and the
+# background prober must pick it up when it comes online.
+# ---------------------------------------------------------------------------
+
+
+class _DeadControlClient:
+    """Control client for a peer whose server is down.
+
+    ``lookup`` raises (as a real timed-out RPC would), ``ping`` reports
+    unreachable, and a test can flip ``up`` to simulate the peer coming
+    online — after which both succeed.
+    """
+
+    def __init__(self):
+        self.up = False
+        self.lookups = 0
+        self.pings = 0
+
+    def lookup(self, req):
+        self.lookups += 1
+        if not self.up:
+            raise RuntimeError("peer control server down")
+        # Alive but holds nothing: empty positional response.
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.nixl_peer_messages import (
+            RemoteLookupResp,
+        )
+
+        n = len(req.keys)
+        return RemoteLookupResp(
+            found=[False] * n,
+            page_indices=[-1] * n,
+            sizes=[0] * n,
+            peer_agent_id="node-1",
+        )
+
+    def ping(self, sender_id, timeout_ms):
+        self.pings += 1
+        return self.up
+
+    def unlock(self, req):
+        return None
+
+    def close(self):
+        pass
+
+
+def _make_adapter_with_dead_peer(control, *, probe_interval_s=0.05):
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
+
+    peers = [
+        _Peer(
+            node_id=1,
+            peer_id="node-1",
+            control=control,
+            init_url="127.0.0.1:9999",
+            local_id="node-0",
+        )
+    ]
+    monitor = PeerHealthMonitor(
+        num_peers=1,
+        probe_fn=lambda i: control.ping("node-0", 200),
+        probe_interval_s=probe_interval_s,
+        name="test-nixl-health",
+    )
+    channel = FakeDataChannel()
+    adapter = NixlPeerL2Adapter(
+        peers=peers,
+        data_channel=channel,
+        node_id=0,
+        control_server=None,
+        eager_connect=False,
+        register_peer_callback=False,
+        health_monitor=monitor,
+    )
+    return adapter, control
+
+
+def test_adapter_skips_dead_peer_without_calling_lookup():
+    # A peer that is down starts DEAD; the monitor's first probe fails, so
+    # lookups skip it entirely (no control.lookup, no timeout stall).
+    control = _DeadControlClient()  # up=False
+    adapter, control = _make_adapter_with_dead_peer(control)
+    try:
+        # Let the prober run at least one (failing) sweep.
+        time.sleep(0.2)
+        bitmap = _run_lookup(adapter, [_make_object_key(10)])
+        assert bitmap.popcount() == 0
+        # The dead peer was skipped: lookup() was never issued to it.
+        assert control.lookups == 0
+        # But it WAS probed in the background.
+        assert control.pings >= 1
+    finally:
+        adapter.close()
+
+
+def test_adapter_picks_up_peer_when_it_comes_online():
+    # The peer is down at first, then comes up. The background prober must
+    # promote it so a subsequent lookup consults it (control.lookup runs).
+    control = _DeadControlClient()  # up=False
+    adapter, control = _make_adapter_with_dead_peer(control)
+    try:
+        time.sleep(0.2)
+        # Peer comes online.
+        control.up = True
+        # Prober should promote it within a couple of intervals.
+        _poll_until(
+            lambda: True if adapter._health_monitor.is_alive(0) else None,
+            timeout_s=3.0,
+        )
+        # Now a lookup consults the (now-alive) peer.
+        _run_lookup(adapter, [_make_object_key(10)])
+        assert control.lookups >= 1
+    finally:
+        adapter.close()
+
+
+def test_adapter_demotes_peer_on_lookup_failure():
+    # A peer that is "alive" per the monitor but fails a live lookup must
+    # be demoted so the NEXT lookup skips it instead of paying the timeout
+    # again.
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
+
+    control = _DeadControlClient()  # up=False -> lookup raises
+    peers = [
+        _Peer(
+            node_id=1,
+            peer_id="node-1",
+            control=control,
+            init_url="127.0.0.1:9999",
+            local_id="node-0",
+        )
+    ]
+    # Start the peer ALIVE and give the prober a long interval so it does
+    # not interfere: we want to observe the request-path demotion.
+    monitor = PeerHealthMonitor(
+        num_peers=1,
+        probe_fn=lambda i: control.ping("node-0", 200),
+        probe_interval_s=100.0,
+        start_alive=True,
+    )
+    channel = FakeDataChannel()
+    adapter = NixlPeerL2Adapter(
+        peers=peers,
+        data_channel=channel,
+        node_id=0,
+        control_server=None,
+        eager_connect=False,
+        register_peer_callback=False,
+        health_monitor=monitor,
+    )
+    try:
+        # First lookup: peer is "alive", so lookup IS attempted and fails,
+        # demoting the peer.
+        _run_lookup(adapter, [_make_object_key(10)])
+        assert control.lookups == 1
+        assert not adapter._health_monitor.is_alive(0)
+        # Second lookup: peer now dead -> skipped, no new lookup attempt.
+        _run_lookup(adapter, [_make_object_key(11)])
+        assert control.lookups == 1
+    finally:
+        adapter.close()
+
+
+# ---------------------------------------------------------------------------
 # _NixlReadChannel descriptor-index expansion (the chunk-vs-page granularity
 # that previously transferred only the first page of each chunk)
 # ---------------------------------------------------------------------------

@@ -148,3 +148,6 @@ operator/Dockerfile.cross
 
 # Compiled gettext catalogs (built from .po at HTML build time)
 docs/source/locale/**/*.mo
+
+# Claude Code session scratch (per-session plan artifacts)
+.claude/plans/

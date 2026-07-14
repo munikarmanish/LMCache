@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 import asyncio
+import concurrent.futures
 import ctypes
 import os
 import threading
@@ -50,6 +51,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mp_observability.profile import PROFILE_ENABLED
@@ -120,6 +122,18 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         # for larger pools or larger prompts. The default 5 s in
         # CXLP2PClient is too tight for prompts > ~2k tokens on Llama 8B.
         cxl_p2p_timeout_ms: int = 30000,
+        # Peer liveness / background reconnection (see PeerHealthMonitor).
+        # A configured peer that is down (not launched yet, crashed, or
+        # unreachable) is marked dead and SKIPPED on the request path, so a
+        # lookup miss never blocks on it. A background thread pings dead
+        # peers every `peer_probe_interval_ms` with a short
+        # `peer_probe_timeout_ms` timeout and promotes any that answer — so
+        # a node launched alone works standalone and picks up peers that
+        # come online later. The probe timeout is intentionally far shorter
+        # than `cxl_p2p_timeout_ms` (which sizes a real donor push): a probe
+        # only needs a round-trip, not a multi-second copy.
+        peer_probe_interval_ms: int = 5000,
+        peer_probe_timeout_ms: int = 1000,
         # Geom-hash inputs:
         model_name: str = "",
         world_size: int = 1,
@@ -166,6 +180,10 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("cxl_p2p_bind_url must be a non-empty string")
         if not isinstance(cxl_p2p_timeout_ms, int) or cxl_p2p_timeout_ms <= 0:
             raise ValueError("cxl_p2p_timeout_ms must be a positive integer")
+        if not isinstance(peer_probe_interval_ms, int) or peer_probe_interval_ms <= 0:
+            raise ValueError("peer_probe_interval_ms must be a positive integer")
+        if not isinstance(peer_probe_timeout_ms, int) or peer_probe_timeout_ms <= 0:
+            raise ValueError("peer_probe_timeout_ms must be a positive integer")
 
         self.dev_path = dev_path
         self.node_id = node_id
@@ -181,6 +199,8 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         self.peers = peers_list
         self.cxl_p2p_bind_url = cxl_p2p_bind_url
         self.cxl_p2p_timeout_ms = cxl_p2p_timeout_ms
+        self.peer_probe_interval_ms = peer_probe_interval_ms
+        self.peer_probe_timeout_ms = peer_probe_timeout_ms
         self.model_name = model_name
         self.world_size = world_size
         self.kv_dtype_str = kv_dtype_str
@@ -228,6 +248,8 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             peers=peers,
             cxl_p2p_bind_url=d.get("cxl_p2p_bind_url", "tcp://0.0.0.0:8447"),
             cxl_p2p_timeout_ms=int(d.get("cxl_p2p_timeout_ms", 30000)),
+            peer_probe_interval_ms=int(d.get("peer_probe_interval_ms", 5000)),
+            peer_probe_timeout_ms=int(d.get("peer_probe_timeout_ms", 1000)),
             model_name=d.get("model_name", ""),
             world_size=int(d.get("world_size", 1)),
             kv_dtype_str=d.get("kv_dtype_str", "torch.float16"),
@@ -258,6 +280,11 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             "Each url is the peer's CXLP2PServer endpoint.\n"
             "- cxl_p2p_bind_url (str): bind URL for this node's CXLP2PServer "
             "(default tcp://0.0.0.0:8447)\n"
+            "- peer_probe_interval_ms (int): background ping interval for dead "
+            "peers (default 5000). Dead peers are skipped on the request path "
+            "so a lone node never blocks on them.\n"
+            "- peer_probe_timeout_ms (int): timeout for a single liveness ping "
+            "(default 1000; far shorter than cxl_p2p_timeout_ms)\n"
             "- model_name, world_size, kv_dtype_str, kv_shape, use_mla, "
             "cluster_chunk_size: feed the geom_hash; must match across the rack\n"
             "- worker_id, local_world_size, local_worker_id: worker identity"
@@ -327,7 +354,14 @@ class CXLL2Adapter(L2AdapterInterface):
         *,
         p2p_server: Optional["object"] = None,
         peer_clients: Optional[list["object"]] = None,
+        health_monitor: Optional[PeerHealthMonitor] = None,
     ):
+        # Initialize base-class listener list and byte accounting so
+        # ``_notify_keys_stored`` (used by the eviction-spill path) and
+        # ``get_usage`` work. ``max_capacity_bytes=0`` keeps the adapter out
+        # of aggregate global eviction, matching prior behavior.
+        super().__init__()
+
         self._backend = backend
         self._metadata = metadata
 
@@ -339,6 +373,16 @@ class CXLL2Adapter(L2AdapterInterface):
         # exactly like before (no remote fetch).
         self._p2p_server = p2p_server
         self._peer_clients: list = peer_clients or []
+
+        # Peer liveness: a dead peer (never launched, crashed, or
+        # unreachable) is skipped on the request path so a lookup miss
+        # never blocks on it, and a background thread pings dead peers to
+        # pick them up when they come online. Absent (``None``) in tests
+        # that inject no peers — the fetch path then treats every peer as
+        # alive, preserving the pre-monitor behavior.
+        self._health_monitor = health_monitor
+        if self._health_monitor is not None:
+            self._health_monitor.start()
 
         # Distinct event fds per kind (per the base class invariant).
         self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
@@ -423,6 +467,68 @@ class CXLL2Adapter(L2AdapterInterface):
             done = self._completed_store
             self._completed_store = {}
         return done
+
+    def spill_store(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        timeout_s: float,
+    ) -> L2StoreResult:
+        """Synchronously copy ``objects`` into CXL for an L1-eviction spill.
+
+        Runs the same backend write as :meth:`submit_store_task` on the
+        adapter's asyncio loop but blocks on its own future and returns the
+        result directly. It never allocates a shared ``L2TaskId``, never
+        writes ``_completed_store``, and never signals ``_store_efd``, so it
+        cannot race the async store controller for the shared completion
+        channel (see :meth:`L2AdapterInterface.spill_store`).
+
+        Args:
+            keys (list[ObjectKey]): keys to store; same length as ``objects``.
+            objects (list[MemoryObj]): caller-owned (read-locked) objects.
+            timeout_s (float): max seconds to wait before reporting failure.
+
+        Returns:
+            L2StoreResult: success flag plus bytes actually transferred.
+        """
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_spill_store(keys, list(objects)), self._loop
+        )
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            logger.warning(
+                "CXL spill_store timed out after %.1fs (%d keys); "
+                "the backend copy may still land.",
+                timeout_s,
+                len(keys),
+            )
+            return L2StoreResult(success=False, bytes_transferred=0)
+        except Exception:
+            logger.exception("CXL spill_store failed")
+            return L2StoreResult(success=False, bytes_transferred=0)
+
+    async def _do_spill_store(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> L2StoreResult:
+        """Backend write for :meth:`spill_store`, returning the result inline.
+
+        Mirrors :meth:`_do_store` but returns an ``L2StoreResult`` instead of
+        depositing into ``_completed_store``, and notifies the adapter's own
+        L2 eviction accounting of the newly resident bytes.
+        """
+        try:
+            ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
+            self._backend.batched_submit_put_task(ce_keys, objects)
+            sizes = [obj.get_size() for obj in objects]
+            self._notify_keys_stored(keys, sizes)
+            return L2StoreResult(success=True, bytes_transferred=sum(sizes))
+        except Exception:
+            logger.exception("CXL _do_spill_store failed")
+            return L2StoreResult(success=False, bytes_transferred=0)
 
     # ---------------- lookup-and-lock ----------------
 
@@ -527,7 +633,17 @@ class CXLL2Adapter(L2AdapterInterface):
         # the re-pin loop below adds repin. Empty (and unused) unless profiling.
         timings: dict[str, float] = {} if PROFILE_ENABLED else None  # type: ignore[assignment]
 
-        for donor_node_id, client in self._peer_clients:
+        for peer_index, (donor_node_id, client) in enumerate(self._peer_clients):
+            # Skip peers the health monitor currently believes are dead:
+            # issuing remote_fetch to a down peer would block on the full
+            # cxl_p2p_timeout_ms. A lone node (all peers dead) therefore
+            # falls straight through to "all misses stay misses" with no
+            # stall. The background prober flips a peer back to alive once
+            # it answers a ping, so this recovers automatically.
+            if self._health_monitor is not None and not self._health_monitor.is_alive(
+                peer_index
+            ):
+                continue
             try:
                 result = remote_fetch(
                     requester_node_id=self._backend._node_id,
@@ -540,10 +656,18 @@ class CXLL2Adapter(L2AdapterInterface):
                     timings=timings,
                 )
             except Exception:
+                # A live peer just failed: demote it so the next lookup
+                # skips it instead of paying the timeout again.
+                if self._health_monitor is not None:
+                    self._health_monitor.record_failure(peer_index)
                 logger.exception(
                     "remote_fetch to peer node_id=%d failed", donor_node_id
                 )
                 continue
+
+            # The peer answered (even a 0-key/NACK reply proves liveness).
+            if self._health_monitor is not None:
+                self._health_monitor.record_success(peer_index)
 
             num = result.num_satisfied
             if num <= 0:
@@ -942,6 +1066,15 @@ class CXLL2Adapter(L2AdapterInterface):
         os.close(self._lookup_efd)
         os.close(self._load_efd)
 
+        # Stop the background peer prober before tearing down the clients
+        # it probes through.
+        if self._health_monitor is not None:
+            try:
+                self._health_monitor.stop()
+            except Exception:
+                logger.exception("PeerHealthMonitor.stop failed during shutdown")
+            self._health_monitor = None
+
         # Tear down P2P side first so we stop accepting requests before
         # the backend closes the pool.
         if self._p2p_server is not None:
@@ -1103,11 +1236,34 @@ def build_cxl_adapter_from_config(
             "skipping donor/peer setup. Cross-node fetch will be disabled."
         )
 
+    # Peer liveness monitor: probes dead peers off the request path so a
+    # node launched alone (or before its peers) never blocks on them. The
+    # probe is a short-timeout ZMQ ping against the peer's CXLP2PServer.
+    health_monitor: PeerHealthMonitor | None = None
+    if peer_clients:
+        sender_id = f"node-{backend._node_id}"
+        probe_timeout_ms = config.peer_probe_timeout_ms
+
+        def _probe_peer(peer_index: int) -> bool:
+            return peer_clients[peer_index][1].ping(sender_id, probe_timeout_ms)
+
+        def _describe_peer(peer_index: int) -> str:
+            return f"peer node_id={peer_clients[peer_index][0]}"
+
+        health_monitor = PeerHealthMonitor(
+            num_peers=len(peer_clients),
+            probe_fn=_probe_peer,
+            probe_interval_s=config.peer_probe_interval_ms / 1000.0,
+            name="cxl-peer-health",
+            describe_fn=_describe_peer,
+        )
+
     return CXLL2Adapter(
         backend=backend,
         metadata=metadata,
         p2p_server=p2p_server,
         peer_clients=peer_clients,
+        health_monitor=health_monitor,
     )
 
 

@@ -271,3 +271,65 @@ multi-inheritance). They differ in how they are wired:
 | Config location     | `StorageManagerConfig.eviction_config` | `L2AdapterConfigBase.eviction_config` |
 | Cardinality         | One per `StorageManager`             | One controller for all adapters       |
 | Created by          | `StorageManager.__init__`            | `StorageManager.__init__`             |
+| Eviction target     | `DISCARD` or `L2_CACHE` (spill)      | `DISCARD` only                        |
+
+## L1 → L2 Spill (`eviction_destination = "L2_CACHE"`)
+
+By default, L1 eviction **discards** the least-recently-used keys. When
+`EvictionConfig.eviction_destination == "L2_CACHE"` and a CXL L2 adapter is
+configured, the `L1EvictionController` instead **spills** each evicted key into
+the CXL adapter *before* deleting it from L1, giving a second byte-addressable
+cache tier that survives L1 pressure.
+
+### Configuration
+
+`eviction_destination` (`"DISCARD"` default, or `"L2_CACHE"`) and
+`spill_timeout_s` (default `5.0`) live on `EvictionConfig` (the L1 eviction
+config; the L2 controller shares the dataclass but ignores these fields). CLI:
+`--eviction-destination`, `--eviction-spill-timeout-s`.
+
+The spill target is selected in `StorageManager.__init__`: the **first**
+configured L2 adapter of type `"cxl"`, captured **unwrapped** (spill writes raw
+KV bytes and bypasses any serde wrapper). If `eviction_destination == "L2_CACHE"`
+but no CXL adapter exists, the controller logs a warning and stays on `DISCARD`.
+The controller registers `EvictionDestination.L2_CACHE` on its policy only when
+both the config asks for it and a spill adapter is present, so the policy never
+emits an un-handleable action.
+
+### Spill sequence
+
+`L1EvictionController.execute_eviction_action` dispatches `L2_CACHE` actions to
+`_spill_to_l2(keys)`:
+
+```
+reserve_read(keys)          # hold read locks → buffers can't be freed mid-copy
+  → filter L1Error.SUCCESS  # write-locked / missing keys are skipped this cycle
+  → spill_adapter.spill_store(locked_keys, objs, spill_timeout_s)   # SYNC store
+  → finish_read(locked_keys)                                        # release locks
+  → l1_manager.delete(locked_keys)   # ALWAYS delete (discard-on-failure)
+       ├─ success → publish L1_EVICTION_SPILLED
+       └─ failure/timeout → warn + publish L1_EVICTION_SPILL_FAILED
+```
+
+The sequence mirrors `StoreController`'s write path (reserve_read → store →
+finish_read → delete), but is independent of the `store_policy` — so it works
+even under `LazyStorePolicy`, the usual CXL deployment default.
+
+**Discard-on-failure:** on spill failure or timeout the keys are deleted from L1
+anyway, so memory is always reclaimed; only the observability signal differs.
+(Under sustained CXL failure L1 stays above watermark and emits
+`L1_EVICTION_SPILL_FAILED` each cycle — a loud signal.)
+
+### Why `spill_store` (not `submit_store_task`)
+
+CXL is simultaneously a `StoreController` target and the spill target, and
+`pop_completed_store_tasks()` drains **all** completions. If the synchronous
+eviction loop shared the async submit/pop channel, the two threads would steal
+each other's completions and `StoreController`'s in-flight tasks would never
+finalize (leaking read locks). The dedicated **synchronous**
+`L2AdapterInterface.spill_store(keys, objects, timeout_s) -> L2StoreResult`
+blocks on its own future and never allocates a shared task id, never writes the
+completion map, and never signals the store eventfd — so the two paths share only
+the underlying backend, never the completion bookkeeping. The base
+implementation returns failure, so adapters that cannot spill opt out and the
+controller falls back to `DISCARD`.

@@ -23,6 +23,7 @@ from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.config import get_type_name_for_config
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
@@ -62,23 +63,27 @@ class StorageManager:
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
-        # L1 eviction controller
-        self._eviction_controller = L1EvictionController(
-            l1_manager=self._l1_manager,
-            eviction_config=config.eviction_config,
-        )
-        self._eviction_controller.start()
-
-        # L2 adapters and store controller. When an adapter config carries
-        # a ``serde_config``, the adapter is wrapped with
-        # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
-        # and serde is transparent.
+        # L2 adapters must be built before the L1 eviction controller so the
+        # controller can be handed a CXL spill target (for
+        # ``eviction_destination == "L2_CACHE"``). When an adapter config
+        # carries a ``serde_config``, the adapter is wrapped with
+        # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter and
+        # serde is transparent. The spill target is the *unwrapped* CXL
+        # adapter (spill writes raw KV, bypassing serde), so we capture it
+        # here before wrapping.
         l1_memory_desc = self._l1_manager.get_l1_memory_desc()
         self._l2_adapters: list[L2AdapterInterface] = []
+        spill_adapter: L2AdapterInterface | None = None
         for ac in config.l2_adapter_config.adapters:
             adapter: L2AdapterInterface = create_l2_adapter(
                 ac, l1_memory_desc, l1_manager=self._l1_manager
             )
+            if (
+                spill_adapter is None
+                and config.eviction_config.eviction_destination == "L2_CACHE"
+                and get_type_name_for_config(ac) == "cxl"
+            ):
+                spill_adapter = adapter
             if ac.serde_config is not None:
                 adapter = SerdeL2AdapterWrapper(
                     inner=adapter,
@@ -86,6 +91,23 @@ class StorageManager:
                     l1_manager=self._l1_manager,
                 )
             self._l2_adapters.append(adapter)
+
+        if config.eviction_config.eviction_destination == "L2_CACHE" and (
+            spill_adapter is None
+        ):
+            logger.warning(
+                "eviction_destination=L2_CACHE but no CXL L2 adapter is "
+                "configured; L1 eviction will DISCARD instead of spilling."
+            )
+
+        # L1 eviction controller (spills evicted keys into ``spill_adapter``
+        # when configured, otherwise discards them).
+        self._eviction_controller = L1EvictionController(
+            l1_manager=self._l1_manager,
+            eviction_config=config.eviction_config,
+            spill_adapter=spill_adapter,
+        )
+        self._eviction_controller.start()
 
         PeriodicEventNotifier.create(
             interval_ms=config.periodic_notifier_interval_ms,

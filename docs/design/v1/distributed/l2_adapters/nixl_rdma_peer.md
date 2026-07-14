@@ -103,6 +103,34 @@ order of how a peer typically becomes connected:
 A peer's connection is memoized (a per-peer flag + lock), so the handshake
 runs at most once regardless of which mechanism wins the race.
 
+## 2b. Peer control-plane liveness (never block a lookup on a dead peer)
+
+§2a keeps the *data-plane* NIXL handshake off the request path. Separately,
+the *control-plane* lookup RPC to a dead peer would still block for the full
+`control_timeout_ms` (seconds) on **every** lookup — so a node launched alone
+would stall on each request even though its NIXL handshake never runs.
+
+A
+[`PeerHealthMonitor`](lmcache/v1/distributed/l2_adapters/peer_health.py) (shared
+with the CXL adapter) governs whether the control RPC is even attempted:
+
+- Each peer carries an `alive` flag. `_do_lookup` **skips** peers marked dead —
+  no `control.lookup`, no timeout. A node whose peers are all dead returns an
+  all-miss bitmap immediately.
+- The request path reports outcomes: a `control.lookup` that raises **demotes**
+  the peer (so only one lookup pays the timeout when a live peer dies); any
+  answer **promotes** it.
+- A background daemon thread pings the *dead* peers every
+  `peer_probe_interval_ms` via `NixlPeerControlClient.ping` (a zero-key
+  `RemoteLookupReq` on the short `peer_probe_timeout_ms`; the donor's
+  `handle_lookup` returns an empty response with no read-locks or pins). A peer
+  that answers is promoted, so a lone node picks up a peer that comes online
+  later. The first sweep runs immediately at startup; peers begin **dead** so the
+  very first lookup never blocks.
+
+This is orthogonal to §2a: the monitor gates the control lookup; once a lookup
+gets a hit, the §2a mechanisms establish the NIXL data-plane connection as before.
+
 ---
 
 ## 3. The two planes
@@ -298,6 +326,8 @@ only what already lives in their own L1 from their own traffic.
   "nixl_backends": ["UCX"],             // NIXL data-plane backend(s)
   "control_timeout_ms": 30000,
   "lease_ms": 60000,                    // remote read-lock lease / sweep window
+  "peer_probe_interval_ms": 5000,       // background liveness-ping interval for DEAD peers (§2b)
+  "peer_probe_timeout_ms": 1000,        // single-ping timeout (far shorter than control_timeout_ms)
   "device": "cpu",                      // device the L1 buffer lives on
 
   // geometry — must match across the rack
@@ -331,6 +361,7 @@ descriptor agreement is guaranteed by the fixed 2 MiB constant, not by
 | Peer has no copy of a hash | `found_mask` bit 0 in RemoteLookupResp | Key stays a miss; bitmap bit 0; retrieve recomputes. |
 | Peer evicted the chunk between lookup and READ | Read-lock is held across the window, so this cannot happen for a locked hit. If lookup itself races eviction, the peer simply reports not-found. | n/a / miss. |
 | Control RPC to a peer times out | ZMQ recv timeout | That peer contributes no hits this round; other peers still consulted. Logged. |
+| Peer down (never launched, crashed, unreachable) | `PeerHealthMonitor` ping fails / a live `control.lookup` raises | Peer marked **dead** and skipped on the lookup path (no `control_timeout_ms` stall); background prober re-pings every `peer_probe_interval_ms` and promotes it when it answers (§2b). |
 | RDMA READ errors (`status == ERR`) | `NixlChannel.batched_read` raises | Affected keys' bitmap bits stay 0 (load miss); pins still released via `submit_unlock`. |
 | Requester dies between lookup and unlock | Donor lease expires | Donor sweep calls `finish_read` on expired pins; chunk becomes evictable again. |
 | L1 buffer not a multiple of the 2 MiB descriptor size | Factory `ValueError` at startup (§3) | Fail loud — adjust `--l1-size-gb`. Prevents a node silently picking a desyncing page size. |

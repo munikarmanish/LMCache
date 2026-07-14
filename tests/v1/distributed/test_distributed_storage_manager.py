@@ -737,10 +737,12 @@ class TestFailureEventProduction:
 
             # Allow drain thread to deliver the event.
             assert wait_for_condition(
-                lambda: len(
-                    _events_of_type(captured_events, EventType.L1_ALLOCATION_FAILED)
-                )
-                >= 1,
+                lambda: (
+                    len(
+                        _events_of_type(captured_events, EventType.L1_ALLOCATION_FAILED)
+                    )
+                    >= 1
+                ),
                 timeout=2.0,
             )
 
@@ -788,8 +790,9 @@ class TestFailureEventProduction:
                 assert objs is None  # all_good=False because middle key is gone
 
             assert wait_for_condition(
-                lambda: len(_events_of_type(captured_events, EventType.L1_READ_FAILED))
-                >= 1,
+                lambda: (
+                    len(_events_of_type(captured_events, EventType.L1_READ_FAILED)) >= 1
+                ),
                 timeout=2.0,
             )
 
@@ -869,3 +872,74 @@ class TestStorageManagerSparsePrefetch:
 
         sm.finish_read_prefetched(existing)
         sm.close()
+
+
+class TestStorageManagerSpillWiring:
+    """StorageManager selects a CXL adapter as the L1->L2 spill target when
+    eviction_destination == 'L2_CACHE'."""
+
+    def _make_cxl_config(self, path: str):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.cxl_l2_adapter import (
+            CXLL2AdapterConfig,
+        )
+
+        return CXLL2AdapterConfig(
+            dev_path=path,
+            node_id=0,
+            chunk_size_bytes=64 * 1024,
+            region_size=2 * (1 << 20),
+            initialize=True,
+            generation=1,
+            run_lock_manager=True,
+            model_name="cxl-spill-test",
+            world_size=1,
+            kv_dtype_str="torch.float16",
+            kv_shape=(4, 2, 16, 4, 64),
+            use_mla=False,
+            cluster_chunk_size=16,
+        )
+
+    def test_cxl_selected_as_spill_target(self, basic_l1_config, tmp_path):
+        cxl_path = str(tmp_path / "cxl-pool.bin")
+        with open(cxl_path, "wb") as f:
+            f.truncate(64 * (1 << 20))
+
+        config = StorageManagerConfig(
+            l1_manager_config=basic_l1_config,
+            eviction_config=EvictionConfig(
+                eviction_policy="LRU",
+                eviction_destination="L2_CACHE",
+            ),
+            l2_adapter_config=L2AdaptersConfig(
+                adapters=[self._make_cxl_config(cxl_path)],
+            ),
+        )
+        sm = StorageManager(config)
+        try:
+            status = sm._eviction_controller.report_status()
+            assert status["eviction_destination"] == "L2_CACHE"
+            assert status["spill_adapter"] == "CXLL2Adapter"
+        finally:
+            sm.close()
+
+    def test_no_cxl_adapter_falls_back_to_discard(self, basic_l1_config):
+        config = StorageManagerConfig(
+            l1_manager_config=basic_l1_config,
+            eviction_config=EvictionConfig(
+                eviction_policy="LRU",
+                eviction_destination="L2_CACHE",
+            ),
+            l2_adapter_config=L2AdaptersConfig(
+                adapters=[
+                    MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0),
+                ],
+            ),
+        )
+        sm = StorageManager(config)
+        try:
+            # No CXL adapter -> no spill target; controller stays on DISCARD.
+            status = sm._eviction_controller.report_status()
+            assert status["spill_adapter"] is None
+        finally:
+            sm.close()

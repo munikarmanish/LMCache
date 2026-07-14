@@ -87,6 +87,18 @@ class EvictionConfig:
     eviction_ratio: float = field(default=0.2)
     """ The fraction of *allocated* memory to evict when triggered (0.0 to 1.0). """
 
+    eviction_destination: Literal["DISCARD", "L2_CACHE"] = field(default="DISCARD")
+    """ Where L1-evicted objects go (L1 only; ignored by L2 eviction). 'DISCARD'
+    drops them. 'L2_CACHE' spills them into the first CXL L2 adapter before
+    deleting from L1; if the spill fails or times out, the keys are discarded
+    anyway so L1 is always reclaimed. Requires a CXL L2 adapter — falls back to
+    'DISCARD' when none is configured. """
+
+    spill_timeout_s: float = field(default=5.0)
+    """ Max seconds the L1 eviction loop waits for an 'L2_CACHE' spill store to
+    complete before giving up (and discarding). Only used when
+    ``eviction_destination == "L2_CACHE"``. """
+
 
 @dataclass
 class StorageManagerConfig:
@@ -218,6 +230,23 @@ def add_storage_manager_args(
         help="The fraction of memory to evict when triggered (0.0 to 1.0). "
         "Default is 0.2.",
     )
+    eviction_group.add_argument(
+        "--eviction-destination",
+        type=str,
+        choices=["DISCARD", "L2_CACHE"],
+        default="DISCARD",
+        help="Where L1-evicted KV goes. 'DISCARD' (default) drops it. "
+        "'L2_CACHE' spills it into the first CXL L2 adapter before deleting "
+        "from L1 (falls back to DISCARD on spill failure/timeout or when no "
+        "CXL adapter is configured).",
+    )
+    eviction_group.add_argument(
+        "--eviction-spill-timeout-s",
+        type=float,
+        default=5.0,
+        help="Max seconds the L1 eviction loop waits for an 'L2_CACHE' spill "
+        "store before giving up and discarding. Default is 5.0.",
+    )
 
     # L2 Policies
     # Import here to break circular dependency:
@@ -321,6 +350,8 @@ def parse_args_to_config(
         eviction_policy=args.eviction_policy,
         trigger_watermark=args.eviction_trigger_watermark,
         eviction_ratio=args.eviction_ratio,
+        eviction_destination=args.eviction_destination,
+        spill_timeout_s=args.eviction_spill_timeout_s,
     )
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)

@@ -293,6 +293,49 @@ class NixlPeerControlClient:
             raise RuntimeError(f"unexpected unlock reply type: {type(reply).__name__}")
         return reply
 
+    def ping(self, sender_id: str, timeout_ms: int) -> bool:
+        """Probe the peer's control server liveness on a short timeout.
+
+        Used by the ``PeerHealthMonitor`` to decide whether this peer is
+        reachable *without* paying the long ``recv_timeout_ms`` a real
+        lookup uses. The probe is a zero-key ``RemoteLookupReq``: the
+        donor's ``handle_lookup`` returns an empty ``RemoteLookupResp``
+        with no side effects (no read-locks, no pins), so the round-trip
+        proves reachability and nothing else.
+
+        A dedicated short-lived REQ socket is used rather than the shared
+        one, so the probe never inherits the long timeout and never wedges
+        an in-flight ``lookup``/``unlock`` REQ send/recv state. The socket
+        is closed before returning.
+
+        Args:
+            sender_id: This node's id, for donor-side logging.
+            timeout_ms: Send/recv timeout for the probe, in milliseconds.
+
+        Returns:
+            ``True`` iff the peer answered with a ``RemoteLookupResp``
+            within the timeout; ``False`` on any timeout or transport
+            error.
+        """
+        sock = self._context.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        sock.setsockopt(zmq.LINGER, 0)
+        try:
+            sock.connect(self._control_url)
+            req = RemoteLookupReq(sender_id=sender_id, lease_id="ping", keys=[])
+            sock.send(self._encoder.encode(req))
+            raw = sock.recv()
+            reply = self._decoder.decode(raw)
+            return isinstance(reply, RemoteLookupResp)
+        except (zmq.ZMQError, msgspec.DecodeError):
+            return False
+        finally:
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+
     def close(self) -> None:
         """Close the underlying REQ socket."""
         with self._lock:

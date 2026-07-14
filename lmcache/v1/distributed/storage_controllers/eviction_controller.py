@@ -14,6 +14,7 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import EvictionConfig
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.eviction import L1EvictionPolicy, L2EvictionPolicy
 from lmcache.v1.distributed.eviction_policy import CreateEvictionPolicy
 from lmcache.v1.distributed.internal_api import (
@@ -98,7 +99,19 @@ class L1EvictionController(EvictionController):
         self,
         l1_manager: L1Manager,
         eviction_config: EvictionConfig,
+        spill_adapter: L2AdapterInterface | None = None,
     ):
+        """
+        Args:
+            l1_manager: The L1 manager whose keys this controller evicts.
+            eviction_config: The eviction configuration. When
+                ``eviction_destination == "L2_CACHE"`` and ``spill_adapter``
+                is provided, evicted keys are copied into that adapter before
+                being deleted from L1; otherwise they are discarded.
+            spill_adapter: The L2 adapter that receives spilled keys when
+                ``eviction_destination == "L2_CACHE"``. ``None`` disables
+                spilling (keys are discarded even if the destination is set).
+        """
         super().__init__()
         self._eviction_config = eviction_config
         self._eviction_policy = CreateEvictionPolicy(eviction_config)
@@ -107,6 +120,23 @@ class L1EvictionController(EvictionController):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
 
+        self._spill_adapter = spill_adapter
+        self._spill_timeout_s = eviction_config.spill_timeout_s
+        # Only route evictions to L2 when both the config asks for it and a
+        # spill target exists; otherwise the policy keeps emitting DISCARD.
+        if (
+            spill_adapter is not None
+            and eviction_config.eviction_destination == "L2_CACHE"
+        ):
+            self._eviction_policy.register_eviction_destination(
+                EvictionDestination.L2_CACHE
+            )
+        elif eviction_config.eviction_destination == "L2_CACHE":
+            logger.warning(
+                "eviction_destination=L2_CACHE but no spill adapter is "
+                "configured; L1 eviction will DISCARD instead of spilling."
+            )
+
     def report_status(self) -> dict:
         return {
             "is_healthy": self._thread.is_alive(),
@@ -114,6 +144,12 @@ class L1EvictionController(EvictionController):
             "eviction_policy": self._eviction_config.eviction_policy,
             "trigger_watermark": self._eviction_config.trigger_watermark,
             "eviction_ratio": self._eviction_config.eviction_ratio,
+            "eviction_destination": self._eviction_config.eviction_destination,
+            "spill_adapter": (
+                type(self._spill_adapter).__name__
+                if self._spill_adapter is not None
+                else None
+            ),
         }
 
     def _publish_skipped(self, usage: float, watermark: float) -> None:
@@ -172,13 +208,97 @@ class L1EvictionController(EvictionController):
                 self.execute_eviction_action(action)
             self._publish_triggered(usage, watermark)
 
+    def _publish_spilled(self, keys: list[ObjectKey], bytes_transferred: int) -> None:
+        """Publish a successful L1->L2 eviction spill."""
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_EVICTION_SPILLED,
+                metadata={
+                    "key_count": len(keys),
+                    "bytes_transferred": bytes_transferred,
+                    "spill_adapter": (
+                        type(self._spill_adapter).__name__
+                        if self._spill_adapter is not None
+                        else None
+                    ),
+                },
+            )
+        )
+
+    def _publish_spill_failed(self, keys: list[ObjectKey]) -> None:
+        """Publish a failed L1->L2 eviction spill (keys were discarded)."""
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_EVICTION_SPILL_FAILED,
+                metadata={"key_count": len(keys)},
+            )
+        )
+
     def execute_eviction_action(self, action: EvictionAction):
         if action.destination == EvictionDestination.DISCARD:
             self._l1_manager.delete(action.keys)
+        elif action.destination == EvictionDestination.L2_CACHE:
+            self._spill_to_l2(action.keys)
         else:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
             self._l1_manager.delete(action.keys)
+
+    def _spill_to_l2(self, keys: list[ObjectKey]) -> None:
+        """Copy ``keys`` into the spill adapter, then delete them from L1.
+
+        Sequence mirrors the store controller's write path: reserve read
+        locks so the buffers stay alive during the copy, synchronously store
+        into L2, release the read locks, then delete from L1. On spill
+        success or failure the keys are always deleted so L1 is reclaimed
+        (failure discards them, matching ``eviction_destination`` semantics).
+
+        Args:
+            keys: The keys selected for eviction to L2.
+        """
+        if self._spill_adapter is None:
+            # Defensive: the __init__ gate prevents L2_CACHE actions without a
+            # spill adapter, but discard rather than crash if we get here.
+            self._l1_manager.delete(keys)
+            return
+
+        # Hold read locks and grab MemoryObj refs. A read-locked key cannot be
+        # freed or deleted by any other path during the copy.
+        read_results = self._l1_manager.reserve_read(keys)
+        locked_keys: list[ObjectKey] = []
+        objects = []
+        for key in keys:
+            result = read_results.get(key)
+            if result is None:
+                continue
+            err, obj = result
+            if err == L1Error.SUCCESS and obj is not None:
+                locked_keys.append(key)
+                objects.append(obj)
+
+        if not locked_keys:
+            # Everything is busy (write-locked or already gone) this cycle;
+            # the policy re-evaluates next tick. Nothing to release.
+            return
+
+        result = self._spill_adapter.spill_store(
+            locked_keys, objects, self._spill_timeout_s
+        )
+
+        # Always release the read locks we took before deleting.
+        self._l1_manager.finish_read(locked_keys)
+
+        # Discard-on-failure: delete from L1 regardless so memory is always
+        # reclaimed; only the observability signal differs.
+        self._l1_manager.delete(locked_keys)
+        if result.is_successful():
+            self._publish_spilled(locked_keys, result.bytes_transferred())
+        else:
+            logger.warning(
+                "L2 spill failed for %d keys; discarding them from L1.",
+                len(locked_keys),
+            )
+            self._publish_spill_failed(locked_keys)
 
 
 class L2AdapterEvictionState:

@@ -80,7 +80,33 @@ class PushKVToCXLRetMsg(CXLP2PMsgBase):
     status: PushStatus
 
 
+class PingMsg(CXLP2PMsgBase):
+    """Requester → donor liveness probe.
+
+    A cheap, side-effect-free health check the `PeerHealthMonitor`
+    sends on a short timeout to decide whether a configured peer's
+    `CXLP2PServer` is up. The donor answers immediately with a
+    `PingRetMsg`; no pool state is touched.
+    """
+
+    # Requester's identity, for logging on the donor side.
+    sender_id: str
+
+
+class PingRetMsg(CXLP2PMsgBase):
+    """Donor → requester ping acknowledgment.
+
+    The mere arrival of this message signals liveness. ``ok`` is always
+    ``True`` from a healthy donor; it exists so the struct carries a
+    field and so a future donor could report "reachable but degraded".
+    """
+
+    ok: bool
+
+
 CXLP2PMsg = Union[
     PushKVToCXLMsg,
     PushKVToCXLRetMsg,
+    PingMsg,
+    PingRetMsg,
 ]

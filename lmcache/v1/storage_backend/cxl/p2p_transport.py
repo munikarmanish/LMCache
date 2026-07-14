@@ -30,6 +30,8 @@ from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.cxl.cross_node import CXLDonor, DonorEndpoint
 from lmcache.v1.storage_backend.cxl.p2p_messages import (
     CXLP2PMsg,
+    PingMsg,
+    PingRetMsg,
     PushKVToCXLMsg,
     PushKVToCXLRetMsg,
     PushStatus,
@@ -127,10 +129,15 @@ class CXLP2PServer:
                 # ZMQ REP requires a response per request, even on
                 # error — send a synthetic ALL_NACK so the client
                 # doesn't hang.
-                self._send(PushKVToCXLRetMsg(num_committed=0, status=PushStatus.ALL_NACK))
+                self._send(
+                    PushKVToCXLRetMsg(num_committed=0, status=PushStatus.ALL_NACK)
+                )
                 continue
 
-            if isinstance(msg, PushKVToCXLMsg):
+            if isinstance(msg, PingMsg):
+                # Liveness probe: answer immediately, touch no pool state.
+                self._send(PingRetMsg(ok=True))
+            elif isinstance(msg, PushKVToCXLMsg):
                 try:
                     reply = self._donor.handle_push(msg)
                 except Exception:
@@ -148,7 +155,7 @@ class CXLP2PServer:
                     PushKVToCXLRetMsg(num_committed=0, status=PushStatus.ALL_NACK)
                 )
 
-    def _send(self, reply: PushKVToCXLRetMsg) -> None:
+    def _send(self, reply: CXLP2PMsg) -> None:
         assert self._socket is not None
         try:
             self._socket.send(self._encoder.encode(reply))
@@ -199,10 +206,47 @@ class CXLP2PClient(DonorEndpoint):
                 raise
             reply = self._decoder.decode(raw)
             if not isinstance(reply, PushKVToCXLRetMsg):
-                raise RuntimeError(
-                    f"unexpected reply type: {type(reply).__name__}"
-                )
+                raise RuntimeError(f"unexpected reply type: {type(reply).__name__}")
             return reply
+
+    def ping(self, sender_id: str, timeout_ms: int) -> bool:
+        """Probe the donor's liveness with a short-timeout round-trip.
+
+        Used by the ``PeerHealthMonitor`` to decide whether this peer is
+        reachable *without* paying the long data-plane timeout that
+        ``handle_push`` uses. A dead donor fails within ``timeout_ms``.
+
+        The probe uses a dedicated short-lived REQ socket rather than the
+        shared data socket, so (a) it never inherits the multi-second
+        ``recv_timeout_ms`` and (b) a probe and an in-flight
+        ``handle_push`` never wedge each other's REQ send/recv state. The
+        socket is closed before returning.
+
+        Args:
+            sender_id: This node's id, for donor-side logging.
+            timeout_ms: Send/recv timeout for the probe, in milliseconds.
+
+        Returns:
+            ``True`` iff the donor answered with a ``PingRetMsg`` within
+            the timeout; ``False`` on any timeout or transport error.
+        """
+        sock = self._context.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        sock.setsockopt(zmq.LINGER, 0)
+        try:
+            sock.connect(self._donor_url)
+            sock.send(self._encoder.encode(PingMsg(sender_id=sender_id)))
+            raw = sock.recv()
+            reply = self._decoder.decode(raw)
+            return isinstance(reply, PingRetMsg) and reply.ok
+        except (zmq.ZMQError, msgspec.DecodeError):
+            return False
+        finally:
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
 
     def close(self) -> None:
         with self._lock:

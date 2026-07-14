@@ -27,7 +27,7 @@ mkdir -p "$HERE/results"
 python bench_ttft.py \
     --node-a-url "http://${HOST_A}:8010" \
     --node-b-url "http://${HOST_B}:8010" \
-    --prompt-tokens 1000 3000 9000 27000 \
+    --prompt-tokens 27000 \
     --repeat 3 \
     --label "$LABEL" \
     "${SEED_ARG[@]}" \
