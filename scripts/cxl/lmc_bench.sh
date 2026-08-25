@@ -56,8 +56,9 @@ KV_CACHE_VOLUME="${KV_CACHE_VOLUME:-64}"
 
 # long-doc-qa params
 DOCUMENT_LENGTH="${DOCUMENT_LENGTH:-30000}"
-QUERY_PER_DOCUMENT="${QUERY_PER_DOCUMENT:-2}"
+QUERY_PER_DOCUMENT="${QUERY_PER_DOCUMENT:-1}"
 NUM_INFLIGHT_REQUESTS="${NUM_INFLIGHT_REQUESTS:-1}"
+SHUFFLE_POLICY="${SHUFFLE_POLICY:-tile}"  # none | random | round-robin
 
 # multi-round-chat params
 SHARED_PROMPT_LENGTH="${SHARED_PROMPT_LENGTH:-2000}"
@@ -85,6 +86,7 @@ case "$WORKLOAD" in
             --ldqa-document-length "$DOCUMENT_LENGTH"
             --ldqa-query-per-document "$QUERY_PER_DOCUMENT"
             --ldqa-num-inflight-requests "$NUM_INFLIGHT_REQUESTS"
+            --ldqa-shuffle-policy "$SHUFFLE_POLICY"
         )
         ;;
     multi-round-chat)
@@ -110,7 +112,7 @@ mkdir -p "$HERE/results"
 ENGINE_URL="http://${HOST}:${VLLM_PORT}"
 LMCACHE_URL="http://${HOST}:${LMC_PORT}"
 
-echo "[lmc_bench] engine=${ENGINE_URL} lmcache=${LMCACHE_URL} workload=${WORKLOAD}"
+echo "[lmc_bench] engine=${ENGINE_URL} lmcache=${LMCACHE_URL} workload=${WORKLOAD} seed=${SEED}"
 
 lmcache bench engine \
     --engine-url "$ENGINE_URL" \
@@ -119,6 +121,5 @@ lmcache bench engine \
     --workload "$WORKLOAD" \
     "${WORKLOAD_ARGS[@]}" \
     --no-interactive \
-    --json \
     --output-dir "$HERE/results" \
     "${SEED_ARG[@]}"

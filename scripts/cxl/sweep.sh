@@ -143,7 +143,7 @@ CONTEXT_A="${CONTEXT_A:-30000}"
 # recompute) while CXL still holds everything — that is the CXL-win band. The
 # 0.3M–0.5M points below the knee are the ties baseline (both fit one DRAM).
 # Override the whole list with WS_POINTS="a b c ...".
-WS_POINTS="${WS_POINTS:-300000 400000 500000 600000 700000 800000 900000 1000000}"
+WS_POINTS="${WS_POINTS:-100000 200000 300000 400000 500000 600000 700000 800000 900000}"
 OUT_ROOT="${OUT_ROOT:-$HERE/results/sweep}"
 
 if [[ ! -d "$KVCT_DIR" ]]; then
@@ -258,7 +258,7 @@ TOKENIZER="${TOKENIZER:-meta-llama/Llama-3.1-8B-Instruct}"
 # Total tester wall-clock, divided across the working-set growth sections, so
 # longer duration = more requests per section AFTER each growth event, diluting
 # the cold-transition front in each period's median TTFT.
-TEST_DURATION="${TEST_DURATION:-300}"
+TEST_DURATION="${TEST_DURATION:-600}"
 # Working-set growth strategy (the tester's --init-strategy):
 #   min (default) — start small; at each growth event GENERATE NEW prompts on
 #     the fly. The tester never pre-warms these (its own comment: "NOT
