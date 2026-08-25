@@ -20,9 +20,12 @@ shim over the synchronous
 It is the **shared-memory analogue** of the
 [NIXL peer adapter](docs/design/v1/distributed/l2_adapters/nixl_rdma_peer.md):
 same "L1-first, L2 fetches the misses" shape, but the second tier is a coherent
-shared CXL pool rather than a set of RDMA-reachable peers. Unlike the NIXL peer
-adapter (pull-only, chunks land in L1), the CXL adapter can also serve a hit
-**straight to GPU** without a DRAM bounce (§7).
+shared CXL pool rather than a set of RDMA-reachable peers. The CXL adapter is
+still write-capable where the peer adapter is pull-only, and it serves hits
+**straight to GPU** without a DRAM bounce (§7) unconditionally — the peer
+adapter can now do the same, but only with `enable_gpu_direct` set and with a
+CPU-side wait the stream-ordered CXL copy does not need (see
+[`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md)).
 
 > **Doc-vs-code note.** Some module docstrings under `storage_backend/cxl/`
 > still describe the backend as a "single-process skeleton / step 5" with
@@ -343,8 +346,14 @@ instead of raising, matching the contiguous-prefix contract.
 `supports_l2_resident_retrieve()` returns `True`. The whole pool is
 `cudaHostRegister`'d at bootstrap
 ([`bootstrap.py`](lmcache/v1/storage_backend/cxl/bootstrap.py)), so a copy from
-the pool to GPU HBM is a real async DMA with **no DRAM bounce buffer**. This is
-the CXL adapter's key advantage over the pull-into-L1 NIXL peer path.
+the pool to GPU HBM is a real async DMA with **no DRAM bounce buffer**.
+
+The NIXL peer adapter has an opt-in GPUDirect path too, but the CXL version
+keeps a structural advantage: a `cudaMemcpyAsync` is *stream-ordered* against
+the scatter kernel the caller enqueues next, so `submit_h2d` returns
+immediately and the copy overlaps. An RDMA READ carries no ordering against a
+CUDA stream, so that adapter must block on CPU-side completion instead. See
+[`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md) §2.
 
 - **`gpu_src_view(key)`** ([`cxl_backend.py`](lmcache/v1/storage_backend/cxl_backend.py))
   resolves `(n_bytes, pool.base + chunk_offset)`. It does **not** bump

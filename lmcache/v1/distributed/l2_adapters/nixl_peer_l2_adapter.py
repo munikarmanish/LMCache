@@ -28,8 +28,16 @@ Operation mapping (driven by the ``PrefetchController``):
 - ``submit_store_task`` — inert no-op (STORE never propagates to peers;
   relies on ``store_policy="lazy"``, belt-and-suspenders here).
 
-``supports_l2_resident_retrieve`` stays ``False``: chunks land in L1 and
-retrieve is unchanged, exactly as the requirements specify.
+Two retrieve paths:
+
+- **DRAM (default).** Chunks are pulled into L1 during the prefetch LOAD
+  phase and retrieve is a plain L1 read.
+- **GPUDirect (opt-in, ``enable_gpu_direct``).** The chunk is pulled
+  straight into the GPU staging buffer at retrieve time, skipping the L1
+  landing and the H2D bounce. ``supports_l2_resident_retrieve`` reports
+  ``True`` only once ``register_gpu_staging_buffer`` has run, so it is
+  **dynamic** rather than the constant the CXL adapter returns. See
+  [`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md).
 
 Threading model (matches CXL / Mock adapters): a single asyncio loop on a
 daemon thread runs all task handlers; ``submit_*`` allocate a task id and
@@ -175,6 +183,64 @@ class PeerDataChannel(Protocol):
         ...
 
 
+class GpuPeerDataChannel(Protocol):
+    """The data-plane surface needed for a GPUDirect READ into GPU memory.
+
+    Satisfied by :class:`_NixlGpuReadChannel`. Kept separate from
+    :class:`PeerDataChannel` because the destination is addressed by a raw
+    device pointer into the registered GPU staging buffer rather than by a
+    local ``MemoryObj``. Declaring it as a Protocol lets tests inject an
+    in-process fake without RDMA hardware or a GPU.
+    """
+
+    def lazy_init_peer_connection(
+        self,
+        local_id: str,
+        peer_id: str,
+        peer_init_url: str,
+    ) -> object:
+        """Establish the NIXL connection to a peer's GPU-side agent.
+
+        Args:
+            local_id: This node's id for the handshake.
+            peer_id: The key to register the peer's transfer handler under.
+            peer_init_url: The peer's GPU init side-channel as ``host:port``.
+        """
+        ...
+
+    def read_chunks_to_gpu(
+        self,
+        gpu_ptrs: list[int],
+        sizes: list[int],
+        remote_page_indices: list[int],
+        peer_id: str,
+    ) -> int:
+        """One-sided READ of chunks from a peer straight into GPU memory.
+
+        MUST NOT return until the transfer has completed — an RDMA READ is
+        not ordered against the caller's CUDA stream, so the caller can only
+        establish that ordering by this call being synchronous. See
+        :meth:`NixlPeerL2Adapter.submit_h2d_batch`.
+
+        Args:
+            gpu_ptrs: Destination device pointer per chunk.
+            sizes: Byte size per chunk.
+            remote_page_indices: The peer's base descriptor index per chunk.
+            peer_id: The source peer's data-channel registration key.
+
+        Returns:
+            The number of chunks transferred.
+
+        Raises:
+            RuntimeError: If the transfer reports an error.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release transfer-channel resources."""
+        ...
+
+
 @dataclass
 class _Peer:
     """One configured remote peer's control + data handles.
@@ -198,6 +264,15 @@ class _Peer:
             completed. Guarded by ``connect_lock``.
         connect_lock: Serializes the lazy handshake so it runs at most
             once even under concurrent lookups.
+        gpu_init_url: The peer's GPU-side NIXL handshake side-channel
+            (bare ``host:port``). Empty when the peer advertises no GPU
+            channel, which disables GPUDirect reads from it.
+        gpu_connected: Whether the GPU-side NIXL handshake has completed.
+            Tracked separately from ``connected`` because the two channels
+            are distinct NIXL agents with independent handshakes: a peer can
+            be usable for the DRAM path and not (yet) for the GPU path.
+        gpu_connect_lock: Serializes the GPU handshake, as
+            ``connect_lock`` does for the DRAM one.
     """
 
     node_id: int
@@ -207,6 +282,9 @@ class _Peer:
     local_id: str
     connected: bool = False
     connect_lock: threading.Lock = field(default_factory=threading.Lock)
+    gpu_init_url: str = ""
+    gpu_connected: bool = False
+    gpu_connect_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -347,6 +425,132 @@ class _NixlReadChannel:
         self._channel.close()
 
 
+class _NixlGpuReadChannel:
+    """Data-plane wrapper for one-sided RDMA READs into GPU memory.
+
+    The GPUDirect analogue of :class:`_NixlReadChannel`. Two differences,
+    both forced by the destination being the GPU staging buffer rather than
+    an L1 ``MemoryObj``:
+
+    1. **Addressing.** The destination is a raw device pointer into the
+       registered staging buffer, so the local base descriptor index is
+       ``(gpu_ptr - buffer_base) // page_size`` instead of
+       ``meta.address // page_size``.
+    2. **Synchronous completion.** ``read_chunks_to_gpu`` polls the transfer
+       to DONE before returning. See :meth:`NixlPeerL2Adapter.submit_h2d_batch`
+       for why this is required rather than merely convenient.
+
+    ``page_size`` MUST equal the DRAM channel's page size. NIXL rejects a
+    transfer whose paired descriptors differ in length
+    (``makeXferReq: length mismatch at index pair N``), and the remote
+    descriptors are fixed at that size by the cross-node wire contract.
+    """
+
+    def __init__(self, channel: object, page_size: int, buffer_base: int):
+        """Initialize the GPU read channel.
+
+        Args:
+            channel: The live ``NixlChannel`` registered over the GPU
+                staging buffer (holds the NIXL agent and remote handlers).
+            page_size: NIXL descriptor size; must match the donor's.
+            buffer_base: Device pointer of the staging buffer's base, used
+                to convert a destination pointer into a descriptor index.
+        """
+        self._channel = channel
+        self._page_size = page_size
+        self._buffer_base = buffer_base
+
+    def lazy_init_peer_connection(
+        self, local_id: str, peer_id: str, peer_init_url: str
+    ) -> object:
+        """Delegate the GPU-side NIXL handshake to the underlying channel."""
+        return self._channel.lazy_init_peer_connection(
+            local_id=local_id, peer_id=peer_id, peer_init_url=peer_init_url
+        )
+
+    def read_chunks_to_gpu(
+        self,
+        gpu_ptrs: list[int],
+        sizes: list[int],
+        remote_page_indices: list[int],
+        peer_id: str,
+    ) -> int:
+        """One-sided READ from ``peer_id`` straight into GPU memory.
+
+        Expands each chunk's base index into all ``size // page_size``
+        consecutive descriptor indices — local and remote paired in order —
+        exactly as the DRAM path must (a chunk spans many descriptors; pairing
+        only the first transfers only the first page of each chunk).
+
+        Blocks until the transfer reports DONE.
+
+        Args:
+            gpu_ptrs: Destination device pointer per chunk.
+            sizes: Byte size per chunk.
+            remote_page_indices: Donor-supplied base descriptor index per chunk.
+            peer_id: The source peer's registration key.
+
+        Returns:
+            The number of chunks transferred.
+
+        Raises:
+            ValueError: If a destination pointer lies outside the registered
+                staging buffer, is not page-aligned, or a size is not a whole
+                number of pages.
+            RuntimeError: If the NIXL transfer reports an error.
+        """
+        agent = self._channel.nixl_agent
+        local_indices: list[int] = []
+        remote_indices: list[int] = []
+        for gpu_ptr, size, remote_base in zip(
+            gpu_ptrs, sizes, remote_page_indices, strict=True
+        ):
+            offset = gpu_ptr - self._buffer_base
+            if offset < 0:
+                raise ValueError(
+                    f"destination pointer {gpu_ptr:#x} is below the registered "
+                    f"GPU staging buffer base {self._buffer_base:#x}"
+                )
+            if offset % self._page_size != 0:
+                raise ValueError(
+                    f"GPU staging offset {offset} not aligned to page_size "
+                    f"{self._page_size}"
+                )
+            if size % self._page_size != 0:
+                raise ValueError(
+                    f"chunk size {size} not a multiple of page_size {self._page_size}"
+                )
+            pages_per_chunk = size // self._page_size
+            local_base = offset // self._page_size
+            for p in range(pages_per_chunk):
+                local_indices.append(local_base + p)
+                remote_indices.append(remote_base + p)
+
+        handle = agent.make_prepped_xfer(
+            "READ",
+            self._channel.nixl_wrapper.xfer_handler,
+            local_indices,
+            self._channel.remote_xfer_handlers_dict[peer_id],
+            remote_indices,
+        )
+        agent.transfer(handle)
+        # Poll to completion: the caller is about to enqueue a CUDA kernel
+        # that reads these bytes, and an RDMA READ carries no ordering
+        # against that stream.
+        while True:
+            status = agent.check_xfer_state(handle)
+            if status == "ERR":
+                raise RuntimeError("NIXL one-sided GPUDirect READ failed")
+            if status == "DONE":
+                break
+            time.sleep(0.0001)
+        return len(gpu_ptrs)
+
+    def close(self) -> None:
+        """Delegate channel teardown."""
+        self._channel.close()
+
+
 class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
     """Config for the RDMA/NIXL peer L2 adapter.
 
@@ -394,6 +598,13 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
         # come online later.
         peer_probe_interval_ms: int = 5000,
         peer_probe_timeout_ms: int = 1000,
+        # GPUDirect: pull a remote hit straight into the GPU staging buffer,
+        # skipping the L1/DRAM landing and the H2D bounce. Opt-in (default
+        # off) because it needs GPUDirect-capable RDMA hardware and moves
+        # RDMA latency from the prefetch phase into the TTFT-critical
+        # retrieve phase — a trade that must be measured per deployment.
+        enable_gpu_direct: bool = False,
+        gpu_init_bind_url: str = "0.0.0.0:8502",
         device: str = "cpu",
         model_name: str = "",
         world_size: int = 1,
@@ -424,11 +635,18 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
                     raise ValueError(
                         f"peers[{i}].{field_name} must be a non-empty string"
                     )
+            # gpu_init_url is optional: a peer that advertises none simply
+            # cannot be read GPU-direct (we fall back to the DRAM path for
+            # its chunks), so a mixed-capability rack still works.
+            gpu_init_url = p.get("gpu_init_url", "")
+            if not isinstance(gpu_init_url, str):
+                raise ValueError(f"peers[{i}].gpu_init_url must be a string")
             peers_list.append(
                 {
                     "node_id": int(p["node_id"]),
                     "control_url": p["control_url"],
                     "init_url": p["init_url"],
+                    "gpu_init_url": gpu_init_url,
                 }
             )
 
@@ -444,7 +662,18 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("peer_probe_interval_ms must be a positive integer")
         if not isinstance(peer_probe_timeout_ms, int) or peer_probe_timeout_ms <= 0:
             raise ValueError("peer_probe_timeout_ms must be a positive integer")
+        if not isinstance(enable_gpu_direct, bool):
+            raise ValueError("enable_gpu_direct must be a bool")
+        if enable_gpu_direct and (
+            not isinstance(gpu_init_bind_url, str) or not gpu_init_bind_url
+        ):
+            raise ValueError(
+                "gpu_init_bind_url must be a non-empty string when "
+                "enable_gpu_direct is set"
+            )
 
+        self.enable_gpu_direct = enable_gpu_direct
+        self.gpu_init_bind_url = gpu_init_bind_url
         self.node_id = node_id
         self.peers = peers_list
         self.control_bind_url = control_bind_url
@@ -492,6 +721,8 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             lease_ms=int(d.get("lease_ms", 60000)),
             peer_probe_interval_ms=int(d.get("peer_probe_interval_ms", 5000)),
             peer_probe_timeout_ms=int(d.get("peer_probe_timeout_ms", 1000)),
+            enable_gpu_direct=bool(d.get("enable_gpu_direct", False)),
+            gpu_init_bind_url=d.get("gpu_init_bind_url", "0.0.0.0:8502"),
             device=d.get("device", "cpu"),
             model_name=d.get("model_name", ""),
             world_size=int(d.get("world_size", 1)),
@@ -527,6 +758,17 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             "so a lone node never blocks on them.\n"
             "- peer_probe_timeout_ms (int): timeout for a single liveness ping "
             "(default 1000; far shorter than control_timeout_ms)\n"
+            "- enable_gpu_direct (bool): pull remote hits straight into the "
+            "GPU staging buffer, skipping the L1/DRAM landing and the H2D "
+            "bounce (default False). Requires GPUDirect-capable RDMA and a "
+            "per-chunk staging stride that is a multiple of the 2 MiB NIXL "
+            "descriptor size.\n"
+            "- gpu_init_bind_url (str): this node's GPU-side NIXL handshake "
+            "bind URL, used only when enable_gpu_direct is set "
+            "(default 0.0.0.0:8502)\n"
+            "- peers[].gpu_init_url (str): a peer's GPU-side handshake "
+            "side-channel; optional — a peer without one is read via the "
+            "DRAM path\n"
             "- device (str): L1 buffer device registered with NIXL "
             "(default 'cpu')\n"
             "- model_name, world_size, kv_dtype_str, kv_shape, use_mla, "
@@ -568,6 +810,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         register_peer_callback: bool = True,
         eager_connect: bool = True,
         health_monitor: PeerHealthMonitor | None = None,
+        gpu_channel_factory: object | None = None,
     ):
         """Initialize the adapter.
 
@@ -594,6 +837,14 @@ class NixlPeerL2Adapter(L2AdapterInterface):
                 background thread pings dead peers to pick them up when
                 they come online. ``None`` in tests that drive liveness
                 directly.
+            gpu_channel_factory: Enables GPUDirect retrieve. A callable
+                ``(gpu_ptr, size) -> GpuPeerDataChannel`` invoked by
+                :meth:`register_gpu_staging_buffer` once the GPU context
+                exists. ``None`` (the default) leaves the adapter on the
+                DRAM path, with ``supports_l2_resident_retrieve()`` always
+                ``False``. Deferred rather than taking a channel directly
+                because the staging buffer is created by the GPU context,
+                which does not exist when the adapter is built.
         """
         # Pull-only tier: no aggregate capacity, no global eviction.
         super().__init__(max_capacity_bytes=0)
@@ -625,6 +876,16 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         self._completed_lookup: dict[L2TaskId, Bitmap] = {}
         self._completed_load: dict[L2TaskId, Bitmap] = {}
         self._pins: dict[ObjectKey, _RemotePin] = {}
+
+        # GPUDirect retrieve state. ``_gpu_channel`` stays None until
+        # ``register_gpu_staging_buffer`` runs, which is what flips
+        # ``supports_l2_resident_retrieve()`` to True.
+        self._gpu_channel_factory = gpu_channel_factory
+        self._gpu_channel: GpuPeerDataChannel | None = None
+        # h2d token -> the key whose remote pin it holds, so
+        # ``release_after_h2d`` can unlock exactly that key.
+        self._h2d_token_to_key: dict[int, ObjectKey] = {}
+        self._next_h2d_token: int = 0
 
         # Bg loop.
         self._loop = asyncio.new_event_loop()
@@ -963,6 +1224,318 @@ class NixlPeerL2Adapter(L2AdapterInterface):
                     lease_id,
                 )
 
+    # ---------------- l2-resident retrieve (GPUDirect) ----------------
+
+    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
+        """Register the GPU staging buffer, enabling GPUDirect retrieve.
+
+        Called once by the retrieve module after the GPU context has
+        allocated its staging buffer (which does not exist when the adapter
+        is constructed). Builds the GPU-side data channel via the configured
+        factory and starts background handshakes to each peer that advertises
+        a GPU init URL.
+
+        After this returns successfully, ``supports_l2_resident_retrieve()``
+        reports ``True`` and the ``PrefetchController`` begins leaving hits
+        L2-resident for GPU-direct retrieve.
+
+        No-op when the adapter was built without a ``gpu_channel_factory``
+        (GPUDirect disabled), so the caller can invoke it unconditionally.
+
+        Args:
+            gpu_ptr: Device pointer of the staging buffer's base.
+            size: Byte size of the staging buffer.
+
+        Raises:
+            ValueError: If ``gpu_ptr``/``size`` are unusable for NIXL
+                registration (non-positive, or not tiling evenly at the
+                NIXL descriptor size).
+            RuntimeError: If called twice.
+        """
+        if self._gpu_channel_factory is None:
+            return
+        if self._gpu_channel is not None:
+            raise RuntimeError("GPU staging buffer is already registered")
+        if gpu_ptr <= 0:
+            raise ValueError(f"gpu_ptr must be a positive pointer, got {gpu_ptr}")
+        if size <= 0:
+            raise ValueError(f"size must be positive, got {size}")
+
+        channel = self._gpu_channel_factory(gpu_ptr, size)
+        self._gpu_channel = channel
+        logger.info(
+            "NIXL peer adapter: GPU staging buffer registered "
+            "(ptr=%#x, size=%d); GPUDirect retrieve enabled",
+            gpu_ptr,
+            size,
+        )
+        # Handshake off the request path, as the DRAM channel does, so the
+        # first GPUDirect retrieve does not pay for it. A plain daemon
+        # thread rather than the bg asyncio loop: the handshake is a
+        # blocking ZMQ round-trip with no async component, and a pending
+        # loop task would be stranded if the adapter closed meanwhile.
+        gpu_peers = [p for p in self._peers if p.gpu_init_url]
+        if gpu_peers:
+            threading.Thread(
+                target=lambda: [self._connect_peer_gpu_sync(p) for p in gpu_peers],
+                name="nixl-peer-gpu-connect",
+                daemon=True,
+            ).start()
+
+    def supports_l2_resident_retrieve(self) -> bool:
+        """Whether hits can currently be served GPU-direct from a peer.
+
+        Unlike the CXL adapter's constant ``True``, this is **dynamic**: it
+        is ``False`` until :meth:`register_gpu_staging_buffer` has run, and
+        ``False`` for the whole adapter when GPUDirect is disabled. The
+        ``PrefetchController`` re-reads it per request, so flipping it at
+        runtime is safe: requests before the flip take the DRAM path,
+        requests after take the GPU path, and none observe a mix.
+
+        Returns:
+            ``True`` iff GPUDirect retrieve is enabled and registered.
+        """
+        return self._gpu_channel is not None
+
+    def _connect_peer_gpu_sync(self, peer: _Peer) -> bool:
+        """Establish the GPU-side NIXL connection to ``peer``, blocking.
+
+        The GPU analogue of :meth:`_ensure_peer_connected`, tracked by its
+        own flag and lock because the GPU channel is a distinct NIXL agent
+        with an independent handshake. Memoized: the handshake runs at most
+        once per peer even under concurrent callers.
+
+        **GPUDirect is asymmetric, and this handshake reflects that.** Only
+        the *local* side of the transfer is GPU memory: we READ from the
+        peer's DRAM L1 into our GPU staging buffer. So this connects our GPU
+        agent to the peer's **L1 (DRAM) init side-channel** — ``init_url``,
+        the same endpoint the DRAM channel uses — NOT to the peer's own GPU
+        agent.
+
+        Connecting the two GPU agents instead would register the peer's
+        *staging buffer* as the remote dlist (64 descriptors for a 128 MiB
+        buffer), while the donor reports page indices into its 32 GiB L1
+        (up to ~16k). Every index past the staging buffer is then rejected:
+        ``makeXferReq: remote index out of range at index 0 with value 1872``
+        -> ``NIXL_ERR_INVALID_PARAM``. The peer's ``gpu_init_url`` is
+        therefore NOT a handshake target; it exists only so a peer can
+        advertise that it, too, has GPUDirect enabled.
+
+        Runs on the calling thread. Safe from either the bg loop's executor
+        or the retrieve thread, and it never schedules onto the loop, so it
+        cannot be stranded by a concurrent ``close``.
+
+        Args:
+            peer: The peer to connect to.
+
+        Returns:
+            ``True`` if the peer's GPU channel is (now) connected, ``False``
+            if it advertises no GPU URL, GPUDirect is off, or the handshake
+            failed (the caller should treat the peer as unavailable).
+        """
+        if peer.gpu_connected:
+            return True
+        channel = self._gpu_channel
+        if channel is None or not peer.gpu_init_url:
+            return False
+        try:
+            with peer.gpu_connect_lock:
+                if peer.gpu_connected:
+                    return True
+                # peer.init_url (the peer's L1/DRAM agent), NOT
+                # peer.gpu_init_url — see the docstring.
+                channel.lazy_init_peer_connection(
+                    local_id=peer.local_id,
+                    peer_id=peer.peer_id,
+                    peer_init_url=peer.init_url,
+                )
+                peer.gpu_connected = True
+        except Exception as e:
+            logger.debug(
+                "NIXL GPU connect to peer node_id=%d not ready (%s)",
+                peer.node_id,
+                type(e).__name__,
+            )
+            return False
+        logger.info("NIXL peer node_id=%d GPU channel connected", peer.node_id)
+        return True
+
+    def submit_h2d_batch(
+        self,
+        keys: list[ObjectKey],
+        gpu_ptrs: list[int],
+        dst_sizes: list[int],
+    ) -> list[int]:
+        """Pull a batch of pinned remote chunks straight into GPU memory.
+
+        **This call blocks until the RDMA transfers complete**, which is a
+        deliberate divergence from the CXL adapter's fire-and-forget
+        ``cudaMemcpyAsync``. A ``cudaMemcpyAsync`` issued on the caller's
+        stream is ordered against the scatter kernel the caller enqueues
+        next; a one-sided RDMA READ is issued to the NIC and carries no such
+        ordering. Returning early would let that kernel read a staging
+        buffer the NIC has not finished writing — silent KV corruption. The
+        only ordering primitive available is CPU-side completion, so we take
+        it. (Overriding the base per-key loop matters for more than
+        overhead: it collapses a batch into one RDMA per peer instead of one
+        per chunk, so the blocking wait is paid once.)
+
+        The interface contract is still honored: it does not synchronize the
+        CUDA stream — it never touches the stream at all.
+
+        Args:
+            keys: Pinned keys to copy (from ``lookup_and_lock``).
+            gpu_ptrs: Destination device pointer per key, into the
+                registered staging buffer.
+            dst_sizes: Destination capacity in bytes per key.
+
+        Returns:
+            One token per key in input order: a non-negative token for
+            ``release_after_h2d``, or ``-1`` if the key had no pin, its peer
+            has no GPU channel, or the transfer failed. A ``-1`` is
+            unrecoverable for the caller — there is no L1 copy to fall back
+            on — so the retrieve must fail rather than use that slot.
+
+        Raises:
+            ValueError: If the three lists do not have equal length.
+            NotImplementedError: If GPUDirect retrieve is not enabled.
+        """
+        if not (len(keys) == len(gpu_ptrs) == len(dst_sizes)):
+            raise ValueError(
+                "submit_h2d_batch: keys, gpu_ptrs and dst_sizes must have equal length"
+            )
+        channel = self._gpu_channel
+        if channel is None:
+            raise NotImplementedError(
+                "NixlPeerL2Adapter: GPUDirect retrieve is not enabled "
+                "(register_gpu_staging_buffer has not run)"
+            )
+        if not keys:
+            return []
+
+        # Group by peer so each peer costs one RDMA (and one blocking wait).
+        by_peer: dict[int, list[int]] = {}
+        tokens: list[int] = [-1] * len(keys)
+        with self._lock:
+            for i, key in enumerate(keys):
+                pin = self._pins.get(key)
+                if pin is None:
+                    logger.warning("submit_h2d_batch: no remote pin held for %s", key)
+                    continue
+                by_peer.setdefault(pin.peer_index, []).append(i)
+
+        for peer_index, positions in by_peer.items():
+            peer = self._peers[peer_index]
+            # The GPU handshake normally completed in the background at
+            # registration; this only covers the window before it lands.
+            # Done inline on THIS thread rather than by scheduling onto the
+            # bg loop and blocking on the result: we are already blocking
+            # (see the docstring), and hopping to the loop would queue the
+            # TTFT-critical retrieve behind whatever else it is running —
+            # and strand the coroutine if the adapter closes meanwhile.
+            if not peer.gpu_connected and not self._connect_peer_gpu_sync(peer):
+                logger.warning(
+                    "submit_h2d_batch: peer node_id=%d has no GPU channel; "
+                    "%d key(s) cannot be served GPU-direct",
+                    peer.node_id,
+                    len(positions),
+                )
+                continue
+
+            with self._lock:
+                pins = [self._pins.get(keys[i]) for i in positions]
+            # A pin dropped between grouping and here (e.g. a concurrent
+            # unlock) makes the whole peer batch unsafe to address.
+            if any(pin is None for pin in pins):
+                logger.warning(
+                    "submit_h2d_batch: pin vanished for peer node_id=%d; "
+                    "skipping %d key(s)",
+                    peer.node_id,
+                    len(positions),
+                )
+                continue
+
+            try:
+                channel.read_chunks_to_gpu(
+                    [gpu_ptrs[i] for i in positions],
+                    [
+                        min(pin.size, dst_sizes[i])
+                        for i, pin in zip(positions, pins, strict=True)
+                    ],
+                    [pin.remote_index for pin in pins],
+                    peer.peer_id,
+                )
+            except Exception:
+                logger.exception(
+                    "GPUDirect READ from peer node_id=%d failed for %d chunk(s)",
+                    peer.node_id,
+                    len(positions),
+                )
+                continue
+
+            with self._lock:
+                for i in positions:
+                    token = self._next_h2d_token
+                    self._next_h2d_token += 1
+                    self._h2d_token_to_key[token] = keys[i]
+                    tokens[i] = token
+
+        return tokens
+
+    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+        """Pull one pinned remote chunk into GPU memory.
+
+        Single-key form of :meth:`submit_h2d_batch`; see it for the blocking
+        semantics. Prefer the batch form — one RDMA per peer rather than one
+        per chunk.
+
+        Args:
+            key: The pinned key to copy.
+            gpu_ptr: Destination device pointer.
+            dst_size: Destination capacity in bytes.
+
+        Returns:
+            A token for ``release_after_h2d``, or ``-1`` on failure.
+
+        Raises:
+            NotImplementedError: If GPUDirect retrieve is not enabled.
+        """
+        return self.submit_h2d_batch([key], [gpu_ptr], [dst_size])[0]
+
+    def release_after_h2d_batch(self, tokens: list[int]) -> None:
+        """Release the remote read-locks for a batch of copied chunks.
+
+        Resolves tokens to keys and routes them through the same
+        ``_do_unlock`` path as a normal unlock, so the lease-grouping rules
+        (a peer may hold pins for one key under several leases) are applied
+        in exactly one place. ``-1`` tokens are ignored.
+
+        Unlike CXL this need not wait for the stream — the RDMA already
+        completed inside ``submit_h2d_batch`` — but the caller invokes it
+        from a stream callback anyway, which is harmless: releasing late
+        only delays the peer's ability to evict.
+
+        Args:
+            tokens: Tokens returned by ``submit_h2d_batch``.
+        """
+        with self._lock:
+            keys = [
+                key
+                for token in tokens
+                if token >= 0
+                and (key := self._h2d_token_to_key.pop(token, None)) is not None
+            ]
+        if keys:
+            self.submit_unlock(keys)
+
+    def release_after_h2d(self, token: int) -> None:
+        """Release the remote read-lock for one copied chunk.
+
+        Args:
+            token: A token returned by ``submit_h2d`` (``-1`` is a no-op).
+        """
+        self.release_after_h2d_batch([token])
+
     # ---------------- load ----------------
 
     def submit_load_task(
@@ -1073,6 +1646,14 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         # forever. We're shutting down, so bound it: run the close in a
         # daemon thread, wait briefly, and move on if it doesn't finish.
         # Any leaked NIXL thread dies with the process.
+        gpu_channel = self._gpu_channel
+        self._gpu_channel = None
+        if gpu_channel is not None:
+            try:
+                gpu_channel.close()
+            except Exception:
+                logger.exception("GPU data channel close failed during shutdown")
+
         closer = threading.Thread(
             target=self._safe_channel_close, name="nixl-peer-chan-close", daemon=True
         )
@@ -1236,6 +1817,7 @@ def build_nixl_peer_adapter_from_config(
             recv_timeout_ms=config.control_timeout_ms,
             send_timeout_ms=config.control_timeout_ms,
         )
+        gpu_init_url = p.get("gpu_init_url", "")
         peers.append(
             _Peer(
                 node_id=p["node_id"],
@@ -1243,6 +1825,11 @@ def build_nixl_peer_adapter_from_config(
                 control=control,
                 init_url=_strip_tcp_scheme(p["init_url"]),
                 local_id=f"node-{config.node_id}",
+                gpu_init_url=(
+                    _strip_tcp_scheme(gpu_init_url)
+                    if (config.enable_gpu_direct and gpu_init_url)
+                    else ""
+                ),
             )
         )
 
@@ -1277,6 +1864,73 @@ def build_nixl_peer_adapter_from_config(
             describe_fn=_describe_peer,
         )
 
+    # GPUDirect: a SECOND NixlChannel over the GPU staging buffer. NIXL
+    # registers one region with one memory type per agent, so VRAM needs its
+    # own agent rather than an addition to the DRAM one. Deferred behind a
+    # factory because the staging buffer belongs to the GPU context, which
+    # does not exist yet.
+    gpu_channel_factory = None
+    if config.enable_gpu_direct:
+
+        def gpu_channel_factory(  # noqa: F811
+            gpu_ptr: int, size: int
+        ) -> _NixlGpuReadChannel:
+            """Build the GPU-side read channel over the staging buffer.
+
+            Args:
+                gpu_ptr: Base device pointer of the staging buffer.
+                size: Its byte size.
+
+            Returns:
+                A ``_NixlGpuReadChannel`` registered over that buffer.
+
+            Raises:
+                ValueError: If the buffer is not addressable at the NIXL
+                    descriptor size (see below).
+            """
+            # The local descriptors must be the SAME size as the donor's, or
+            # NIXL rejects the transfer outright ("makeXferReq: length
+            # mismatch at index pair N"). The donor's are nixl_page_bytes by
+            # the cross-node wire contract, so ours must be too — which makes
+            # both of these hard requirements on a buffer we don't allocate.
+            # Fail loudly rather than silently desync, matching how the L1
+            # buffer is validated above.
+            if gpu_ptr % nixl_page_bytes != 0:
+                raise ValueError(
+                    f"GPUDirect requires the GPU staging buffer pointer "
+                    f"({gpu_ptr:#x}) to be {nixl_page_bytes}-byte aligned."
+                )
+            if size % nixl_page_bytes != 0:
+                raise ValueError(
+                    f"GPUDirect requires the GPU staging buffer size ({size}) "
+                    f"to be a multiple of the {nixl_page_bytes}-byte NIXL "
+                    f"descriptor size. This is the per-chunk staging stride "
+                    f"times max_batch_size; a KV geometry whose chunk bytes "
+                    f"are not a 2 MiB multiple (e.g. an odd KV-head or layer "
+                    f"count) cannot use GPUDirect."
+                )
+            gpu_channel = NixlChannel(
+                async_mode=False,
+                device="cuda",
+                role="both",
+                buffer_ptr=gpu_ptr,
+                buffer_size=size,
+                align_bytes=nixl_page_bytes,
+                tp_rank=config.local_worker_id,
+                peer_init_url=_strip_tcp_scheme(config.gpu_init_bind_url),
+                backends=config.nixl_backends,
+            )
+            return _NixlGpuReadChannel(
+                gpu_channel, page_size=nixl_page_bytes, buffer_base=gpu_ptr
+            )
+
+        logger.info(
+            "NIXL peer adapter node_id=%d: GPUDirect enabled "
+            "(gpu init bind=%s); awaiting GPU staging buffer registration",
+            config.node_id,
+            config.gpu_init_bind_url,
+        )
+
     return NixlPeerL2Adapter(
         peers=peers,
         data_channel=read_channel,
@@ -1284,6 +1938,7 @@ def build_nixl_peer_adapter_from_config(
         control_server=control_server,
         connect_timeout_s=config.control_timeout_ms / 1000.0,
         health_monitor=health_monitor,
+        gpu_channel_factory=gpu_channel_factory,
     )
 
 

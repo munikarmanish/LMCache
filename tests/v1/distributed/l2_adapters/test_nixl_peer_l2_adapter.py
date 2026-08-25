@@ -44,6 +44,7 @@ from lmcache.v1.distributed.l2_adapters.nixl_peer_donor import (
 from lmcache.v1.distributed.l2_adapters.nixl_peer_l2_adapter import (
     NixlPeerL2Adapter,
     NixlPeerL2AdapterConfig,
+    _NixlGpuReadChannel,
     _NixlReadChannel,
     _Peer,
     _strip_tcp_scheme,
@@ -1065,3 +1066,362 @@ def test_read_chunks_rejects_non_multiple_size():
     rc = _NixlReadChannel(_FakeChannelForRead(), page_size=page)
     with pytest.raises(ValueError):
         rc.read_chunks([_FakeBuf(0, page + 1)], [0], "node-1")
+
+
+# ---------------------------------------------------------------------------
+# GPUDirect (L2-resident retrieve) — see nixl_peer_gpudirect.md
+# ---------------------------------------------------------------------------
+
+
+class _FakeGpuChannel:
+    """In-process stand-in for ``_NixlGpuReadChannel``.
+
+    Records each READ so tests can assert per-peer batching and index math
+    without RDMA hardware or a GPU. ``completed_before_return`` records
+    whether the transfer had finished when the call returned — the property
+    the whole GPUDirect design rests on (an RDMA READ is not ordered against
+    the caller's CUDA stream, so the adapter must not return early).
+    """
+
+    def __init__(self, fail: bool = False):
+        self.reads: list[tuple[str, list[int], list[int], list[int]]] = []
+        self.connects: list[str] = []
+        self.fail = fail
+        self.closed = False
+        self.completed_before_return = True
+
+    def lazy_init_peer_connection(self, local_id, peer_id, peer_init_url):
+        # Record the URL, not just the peer id: GPUDirect must handshake the
+        # peer's L1/DRAM agent, and a test that ignores this cannot tell the
+        # two endpoints apart (see test_gpu_direct_handshakes_l1_not_gpu_url).
+        self.connects.append((peer_id, peer_init_url))
+
+    def read_chunks_to_gpu(self, gpu_ptrs, sizes, remote_page_indices, peer_id):
+        if self.fail:
+            raise RuntimeError("simulated GPUDirect READ failure")
+        self.reads.append(
+            (peer_id, list(gpu_ptrs), list(sizes), list(remote_page_indices))
+        )
+        return len(gpu_ptrs)
+
+    def close(self):
+        self.closed = True
+
+
+def _gpu_adapter(fail: bool = False):
+    """Adapter wired to one peer with GPUDirect enabled and registered."""
+    peer_l1 = FakeL1Manager()
+    peer_l1.put(_make_object_key(10), page_index=2, size_bytes=64, fill=0xAB)
+    peer_l1.put(_make_object_key(11), page_index=4, size_bytes=64, fill=0xCD)
+    donor = NixlPeerDonor(
+        peer_l1, peer_agent_id="node-1", lease_seconds=60, page_size=PAGE_SIZE
+    )
+    server = NixlPeerControlServer(donor, bind_url="tcp://127.0.0.1:0")
+    server.start()
+    control = NixlPeerControlClient(
+        server.bound_endpoint(), recv_timeout_ms=5000, send_timeout_ms=5000
+    )
+    peers = [
+        _Peer(
+            node_id=1,
+            peer_id="node-1",
+            control=control,
+            init_url="127.0.0.1:9999",
+            local_id="node-0",
+            gpu_init_url="127.0.0.1:9998",
+        )
+    ]
+    gpu_channel = _FakeGpuChannel(fail=fail)
+    adapter = NixlPeerL2Adapter(
+        peers=peers,
+        data_channel=FakeDataChannel(remote_pages={"node-1": {}}),
+        node_id=0,
+        control_server=None,
+        eager_connect=False,
+        register_peer_callback=False,
+        gpu_channel_factory=lambda ptr, size: gpu_channel,
+    )
+    return adapter, gpu_channel, server, peer_l1
+
+
+def test_gpu_direct_disabled_without_factory():
+    """No factory => the adapter stays on the DRAM path entirely."""
+    adapter = NixlPeerL2Adapter(
+        peers=[],
+        data_channel=FakeDataChannel(),
+        node_id=0,
+        control_server=None,
+        eager_connect=False,
+        register_peer_callback=False,
+    )
+    try:
+        assert adapter.supports_l2_resident_retrieve() is False
+        # Registration is a no-op, not an error: the caller invokes it
+        # unconditionally for every adapter.
+        adapter.register_gpu_staging_buffer(0x1000, 4096)
+        assert adapter.supports_l2_resident_retrieve() is False
+        with pytest.raises(NotImplementedError):
+            adapter.submit_h2d_batch([_make_object_key(1)], [0x1000], [64])
+    finally:
+        adapter.close()
+
+
+def test_gpu_direct_support_flips_on_registration():
+    """supports_l2_resident_retrieve() is dynamic: False until registered."""
+    adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
+    try:
+        assert adapter.supports_l2_resident_retrieve() is False
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        assert adapter.supports_l2_resident_retrieve() is True
+        # Registering twice is a programming error, not a silent no-op.
+        with pytest.raises(RuntimeError):
+            adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_rejects_bad_buffer():
+    adapter, _gpu_channel, server, _peer_l1 = _gpu_adapter()
+    try:
+        with pytest.raises(ValueError):
+            adapter.register_gpu_staging_buffer(0, 4096)
+        with pytest.raises(ValueError):
+            adapter.register_gpu_staging_buffer(0x200000, 0)
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_h2d_reads_and_releases_pins():
+    """lookup -> submit_h2d_batch -> release drops every remote read-lock."""
+    adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        k0, k1 = _make_object_key(10), _make_object_key(11)
+
+        bitmap = _run_lookup(adapter, [k0, k1])
+        assert bitmap.popcount() == 2
+        assert adapter.debug_held_pin_count() == 2
+
+        tokens = adapter.submit_h2d_batch([k0, k1], [0x200000, 0x400000], [64, 64])
+        assert all(t >= 0 for t in tokens)
+        assert len(set(tokens)) == 2, "tokens must be distinct"
+
+        # One RDMA for the whole batch (both keys live on the same peer),
+        # not one per chunk.
+        assert len(gpu_channel.reads) == 1
+        peer_id, ptrs, sizes, remote_idx = gpu_channel.reads[0]
+        assert peer_id == "node-1"
+        assert ptrs == [0x200000, 0x400000]
+        # Donor page indices come straight from the wire, unchanged.
+        assert remote_idx == [2, 4]
+        # Size is clamped to the chunk, not the destination capacity.
+        assert sizes == [64, 64]
+
+        # The pins are still held until release — on BOTH sides.
+        assert adapter.debug_held_pin_count() == 2
+        assert peer_l1.read_lock_count(k0) == 1
+        assert peer_l1.read_lock_count(k1) == 1
+
+        adapter.release_after_h2d_batch(tokens)
+        _poll_until(lambda: adapter.debug_held_pin_count() == 0 or None)
+        assert adapter.debug_held_pin_count() == 0
+        # The donor's read-locks are actually dropped, not just forgotten
+        # locally — otherwise the peer could never evict these chunks.
+        _poll_until(lambda: peer_l1.read_lock_count(k0) == 0 or None)
+        assert peer_l1.read_lock_count(k0) == 0
+        assert peer_l1.read_lock_count(k1) == 0
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_h2d_without_pin_returns_miss():
+    """A key with no held pin yields -1 rather than a bogus transfer."""
+    adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        tokens = adapter.submit_h2d_batch([_make_object_key(999)], [0x200000], [64])
+        assert tokens == [-1]
+        assert gpu_channel.reads == []
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_h2d_failure_returns_miss_and_keeps_pin():
+    """A failed READ reports -1; the pin stays so unlock can still free it."""
+    adapter, gpu_channel, server, peer_l1 = _gpu_adapter(fail=True)
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        k0 = _make_object_key(10)
+        _run_lookup(adapter, [k0])
+        tokens = adapter.submit_h2d_batch([k0], [0x200000], [64])
+        assert tokens == [-1]
+        # Pin still held -> the abort path (submit_unlock, which the
+        # retrieve consumer calls via submit_unlock_l2_resident when a
+        # retrieve fails) can still release it on the donor.
+        assert adapter.debug_held_pin_count() == 1
+        assert peer_l1.read_lock_count(k0) == 1
+        adapter.submit_unlock([k0])
+        _poll_until(lambda: adapter.debug_held_pin_count() == 0 or None)
+        assert adapter.debug_held_pin_count() == 0
+        _poll_until(lambda: peer_l1.read_lock_count(k0) == 0 or None)
+        assert peer_l1.read_lock_count(k0) == 0
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_release_ignores_negative_tokens():
+    adapter, _gpu_channel, server, _peer_l1 = _gpu_adapter()
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.release_after_h2d_batch([-1, -1])
+        adapter.release_after_h2d(-1)
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_close_tears_down_gpu_channel():
+    adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+    finally:
+        adapter.close()
+        server.stop()
+    assert gpu_channel.closed is True
+
+
+def test_gpu_read_channel_expands_chunk_into_all_descriptors():
+    """Same regression guard as the DRAM path: a chunk spans MANY
+    descriptors and every one must be paired, or only the first page of
+    each chunk transfers."""
+    page = 2 * 1024 * 1024
+    chunk = 32 * 1024 * 1024
+    pages_per_chunk = chunk // page
+    base = 0x40000000
+
+    fake = _FakeChannelForRead()
+    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+
+    # Staging slots 0 and 1; donor bases 2 and 4 chunks in.
+    rc.read_chunks_to_gpu(
+        [base, base + chunk],
+        [chunk, chunk],
+        [2 * pages_per_chunk, 4 * pages_per_chunk],
+        "node-1",
+    )
+
+    agent = fake.nixl_agent
+    assert agent.local_indices == list(range(0, 2 * pages_per_chunk))
+    assert agent.remote_indices == (
+        list(range(2 * pages_per_chunk, 3 * pages_per_chunk))
+        + list(range(4 * pages_per_chunk, 5 * pages_per_chunk))
+    )
+    assert len(agent.local_indices) == len(agent.remote_indices)
+
+
+def test_gpu_read_channel_derives_slot_index_from_pointer():
+    """Slot k's local base descriptor index is k * pages_per_chunk."""
+    page = 2 * 1024 * 1024
+    chunk = 8 * 1024 * 1024
+    pages_per_chunk = chunk // page
+    base = 0x40000000
+
+    fake = _FakeChannelForRead()
+    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+    # Slot 3 only.
+    rc.read_chunks_to_gpu([base + 3 * chunk], [chunk], [0], "node-1")
+    assert fake.nixl_agent.local_indices == list(
+        range(3 * pages_per_chunk, 4 * pages_per_chunk)
+    )
+
+
+def test_gpu_read_channel_rejects_pointer_below_base():
+    page = 2 * 1024 * 1024
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+    )
+    with pytest.raises(ValueError):
+        rc.read_chunks_to_gpu([0x3FFFFFFF], [page], [0], "node-1")
+
+
+def test_gpu_read_channel_rejects_misaligned_pointer():
+    page = 2 * 1024 * 1024
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+    )
+    with pytest.raises(ValueError):
+        rc.read_chunks_to_gpu([0x40000000 + 1], [page], [0], "node-1")
+
+
+def test_gpu_read_channel_rejects_non_multiple_size():
+    page = 2 * 1024 * 1024
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+    )
+    with pytest.raises(ValueError):
+        rc.read_chunks_to_gpu([0x40000000], [page + 1], [0], "node-1")
+
+
+def test_gpu_direct_handshakes_l1_not_gpu_url():
+    """The GPU channel must connect to the peer's L1 (DRAM) agent.
+
+    Regression guard. GPUDirect is asymmetric: only OUR side of the transfer
+    is GPU memory (we READ the peer's DRAM L1 into our GPU staging buffer).
+    Handshaking the peer's *GPU* agent instead registers its staging buffer
+    as the remote dlist (64 descriptors for 128 MiB), while the donor reports
+    page indices into its multi-GiB L1 — so every index past the staging
+    buffer is rejected by NIXL:
+
+        makeXferReq: remote index out of range at index 0 with value 1872
+        -> NIXL_ERR_INVALID_PARAM
+
+    which surfaced as a fully-broken GPUDirect path that still *looked* like
+    it worked (the retrieve failed and vLLM recomputed).
+    """
+    adapter, gpu_channel, server, _peer_l1 = _gpu_adapter()
+    try:
+        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        k0 = _make_object_key(10)
+        _run_lookup(adapter, [k0])
+        adapter.submit_h2d_batch([k0], [0x200000], [64])
+
+        assert gpu_channel.connects, "no GPU handshake happened"
+        _peer_id, url = gpu_channel.connects[0]
+        # The fixture's peer: init_url=127.0.0.1:9999 (L1/DRAM agent),
+        # gpu_init_url=127.0.0.1:9998 (its own GPU agent — NOT a target).
+        assert url == "127.0.0.1:9999", (
+            f"GPU channel handshook {url!r}; it must target the peer's L1 "
+            f"init_url (127.0.0.1:9999), not its gpu_init_url"
+        )
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_gpu_direct_reads_remote_index_beyond_staging_buffer():
+    """A chunk living far into the peer's L1 must still be readable.
+
+    The remote dlist spans the peer's whole L1, so remote indices are
+    unbounded by our staging buffer's size. This is the property the
+    wrong-handshake bug violated.
+    """
+    page = 2 * 1024 * 1024
+    chunk = 32 * 1024 * 1024
+    pages_per_chunk = chunk // page
+    base = 0x40000000
+
+    fake = _FakeChannelForRead()
+    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+
+    # Staging slot 0 (local idx 0-15) <- remote base 8192 (deep in a 32 GiB
+    # L1, far past the 64 descriptors a 128 MiB staging buffer would have).
+    rc.read_chunks_to_gpu([base], [chunk], [8192], "node-1")
+
+    agent = fake.nixl_agent
+    assert agent.local_indices == list(range(0, pages_per_chunk))
+    assert agent.remote_indices == list(range(8192, 8192 + pages_per_chunk))

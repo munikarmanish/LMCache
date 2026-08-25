@@ -304,6 +304,22 @@ class GPUTransferModule:
         layout_desc = get_layout_desc(cache_context, self._ctx.chunk_size)
         self._ctx.layout_desc_registry.register(model_name, world_size, layout_desc)
 
+        # Offer the retrieve staging buffer to any L2 adapter that can pull
+        # remote chunks straight into it (GPUDirect). This is the earliest
+        # point the buffer exists — it belongs to the GPU context created
+        # just above, long after the L2 adapters were built. Adapters with no
+        # GPU-direct path ignore the call.
+        #
+        # ``getattr`` because not every cache-context implementation has a
+        # flat staging buffer (PlainGPUCacheContext does not, nor do test
+        # doubles); GPUDirect is an optimization, so a context without one
+        # just doesn't offer it rather than failing KV cache registration.
+        staging = getattr(cache_context, "tmp_gpu_staging_buffer", None)
+        if staging is not None:
+            self._ctx.storage_manager.register_gpu_staging_buffer(
+                staging.data_ptr(), staging.nbytes
+            )
+
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
@@ -734,6 +750,26 @@ class GPUTransferModule:
                     )
                     h2d_tokens.extend(batch_tokens)
                     h2d_token_adapters.extend(resident_adapters)
+                    # A -1 token means the adapter could not fill that
+                    # staging slot. There is NO fallback copy: an
+                    # L2-resident key was deliberately excluded from the L1
+                    # load plan, so the slot still holds the previous
+                    # batch's bytes. Letting the scatter kernel below run
+                    # would write those stale bytes into the paged KV cache
+                    # as if they were this request's KV — silent,
+                    # unrecoverable corruption of the model's context.
+                    # Fail the retrieve instead and let the engine recompute.
+                    # (Near-impossible for CXL, where a miss under a held
+                    # pin cannot normally happen; reachable for a network
+                    # adapter whose transfer can fail for ordinary reasons.)
+                    if any(token < 0 for token in batch_tokens):
+                        raise RuntimeError(
+                            "L2-resident H2D failed for "
+                            f"{sum(1 for t in batch_tokens if t < 0)}/"
+                            f"{len(batch_tokens)} key(s) in batch {batch_idx}; "
+                            "failing retrieve rather than scattering stale "
+                            "staging-buffer bytes into the KV cache"
+                        )
                 if profiler.enabled:
                     now = time.perf_counter()
                     prof_fill_s += now - fill_start

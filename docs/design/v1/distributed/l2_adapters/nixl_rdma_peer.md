@@ -13,8 +13,10 @@ It is the network analogue of the
 [CXL adapter](docs/design/v1/distributed/l2_adapters/cxl_l2_adapter.md): same
 "L1-first, L2 fetches the misses from peers and prefetches them into L1"
 shape, but the peers are on other hosts reachable by RDMA rather than a
-shared CXL pool. (One difference: the CXL adapter can also serve a hit
-GPU-direct; this adapter always lands chunks in L1 first.)
+shared CXL pool. Both can also serve a hit GPU-direct — for CXL always,
+for this adapter when `enable_gpu_direct` is set
+([`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md));
+otherwise chunks land in L1 first.
 
 ---
 
@@ -41,8 +43,13 @@ GPU-direct; this adapter always lands chunks in L1 first.)
 - Dynamic peer discovery / membership changes / a directory service.
 - Cross-host eviction coordination. Each peer evicts its own L1 freely;
   the remote read-lock only protects the in-flight READ window.
-- L2-resident GPU-direct retrieve (`supports_l2_resident_retrieve()`
-  stays `False` — chunks land in L1 and retrieve is unchanged).
+- ~~L2-resident GPU-direct retrieve~~ — **implemented, opt-in.** See
+  [`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md).
+  With `enable_gpu_direct`, a hit is pulled straight into the GPU staging
+  buffer, skipping the L1 landing and the H2D bounce;
+  `supports_l2_resident_retrieve()` then reports `True` once the staging
+  buffer is registered. Default off — the DRAM path below is what runs
+  unless it is enabled.
 - Authentication / untrusted peers / multi-tenancy.
 
 ---
@@ -286,7 +293,13 @@ idea from [`cxl_l1_donor.py`](lmcache/v1/distributed/l2_adapters/cxl_l1_donor.py
 
 ---
 
-## 5. RETRIEVE is unchanged
+## 5. RETRIEVE is unchanged (on the default DRAM path)
+
+> With `enable_gpu_direct` the hit never reaches L1 and this section does
+> not apply — the retrieve handler pulls it straight into the GPU staging
+> buffer instead. See
+> [`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md).
+
 
 By the time `retrieve` runs, every hit chunk is in L1 (pulled during the
 prefetch LOAD phase) and read-locked by the `PrefetchController`. The

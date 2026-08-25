@@ -23,9 +23,9 @@ Design docs for the adapters:
 
 **Hardware / topology.** The scripts hardcode a 2-node topology:
 
-- **node 0 = `c1` = `192.168.128.31`** — the CXL **initializer** (bootstraps the
+- **node 0 = `g5` = `192.168.128.75`** — the CXL **initializer** (bootstraps the
   pool) and where you run the router.
-- **node 1 = `c2` = `192.168.128.32`**.
+- **node 1 = `g6` = `192.168.128.76`**.
 
 To use your own hosts, edit `NODE0_HOST=` / `NODE1_HOST=` at the top of
 `launch_node.sh`, `launch_router.sh`, `clear_cache.sh`, and `run_bench.sh` (they
@@ -92,11 +92,42 @@ On **both** machines (**node 0 first** for the `cxl` arm — it initializes the
 pool; for `nixl` either order works once both are up):
 
 ```bash
-# on c1 (192.168.128.31):
+# on g5 (192.168.128.75):
 sudo ./launch_node.sh 0 cxl      # or: ... 0 nixl
-# on c2 (192.168.128.32):
+# on g6 (192.168.128.76):
 sudo ./launch_node.sh 1 cxl      # or: ... 1 nixl
 ```
+
+**GPUDirect (`nixl` only, opt-in).** `GPUDIRECT=1` pulls a remote hit straight
+into the GPU staging buffer over RDMA, skipping the L1/DRAM landing and the
+H2D bounce. Set it on **both** nodes — a node without it advertises no GPU
+handshake URL, so its peer falls back to the DRAM path for its chunks:
+
+```bash
+GPUDIRECT=1 sudo -E ./launch_node.sh 0 nixl    # g5
+GPUDIRECT=1 sudo -E ./launch_node.sh 1 nixl    # g6
+```
+
+It adds `enable_gpu_direct`, `gpu_init_bind_url` and each peer's
+`gpu_init_url` (port 8502) to the merged JSON — the GPU side is a separate
+NIXL agent from the DRAM one, so it needs its own port open between the nodes.
+It also widens `UCX_TLS` from `rc` to `rc,cuda_copy`: `UCX_TLS` is an
+**allowlist**, and without `cuda_copy` UCX cannot detect GPU memory, so it
+classifies the staging buffer as host memory and registration fails with
+`VRAM memory is detected as host by UCX` → `NIXL_ERR_BACKEND`.
+The `READY` banner reports which path is active. Confirm the data plane came up
+by looking for both of these in `logs/node<N>-nixl.log`, *after* vLLM registers
+its KV cache:
+
+```
+NIXL peer adapter: GPU staging buffer registered (...); GPUDirect retrieve enabled
+NIXL peer node_id=N GPU channel connected
+```
+
+Still unvalidated on real RDMA hardware, and it moves RDMA latency out of the
+prefetch phase into the TTFT-critical retrieve phase — so A/B it with
+`LMC_PROFILE=1` before trusting it. See
+[`nixl_peer_gpudirect.md`](../../docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md).
 
 Each invocation:
 1. merges `config/<mode>.base.json` + `config/<mode>.node<N>.json` with `jq` and
@@ -169,10 +200,10 @@ to a server's `/v1/completions`, printing the raw response:
 
 ```bash
 # warm a 2000-token prompt on node 0 (seeded so it's reproducible):
-python send_request.py 192.168.128.31:8010 -n 2000 -s 42
+python send_request.py 192.168.128.75:8010 -n 2000 -s 42
 
 # then send the SAME prompt to node 1 and watch it fetch cross-node:
-python send_request.py 192.168.128.32:8010 -n 2000 -s 42
+python send_request.py 192.168.128.76:8010 -n 2000 -s 42
 ```
 
 Args: positional `HOST:PORT`, `-m/--model` (default the harness model),
@@ -227,15 +258,15 @@ built-in `lmcache bench engine` driver against one endpoint:
 
 ```bash
 # against node 0's vLLM (8010) using its MP server (8090) to auto-resolve tokens/GB:
-./lmc_bench.sh 192.168.128.31 8010 8090
+./lmc_bench.sh 192.168.128.75 8010 8090
 
 # sweep document length + concurrency:
 WORKLOAD=long-doc-qa DOCUMENT_LENGTH=8000 NUM_INFLIGHT_REQUESTS=16 \
-    ./lmc_bench.sh 192.168.128.31 8010 8090
+    ./lmc_bench.sh 192.168.128.75 8010 8090
 
 # multi-round-chat workload:
 WORKLOAD=multi-round-chat QPS=2 DURATION=120 \
-    ./lmc_bench.sh 192.168.128.31 8010 8090
+    ./lmc_bench.sh 192.168.128.75 8010 8090
 ```
 
 > Pass **8090** (the MP HTTP port) as the third arg — the in-script example that
@@ -305,8 +336,8 @@ the venv python (`~/.virtualenvs/lmcache/bin/python`).
   donor write is software-fixable or the device's write ceiling. E.g.
   `bench_cxl_write.py --dev /dev/dax0.0 --chunk-mib 32 --chunks 105`.
 - **`probe_nixl_rdma.py {donor|reader}`** — a bare two-node NIXL one-sided READ
-  correctness + bandwidth probe (no control plane). Run `donor` on c1, then
-  `reader --peer-init <c1>:9600` on c2. Sweep `--page-kib` (must match on both
+  correctness + bandwidth probe (no control plane). Run `donor` on g5, then
+  `reader --peer-init <g5>:9600` on g6. Sweep `--page-kib` (must match on both
   roles) to study the descriptor-size effect described in the NIXL design doc.
 - **`gen_prompt.py <num_tokens>`** — emit an exact-length prompt + its token IDs
   to feed a node's `/lookup_hits` endpoint.

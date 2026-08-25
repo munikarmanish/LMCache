@@ -317,6 +317,19 @@ class GPUCacheContext:
         given group."""
         return self.group_kv_pointers_[group_idx]
 
+    @property
+    def tmp_gpu_staging_buffer(self) -> torch.Tensor:
+        """The flat staging buffer backing every ``get_tmp_gpu_buffer_flat``
+        slot.
+
+        Exposed so an L2 adapter can register it for GPUDirect transfers
+        (pulling a remote chunk straight into a staging slot instead of
+        bouncing through DRAM). It is allocated once and never reallocated,
+        so the pointer is stable for the process lifetime — a precondition
+        for registering it with an RDMA NIC.
+        """
+        return self.tmp_gpu_buffer_
+
     def get_tmp_gpu_buffer_flat(self, chunk_idx: int) -> torch.Tensor:
         """Returns the flat uint8 view of the temporary GPU buffer for the
         given chunk index, covering all KV layer groups.

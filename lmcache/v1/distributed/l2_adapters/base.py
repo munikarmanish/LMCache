@@ -394,11 +394,48 @@ class L2AdapterInterface(ABC):
         prefetch copies every hit into an L1 buffer via
         ``submit_load_task`` before retrieve.
 
+        **May change over the adapter's lifetime.** An adapter whose
+        GPU-direct path needs a resource that does not exist at
+        construction (e.g. the NIXL peer adapter, which must register the
+        GPU staging buffer created later by the GPU context) reports
+        ``False`` until it is ready. The ``PrefetchController`` re-reads
+        this per request, so a flip is safe: requests before it take the
+        L1-bounce path, requests after take the GPU-direct path, and no
+        single request observes a mix. Implementations MUST NOT flip it
+        back to ``False`` while pins are held.
+
         Returns:
             ``True`` iff the adapter implements ``submit_h2d`` /
-            ``release_after_h2d``.
+            ``release_after_h2d`` **and** is currently able to serve them.
         """
         return False
+
+    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
+        """Offer the GPU retrieve staging buffer to this adapter.
+
+        Called once, when the GPU context creates the buffer — which happens
+        after the adapters are built. An adapter whose GPU-direct path needs
+        the destination registered up front (e.g. with an RDMA NIC) does so
+        here, and may only then report ``supports_l2_resident_retrieve() ==
+        True``.
+
+        The default is a no-op: an adapter that needs no registration (CXL,
+        which registers its own pool at bootstrap) or that has no GPU-direct
+        path simply ignores it.
+
+        The buffer is allocated once and never moved, so implementations may
+        retain the pointer for the process lifetime.
+
+        Args:
+            gpu_ptr: Device pointer of the staging buffer's base.
+            size: Byte size of the staging buffer.
+
+        Raises:
+            ValueError: If the adapter requires GPU-direct but the buffer is
+                unusable (e.g. wrong alignment for its transport). The caller
+                logs and continues with this adapter on its non-GPU path.
+        """
+        return None
 
     def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
         """Queue an async H2D copy of ``key``'s chunk straight into GPU memory.
@@ -408,6 +445,16 @@ class L2AdapterInterface(ABC):
         method does NOT synchronize the stream and acquires NO new
         eviction lock — it relies on the ``lookup_and_lock`` pin that the
         prefetch phase still holds for this key.
+
+        **The data MUST be in the destination, or ordered on the caller's
+        stream to arrive there, before this returns.** Caller enqueues a
+        kernel reading that buffer immediately afterwards, so an
+        implementation whose transport is *not* stream-ordered (e.g. an
+        RDMA READ, which the NIC completes independently of any CUDA
+        stream) has to block until the transfer completes — it has no other
+        way to establish the ordering. Such an implementation is permitted
+        and should say so in its docstring; "does not synchronize the
+        stream" constrains stream handling, not wall-clock duration.
 
         Preconditions:
             - ``submit_lookup_and_lock_task`` previously succeeded for

@@ -21,8 +21,16 @@
 #   ./launch_node.sh 0 cxl      # node0, CXL adapter
 #   ./launch_node.sh 1 nixl     # node1, NIXL-peer (RDMA) adapter
 #
+# Env toggles:
+#   GPUDIRECT=1   (nixl only) pull remote hits straight into the GPU staging
+#                 buffer, skipping the L1/DRAM landing and the H2D bounce.
+#                 Off by default. Set it on BOTH nodes. Requires
+#                 GPUDirect-capable RDMA; see
+#                 docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md
+#     GPUDIRECT=1 ./launch_node.sh 0 nixl
+#
 # Peers are NOT taken from the CLI: the two-node topology is hard-coded
-# from the known IPs of node0 (192.168.128.31) and node1 (192.168.128.32).
+# from the known IPs of node0 (192.168.128.75) and node1 (192.168.128.76).
 #
 # Requires: jq, and the lmcache venv on PATH (lmcache + vllm CLIs).
 
@@ -42,8 +50,8 @@ source "$VENV/bin/activate"
 # ---------------------------------------------------------------------------
 # Static 2-node topology (NOT configurable via CLI).
 # ---------------------------------------------------------------------------
-NODE0_HOST=192.168.128.31
-NODE1_HOST=192.168.128.32
+NODE0_HOST=192.168.128.75
+NODE1_HOST=192.168.128.76
 
 # ---------------------------------------------------------------------------
 # Ports / model (same on both nodes — each binds its own).
@@ -51,6 +59,7 @@ NODE1_HOST=192.168.128.32
 LMC_ZMQ_PORT=5555          # MP server ZMQ (vLLM connector talks here)
 LMC_HTTP_PORT=8090         # MP server HTTP (healthcheck + /lookup_hits + metrics)
 VLLM_PORT=8010             # vLLM OpenAI API (/health, /v1/..., /metrics)
+NIXL_GPU_INIT_PORT=8502    # NIXL GPU-side handshake (nixl mode + GPUDIRECT=1)
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 
 # ---------------------------------------------------------------------------
@@ -81,7 +90,22 @@ case "$MODE" in
         OVERRIDE="$CONFIG_DIR/nixl.node${NODE_ID}.json"
         # Pin NIXL's UCX transport to the direct RDMA link (mlx5_0 port 1).
         # RC = reliable-connection RDMA.
-        export UCX_TLS="${UCX_TLS:-rc}"
+        #
+        # UCX_TLS is an ALLOWLIST, so it must also name the CUDA transports
+        # when GPUDirect is on. With a bare "rc", UCX has no cuda_copy
+        # transport, classifies the GPU staging buffer as host memory, and
+        # fails registration with:
+        #   "VRAM memory is detected as host by UCX ... registration cannot
+        #    proceed" -> NIXL_ERR_BACKEND
+        # cuda_copy is what lets UCX detect and register VRAM. (gdr_copy,
+        # the GPUDirect fast path, is NOT in this UCX build — naming it just
+        # produces a "transport not available" WARN on every launch, so it
+        # is left out. rc already carries the RDMA path to the NIC.)
+        if [[ "${GPUDIRECT:-0}" == "1" ]]; then
+            export UCX_TLS="${UCX_TLS:-rc,cuda_copy}"
+        else
+            export UCX_TLS="${UCX_TLS:-rc}"
+        fi
         export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_0:1}"
         ;;
     *)
@@ -137,6 +161,32 @@ export LMC_PROFILE=0
 
 L2_JSON="$(jq -c -s '.[0] * .[1]' "$BASE" "$OVERRIDE" \
     | sed -e "s/NODE0_HOST/${NODE0_HOST}/g" -e "s/NODE1_HOST/${NODE1_HOST}/g")"
+
+# ---------------------------------------------------------------------------
+# GPUDirect (nixl mode only, opt-in): GPUDIRECT=1 ./launch_node.sh <id> nixl
+#
+# Pulls a remote hit straight into the GPU staging buffer over RDMA, skipping
+# the L1/DRAM landing and the H2D bounce. Injected here rather than committed
+# into the JSON so the default stays the (validated) DRAM path and A/B runs
+# need no file edits.
+#
+# The GPU side is a SEPARATE NIXL agent from the DRAM one (NIXL registers one
+# region with one memory type per agent), so it needs its own bind port and
+# its own peer URL — hence gpu_init_bind_url + peers[].gpu_init_url.
+# ---------------------------------------------------------------------------
+GPUDIRECT="${GPUDIRECT:-0}"
+if [[ "$GPUDIRECT" == "1" ]]; then
+    if [[ "$MODE" != "nixl" ]]; then
+        echo "ERROR: GPUDIRECT=1 is only supported in 'nixl' mode (got '$MODE')" >&2
+        exit 2
+    fi
+    L2_JSON="$(jq -c \
+        --arg bind "0.0.0.0:${NIXL_GPU_INIT_PORT}" \
+        --arg peer "${PEER_IP}:${NIXL_GPU_INIT_PORT}" \
+        '.enable_gpu_direct = true
+         | .gpu_init_bind_url = $bind
+         | .peers = [.peers[] | .gpu_init_url = $peer]' <<<"$L2_JSON")"
+fi
 
 L2_STORE_POLICY="${L2_STORE_POLICY:-lazy}"
 # L2_STORE_POLICY="${L2_STORE_POLICY:-default}"
@@ -201,6 +251,9 @@ echo "
   MY_IP          : $MY_IP
   PEER           : node${PEER_ID} at $PEER_IP
   MODEL          : $MODEL
+  GPUDirect      : $([[ "$GPUDIRECT" == "1" ]] \
+                       && echo "ENABLED (gpu handshake :${NIXL_GPU_INIT_PORT})" \
+                       || echo "disabled (DRAM path)")
   MP server ZMQ  : tcp://localhost:${LMC_ZMQ_PORT}
   MP server HTTP : http://${MY_IP}:${LMC_HTTP_PORT}  (/healthcheck, /lookup_hits)
   vLLM API       : http://${MY_IP}:${VLLM_PORT}      (/health, /v1/..., /metrics)

@@ -719,6 +719,34 @@ class StorageManager:
             handle.prefetch_request_id
         )
 
+    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
+        """Offer the GPU retrieve staging buffer to every L2 adapter.
+
+        Adapters that can transfer straight into GPU memory (e.g. the NIXL
+        peer adapter's GPUDirect path) register it and begin reporting
+        ``supports_l2_resident_retrieve() == True``; the rest ignore it.
+        Called once, when the GPU context is created — the buffer does not
+        exist when the adapters are built.
+
+        A failure to register is logged and swallowed rather than raised:
+        GPUDirect is an optimization, and an adapter that cannot use this
+        buffer must fall back to its DRAM path rather than break KV cache
+        registration for the whole engine.
+
+        Args:
+            gpu_ptr: Device pointer of the staging buffer's base.
+            size: Byte size of the staging buffer.
+        """
+        for adapter_idx, adapter in enumerate(self._l2_adapters):
+            try:
+                adapter.register_gpu_staging_buffer(gpu_ptr, size)
+            except Exception:
+                logger.exception(
+                    "L2 adapter %d rejected the GPU staging buffer; it will "
+                    "keep using its non-GPUDirect path",
+                    adapter_idx,
+                )
+
     def submit_h2d_for_l2_resident(
         self,
         keys: list[ObjectKey],
