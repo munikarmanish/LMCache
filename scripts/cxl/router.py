@@ -8,7 +8,8 @@ pinning vLLM to an old version.
 
 Strategies (``--strategy``):
     round_robin : next node in rotation; ignores all signals.
-    random      : uniformly random node.
+    random      : random node. Uniform by default, or per ``--weights`` shares
+                  if given (e.g. ``c1=0.7,c2=0.3`` sends ~70% to c1).
     gpu_load    : node with the fewest running requests (KV-cache usage as a
                   tiebreaker), scraped from each node's vLLM /metrics.
     max_prefix  : node with the longest cached prompt prefix, via each node's
@@ -98,6 +99,8 @@ class NodeState:
             (``inf`` until first successful scrape, so an unscraped node is
             never preferred by gpu_load).
         kv_usage: KV-cache usage fraction [0,1] from the last scrape.
+        weight: Relative sampling weight for the ``random`` strategy (default
+            1.0, i.e. uniform). Ignored by every other strategy.
     """
 
     name: str
@@ -105,6 +108,7 @@ class NodeState:
     lookup_url: str
     num_running: float = float("inf")
     kv_usage: float = 0.0
+    weight: float = 1.0
 
 
 @dataclass
@@ -183,6 +187,56 @@ def parse_node_map(serve_arg: str, lookup_arg: str) -> list[NodeState]:
     if not serve:
         raise ValueError("at least one node is required")
     return [NodeState(name=n, serve_url=serve[n], lookup_url=lookup[n]) for n in serve]
+
+
+def apply_weights(nodes: list[NodeState], weights_arg: str) -> None:
+    """Set each node's ``weight`` from a ``name=weight,...`` string, in place.
+
+    Only used by the ``random`` strategy. An empty ``weights_arg``
+    leaves every node at its default weight of 1.0 (uniform). Weights are
+    relative shares, not probabilities: ``random.choices`` normalises them, so
+    ``c1=0.7,c2=0.3`` and ``c1=7,c2=3`` route identically.
+
+    Args:
+        nodes: The parsed nodes to annotate (mutated in place).
+        weights_arg: Comma-separated ``name=weight`` pairs. Every name must be
+            a configured node, and every node must be assigned a weight (no
+            partial specs, to avoid silently mixing an explicit weight with a
+            default 1.0 for the rest).
+
+    Raises:
+        ValueError: On a malformed entry, an unknown/duplicate/missing node
+            name, a non-numeric or negative weight, or an all-zero total.
+    """
+    by_name = {n.name: n for n in nodes}
+    seen: dict[str, float] = {}
+    for entry in weights_arg.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(f"expected name=weight, got {entry!r}")
+        name, raw = entry.split("=", 1)
+        name = name.strip()
+        if name not in by_name:
+            raise ValueError(f"--weights names unknown node {name!r}")
+        if name in seen:
+            raise ValueError(f"--weights has duplicate node {name!r}")
+        try:
+            weight = float(raw.strip())
+        except ValueError:
+            raise ValueError(f"--weights value for {name!r} is not a number: {raw!r}")
+        if weight < 0:
+            raise ValueError(f"--weights value for {name!r} is negative: {weight}")
+        seen[name] = weight
+
+    missing = [n.name for n in nodes if n.name not in seen]
+    if missing:
+        raise ValueError(f"--weights missing node(s) {sorted(missing)}")
+    if sum(seen.values()) <= 0:
+        raise ValueError("--weights sum to zero; at least one must be positive")
+    for name, weight in seen.items():
+        by_name[name].weight = weight
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +376,9 @@ async def choose_node(
         return node, RoutingDecision(node=node.name, reason="round-robin")
 
     if cfg.strategy == "random":
-        node = random.choice(nodes)
+        # Sampled in proportion to each node's --weights share; weights all
+        # default to 1.0, so this is uniform unless --weights was given.
+        node = random.choices(nodes, weights=[n.weight for n in nodes], k=1)[0]
         return node, RoutingDecision(node=node.name, reason="random")
 
     if cfg.strategy == "gpu_load":
@@ -603,6 +659,12 @@ def parse_args() -> RouterConfig:
     parser.add_argument(
         "--strategy", default="round_robin", choices=STRATEGIES, help="routing strategy"
     )
+    parser.add_argument(
+        "--weights",
+        default="",
+        help="random: comma-separated name=weight shares "
+        "(e.g. c1=0.7,c2=0.3); every node must be listed. Default: uniform.",
+    )
     parser.add_argument("--w-prefix", type=float, default=0.7, help="weighted: prefix weight")
     parser.add_argument("--w-load", type=float, default=0.3, help="weighted: load weight")
     parser.add_argument("--port", type=int, default=8000, help="router listen port")
@@ -629,6 +691,13 @@ def parse_args() -> RouterConfig:
     args = parser.parse_args()
 
     nodes = parse_node_map(args.nodes, args.lookup)
+    if args.weights:
+        apply_weights(nodes, args.weights)
+        if args.strategy != "random":
+            logger.warning(
+                "--weights is ignored by the %r strategy (only random uses it)",
+                args.strategy,
+            )
     return RouterConfig(
         nodes=nodes,
         model=args.model,
