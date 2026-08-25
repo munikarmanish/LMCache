@@ -31,12 +31,11 @@ These are what the index's `chunk_offset` field wants.
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.cxl.regions import (
-    NoRegionAvailable,
     RegionAllocator,
 )
 
@@ -74,8 +73,7 @@ class NodeHeap:
         rsize = region_allocator.region_size()
         if rsize % chunk_size != 0:
             raise ValueError(
-                f"chunk_size {chunk_size} does not evenly divide "
-                f"region_size {rsize}"
+                f"chunk_size {chunk_size} does not evenly divide region_size {rsize}"
             )
 
         self._regions = region_allocator
@@ -110,11 +108,28 @@ class NodeHeap:
         with self._lock:
             if not self._free:
                 self._claim_and_seed_region_locked()
-            off = self._free.popleft()
-            # Track per-region occupancy for trim().
-            region_id = self._region_for_offset(off)
-            self._free_count_per_region[region_id] -= 1
-            return off
+            return self._pop_free_locked()
+
+    def alloc_no_claim(self) -> int:
+        """Return a pool-relative offset for one free chunk, never claiming.
+
+        Free-list-only counterpart of :meth:`alloc`: it serves from the
+        existing free-list and never claims a new region from the global pool.
+        The backend uses it to retry a store after eviction has refilled the
+        free-list, so a slot freed by evicting a cold chunk is reused in place
+        rather than growing this node's region footprint.
+
+        Returns:
+            A pool-relative offset for a free chunk.
+
+        Raises:
+            OutOfChunks: If the free-list is empty (nothing was evicted, or the
+                freed slots were consumed by a concurrent alloc).
+        """
+        with self._lock:
+            if not self._free:
+                raise OutOfChunks("no free chunk without claiming a new region")
+            return self._pop_free_locked()
 
     def alloc_batch(self, n: int) -> List[int]:
         """Allocate `n` chunks in one lock acquisition.
@@ -132,11 +147,60 @@ class NodeHeap:
             while len(out) < n:
                 if not self._free:
                     self._claim_and_seed_region_locked()
-                off = self._free.popleft()
-                region_id = self._region_for_offset(off)
-                self._free_count_per_region[region_id] -= 1
-                out.append(off)
+                out.append(self._pop_free_locked())
         return out
+
+    def alloc_batch_no_claim(self, n: int) -> List[int]:
+        """Allocate `n` chunks from the free-list only, never claiming.
+
+        Free-list-only counterpart of :meth:`alloc_batch`, used by the
+        post-eviction store retry. Serves from the existing free-list and
+        never claims a new region. If the free-list runs dry before `n`
+        chunks are handed out, the offsets already popped in this call are
+        returned to the free-list before raising, so the heap is left
+        unchanged (unlike :meth:`alloc_batch`, whose partial hand-outs the
+        caller must back out).
+
+        Args:
+            n: Number of chunks to allocate.
+
+        Returns:
+            A list of `n` pool-relative offsets.
+
+        Raises:
+            ValueError: If `n <= 0`.
+            OutOfChunks: If the free-list holds fewer than `n` chunks. The
+                heap is left unmodified in this case.
+        """
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n}")
+        out: List[int] = []
+        with self._lock:
+            while len(out) < n:
+                if not self._free:
+                    # Roll back this call's partial hand-outs so the heap is
+                    # unchanged, then signal the caller to drop the batch.
+                    self._return_free_locked(out)
+                    raise OutOfChunks(
+                        f"free-list has {len(out)} of {n} requested chunks "
+                        "without claiming a new region"
+                    )
+                out.append(self._pop_free_locked())
+        return out
+
+    def _pop_free_locked(self) -> int:
+        """Pop one offset off the free-list and update occupancy. Holds lock."""
+        off = self._free.popleft()
+        region_id = self._region_for_offset(off)
+        self._free_count_per_region[region_id] -= 1
+        return off
+
+    def _return_free_locked(self, offsets: List[int]) -> None:
+        """Return already-popped offsets to the free-list. Holds lock."""
+        for off in offsets:
+            region_id = self._region_for_offset(off)
+            self._free.append(off)
+            self._free_count_per_region[region_id] += 1
 
     def free(self, offset: int) -> None:
         """Return one chunk (by pool-relative offset) to the free-list.
@@ -188,8 +252,7 @@ class NodeHeap:
             victims = [
                 rid
                 for rid in list(self._owned)
-                if self._free_count_per_region.get(rid, 0)
-                == self._slots_per_region
+                if self._free_count_per_region.get(rid, 0) == self._slots_per_region
             ]
             for rid in victims:
                 # Remove the region's offsets from the free deque.
@@ -203,6 +266,26 @@ class NodeHeap:
                 self._regions.release(rid, self._node_id)
                 released.append(rid)
         return released
+
+    def occupancy(self) -> tuple[int, int]:
+        """Return ``(occupied_slots, total_slots)`` across owned regions.
+
+        Both counts are DRAM-only and cover only this node's currently-claimed
+        regions: ``total = len(owned) * slots_per_region`` and
+        ``occupied = total - len(free_list)``. The backend's eviction loop uses
+        the ratio as a node-local usage watermark that eviction can actually
+        lower — freeing a chunk moves it from occupied to free without changing
+        ``total`` (regions are never released on this path).
+
+        Returns:
+            A ``(occupied_slots, total_slots)`` pair. ``total_slots`` is 0 when
+            this node owns no regions, in which case the caller treats
+            occupancy as 0% (nothing local to evict).
+        """
+        with self._lock:
+            total = len(self._owned) * self._slots_per_region
+            occupied = total - len(self._free)
+            return occupied, total
 
     def stats(self) -> HeapStats:
         with self._lock:
