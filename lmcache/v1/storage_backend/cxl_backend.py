@@ -83,6 +83,7 @@ class CXLBackendConfig:
     run_lock_manager: bool = True
     pool_size_override: Optional[int] = None
     max_nodes: Optional[int] = None
+    num_locks: Optional[int] = None
     # Node-local LRU eviction (see CXLBackend eviction ladder). When a store
     # cannot claim a new region because the *global* pool is exhausted, the
     # node evicts its own coldest chunks back into its heap free-list and
@@ -155,23 +156,23 @@ class CXLBackend(AllocatorBackendInterface):
             )
         self._evict_low_watermark = cxl_config.evict_low_watermark
 
+        # ``max_nodes`` / ``num_locks`` size the shared lock table, and the
+        # arbiter sweeps every one of its ``num_locks * max_nodes`` cells each
+        # pass — so both directly set the sweep cost. Pass them through only
+        # when set, letting CXLBootstrapConfig's defaults apply otherwise.
+        bootstrap_kwargs: dict[str, int] = {}
         if cxl_config.max_nodes is not None:
-            bootstrap_cfg = CXLBootstrapConfig(
-                dev_path=cxl_config.dev_path,
-                region_size=cxl_config.region_size,
-                initialize=cxl_config.initialize,
-                generation=cxl_config.generation,
-                pool_size_override=cxl_config.pool_size_override,
-                max_nodes=cxl_config.max_nodes,
-            )
-        else:
-            bootstrap_cfg = CXLBootstrapConfig(
-                dev_path=cxl_config.dev_path,
-                region_size=cxl_config.region_size,
-                initialize=cxl_config.initialize,
-                generation=cxl_config.generation,
-                pool_size_override=cxl_config.pool_size_override,
-            )
+            bootstrap_kwargs["max_nodes"] = cxl_config.max_nodes
+        if cxl_config.num_locks is not None:
+            bootstrap_kwargs["num_locks"] = cxl_config.num_locks
+        bootstrap_cfg = CXLBootstrapConfig(
+            dev_path=cxl_config.dev_path,
+            region_size=cxl_config.region_size,
+            initialize=cxl_config.initialize,
+            generation=cxl_config.generation,
+            pool_size_override=cxl_config.pool_size_override,
+            **bootstrap_kwargs,
+        )
         self._pool: PoolHandle = bootstrap_pool(bootstrap_cfg, metadata)
         self._fence = None  # default StubFence; explicit None == use module default
 

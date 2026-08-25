@@ -106,6 +106,14 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         # (e.g. 2) shrinks the lock-table sweep by max_nodes/64×, which
         # is a big win for the arbiter on small clusters.
         max_nodes: int | None = None,
+        # Number of shards in the distributed lock array (pool-header field).
+        # Default in the CXL layout is 4096. The arbiter sweeps every
+        # ``num_locks * max_nodes`` cell each pass, and each cell costs a
+        # clflush + a cold CXL read (~172 ns measured), so this sets the
+        # sweep cost linearly: 4096x2 cells ~= 1.4 ms/sweep, 1024x2 ~= 0.35 ms.
+        # Lower it toward the real concurrency of the deployment; too low
+        # raises false-sharing contention between unrelated keys.
+        num_locks: int | None = None,
         # Static-peer cross-node fetch (Alternative A — no controller).
         # If empty, the adapter does no cross-node fetch on a CXL miss.
         # Each peer is {"node_id": int, "url": "tcp://host:port"}, where
@@ -196,6 +204,11 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         if max_nodes is not None and (not isinstance(max_nodes, int) or max_nodes <= 0):
             raise ValueError("max_nodes must be a positive integer when set")
         self.max_nodes = max_nodes
+        if num_locks is not None and (not isinstance(num_locks, int) or num_locks <= 1):
+            # >1: _lock_id_for_slot maps to 1 + slot % (num_locks - 1), so
+            # num_locks == 1 would divide by zero.
+            raise ValueError("num_locks must be an integer > 1 when set")
+        self.num_locks = num_locks
         self.peers = peers_list
         self.cxl_p2p_bind_url = cxl_p2p_bind_url
         self.cxl_p2p_timeout_ms = cxl_p2p_timeout_ms
@@ -245,6 +258,7 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             run_lock_manager=bool(d.get("run_lock_manager", False)),
             pool_size_override=pool_size_override,
             max_nodes=d.get("max_nodes"),
+            num_locks=d.get("num_locks"),
             peers=peers,
             cxl_p2p_bind_url=d.get("cxl_p2p_bind_url", "tcp://0.0.0.0:8447"),
             cxl_p2p_timeout_ms=int(d.get("cxl_p2p_timeout_ms", 30000)),
@@ -1198,6 +1212,7 @@ def build_cxl_adapter_from_config(
         run_lock_manager=config.run_lock_manager,
         pool_size_override=config.pool_size_override,
         max_nodes=config.max_nodes,
+        num_locks=config.num_locks,
     )
     metadata = LMCacheMetadata(
         model_name=config.model_name,
