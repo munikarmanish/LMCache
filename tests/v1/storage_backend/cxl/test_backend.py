@@ -10,6 +10,7 @@ host anyway).
 # Standard
 import asyncio
 import ctypes
+import hashlib
 import os
 import tempfile
 import threading
@@ -57,6 +58,24 @@ def _make_key(h: int) -> CacheEngineKey:
         chunk_hash=h,
         dtype=md.kv_dtype,
     )
+
+
+def _content_hash(*parts: int) -> int:
+    """A realistic 64-bit chunk_hash derived from `parts`.
+
+    Production `chunk_hash` values come from hashing token content
+    (sha256_cbor, or Python's builtin hash), so they are full-width 64-bit
+    and uniformly spread across the index's `chunk_hash % slot_count` home
+    slots. Small hand-picked integers are not: a base that happens to be a
+    multiple of the slot count aliases every key onto the same home slot,
+    which piles keys into one probe run and can exhaust `max_probe` while
+    the index is still nearly empty.
+
+    Tests that store many keys at once should use this instead of a literal
+    so their probe behavior matches production.
+    """
+    payload = b":".join(str(p).encode() for p in parts)
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
 def _make_source_obj(size_bytes: int, fill_byte: int = 0xAB) -> TensorMemoryObj:
@@ -295,24 +314,46 @@ def test_concurrent_puts_and_gets_do_not_corrupt(backend):
     num_threads = 4
     per_thread = 50
 
+    # Failures are collected rather than asserted in-thread: an assert inside
+    # a worker only surfaces as a PytestUnhandledThreadExceptionWarning, which
+    # does NOT fail the test. The main thread asserts on this list instead.
+    failures: list[str] = []
+    failures_lock = threading.Lock()
+
     def worker(tid: int):
         for i in range(per_thread):
-            h = 0x10000 * (tid + 1) + i
+            # Realistic content-derived hash: full-width and uniformly spread
+            # over the index's home slots, matching production key behavior.
+            h = _content_hash(tid, i)
             key = _make_key(h)
             fill = h & 0xFF
-            backend.batched_submit_put_task(
-                [key], [_make_source_obj(512, fill_byte=fill)]
-            )
-            got = backend.get_blocking(key)
-            assert got is not None, f"miss after put for h={h}"
-            assert int(got.raw_data[0]) == fill
-            got.ref_count_down()
+            try:
+                backend.batched_submit_put_task(
+                    [key], [_make_source_obj(512, fill_byte=fill)]
+                )
+                got = backend.get_blocking(key)
+                if got is None:
+                    with failures_lock:
+                        failures.append(f"miss after put for h={h:#x}")
+                    continue
+                if int(got.raw_data[0]) != fill:
+                    with failures_lock:
+                        failures.append(
+                            f"corrupt payload for h={h:#x}: "
+                            f"got {int(got.raw_data[0])}, want {fill}"
+                        )
+                got.ref_count_down()
+            except Exception as e:  # noqa: BLE001 - reported below
+                with failures_lock:
+                    failures.append(f"exception for h={h:#x}: {e!r}")
 
     threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(30)
+    assert not any(t.is_alive() for t in threads), "worker thread did not finish"
+    assert not failures, f"{len(failures)} failure(s): {failures[:10]}"
 
 
 def test_double_get_holds_two_refs(backend):
