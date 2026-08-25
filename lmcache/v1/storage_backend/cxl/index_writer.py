@@ -739,3 +739,57 @@ class CXLIndexWriter:
             slot_addr = self._slots_base_addr + slot_idx * self._slot_size
             self._fence.fence_after_write(slot_addr, self._line0_size)
             return True, view
+
+    def clear_owned_slots(self) -> Tuple[List[int], int]:
+        """Evict every VALID slot this node owns, returning their offsets.
+
+        Bulk counterpart of :meth:`evict` for a full node clear (see
+        ``CXLBackend.clear``). Scans the whole slot array once and, for each
+        VALID slot whose ``owner_node_id`` matches this node, flips it to TOMB
+        under the slot lock and collects its ``chunk_offset`` so the caller can
+        free the chunk from the node heap. Slots owned by other nodes (donor
+        entries in the shared index) are left untouched — this heap cannot free
+        their offsets.
+
+        Busy slots are skipped, never force-freed: a slot with
+        ``ref_count > 0`` (in-flight GET/GPU copy) or ``pin_count > 0`` stays
+        VALID and is counted in the returned skip total. This matches
+        :meth:`evict`/``CXLBackend.remove`` semantics, so a concurrent read is
+        never invalidated underneath the reader.
+
+        A single bulk fence-before-read primes the whole slot array up front
+        (per the rationale in :meth:`region_has_no_live_slots`); each TOMB
+        flip is fenced individually so a peer observes the tombstone.
+
+        Returns:
+            Tuple[List[int], int]: ``(freed_offsets, skipped_busy)`` — the
+            pool-relative ``chunk_offset`` of every slot flipped to TOMB, and
+            the number of owned VALID slots skipped because they were busy.
+        """
+        self._fence.flush_before_read(
+            self._slots_base_addr, self._slot_count * self._slot_size
+        )
+        freed_offsets: List[int] = []
+        skipped_busy = 0
+        for slot_idx in range(self._slot_count):
+            # Cheap unlocked pre-filter off the primed read; the locked
+            # re-check below is authoritative.
+            line0 = self._slots[slot_idx].line0
+            if line0.state != SLOT_STATE_VALID:
+                continue
+            if line0.owner_node_id != self._node_id:
+                continue
+            with self._lock.acquire(self._lock_id_for_slot(slot_idx)):
+                slot = self._slots[slot_idx]
+                if slot.line0.state != SLOT_STATE_VALID:
+                    continue
+                if slot.line0.owner_node_id != self._node_id:
+                    continue
+                if slot.line1.ref_count > 0 or slot.line1.pin_count > 0:
+                    skipped_busy += 1
+                    continue
+                freed_offsets.append(int(slot.line0.chunk_offset))
+                slot.line0.state = SLOT_STATE_TOMB
+                slot_addr = self._slots_base_addr + slot_idx * self._slot_size
+                self._fence.fence_after_write(slot_addr, self._line0_size)
+        return freed_offsets, skipped_busy

@@ -16,12 +16,11 @@ CXL_LOOKUP.
 """
 
 # Standard
-import asyncio
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 # Third Party
 import torch
@@ -43,20 +42,25 @@ from lmcache.v1.storage_backend.cxl.bootstrap import (
     PoolHandle,
     bootstrap_pool,
 )
-from lmcache.v1.storage_backend.cxl.heap import NodeHeap
+from lmcache.v1.storage_backend.cxl.heap import NodeHeap, OutOfChunks
 from lmcache.v1.storage_backend.cxl.index import CXLIndex, SlotView
 from lmcache.v1.storage_backend.cxl.index_writer import (
     CXLIndexWriter,
     ReserveOutcome,
     ReserveResult,
 )
+from lmcache.v1.storage_backend.cxl.layout import OWNER_FREE
 from lmcache.v1.storage_backend.cxl.lock_manager import LockManager
 from lmcache.v1.storage_backend.cxl.lock_manager_proc import (
     ProcessLockManager,
     ProcessLockManagerConfig,
 )
 from lmcache.v1.storage_backend.cxl.locks import TwoTierLock
-from lmcache.v1.storage_backend.cxl.regions import RegionAllocator
+from lmcache.v1.storage_backend.cxl.lru_tracker import NodeLRUTracker
+from lmcache.v1.storage_backend.cxl.regions import (
+    NoRegionAvailable,
+    RegionAllocator,
+)
 
 logger = init_logger(__name__)
 
@@ -79,6 +83,17 @@ class CXLBackendConfig:
     run_lock_manager: bool = True
     pool_size_override: Optional[int] = None
     max_nodes: Optional[int] = None
+    # Node-local LRU eviction (see CXLBackend eviction ladder). When a store
+    # cannot claim a new region because the *global* pool is exhausted, the
+    # node evicts its own coldest chunks back into its heap free-list and
+    # retries the store from there, capping its footprint instead of dropping
+    # the put. `evict_low_watermark` is the occupancy floor eviction drains
+    # toward (occupied owned-slots / total owned-slots) when there is headroom;
+    # a batch that needs more space evicts past it, down to the last
+    # non-pinned chunk. Range (0.0, 1.0]. There is no separate high watermark:
+    # the trigger is region exhaustion (NoRegionAvailable), so eviction costs
+    # nothing until the pool is actually full.
+    evict_low_watermark: float = 0.8
     # When True (default) and run_lock_manager is also True, the lock
     # manager runs as a standalone C subprocess via ProcessLockManager.
     # The in-process Python LockManager is starved of GIL under donor
@@ -86,6 +101,25 @@ class CXLBackendConfig:
     # Set False to fall back to the Python thread (e.g. for tests or
     # environments without a C compiler).
     use_process_lock_manager: bool = True
+
+
+@dataclass
+class ClearResult:
+    """Outcome of :meth:`CXLBackend.clear`.
+
+    Attributes:
+        chunks_deleted: Number of this node's VALID chunks tombstoned and
+            freed back to the node heap.
+        slots_skipped_busy: Number of this node's VALID chunks left in place
+            because they were pinned or had a nonzero ref_count (in-flight
+            read / GPU copy). Their regions cannot trim while they persist.
+        regions_released: Number of now-empty regions returned to the global
+            pool by ``heap.trim()``.
+    """
+
+    chunks_deleted: int
+    slots_skipped_busy: int
+    regions_released: int
 
 
 class CXLBackend(AllocatorBackendInterface):
@@ -114,6 +148,12 @@ class CXLBackend(AllocatorBackendInterface):
         super().__init__(dst_device=dst_device)
         self._node_id = cxl_config.node_id
         self._chunk_size_bytes = cxl_config.chunk_size_bytes
+        if not 0.0 < cxl_config.evict_low_watermark <= 1.0:
+            raise ValueError(
+                "evict_low_watermark must be in (0.0, 1.0], got "
+                f"{cxl_config.evict_low_watermark}"
+            )
+        self._evict_low_watermark = cxl_config.evict_low_watermark
 
         if cxl_config.max_nodes is not None:
             bootstrap_cfg = CXLBootstrapConfig(
@@ -184,6 +224,11 @@ class CXLBackend(AllocatorBackendInterface):
         # cache to skip probing when the caller already knows the key.
         self._key_to_slot: dict[int, int] = {}
         self._key_to_slot_lock = threading.Lock()
+
+        # Node-local LRU recency over the slots this node owns. Touched on every
+        # local read/commit (DRAM only, no CXL write) and consulted only when a
+        # store must evict to reclaim free-list space after region exhaustion.
+        self._lru = NodeLRUTracker()
 
         # In-flight put futures keyed by chunk_hash — tracked so
         # `exists_in_put_tasks` can answer correctly.
@@ -352,6 +397,19 @@ class CXLBackend(AllocatorBackendInterface):
             raise ValueError(
                 f"batched_submit_put_task: {len(keys)} keys vs {len(objs)} objs"
             )
+        # Batch admission: when the pool is exhausted, evict this node's cold
+        # chunks *once* for the whole batch (evict-as-much-as-possible). If
+        # eviction still cannot free room for every chunk, drop the entire
+        # batch rather than storing a partial prefix — per the eviction
+        # contract, a store batch lands whole or not at all.
+        if not self._ensure_batch_space(len(keys)):
+            logger.warning(
+                "CXL node %d: pool exhausted and local eviction could not free "
+                "space for a %d-chunk store batch; dropping the batch",
+                self._node_id,
+                len(keys),
+            )
+            return None
         for key, obj in zip(keys, objs, strict=True):
             try:
                 self._put_one(key, obj)
@@ -407,7 +465,7 @@ class CXLBackend(AllocatorBackendInterface):
                 )
 
             try:
-                chunk_offset = self._heap.alloc()
+                chunk_offset = self._alloc_chunk_with_eviction()
             except Exception:
                 self._index_writer.release_slot(slot_idx)
                 raise
@@ -420,6 +478,8 @@ class CXLBackend(AllocatorBackendInterface):
                     chunk_len=size_bytes,
                     fmt=src.meta.fmt,
                 )
+                # _cache_slot also refreshes LRU recency, so the freshly
+                # committed slot is most-recently-used.
                 self._cache_slot(key, slot_idx)
             except Exception:
                 self._heap.free(chunk_offset)
@@ -428,6 +488,165 @@ class CXLBackend(AllocatorBackendInterface):
         finally:
             with self._inflight_lock:
                 self._inflight_puts.discard(key.chunk_hash)
+
+    def _alloc_chunk_with_eviction(self) -> int:
+        """Allocate one chunk offset, evicting local cold chunks if needed.
+
+        The store allocation ladder:
+
+          1. ``heap.alloc()`` — serve from the free-list, else claim a new
+             region from the global pool.
+          2. On ``NoRegionAvailable`` (the global pool is exhausted, so this
+             node's region count is now fixed), evict this node's coldest
+             chunks back into the free-list via :meth:`_evict_cold_slots`, then
+             retry with ``heap.alloc_no_claim()`` (free-list only — never
+             claims).
+          3. If eviction frees nothing (every cold slot is pinned or has an
+             in-flight read), ``alloc_no_claim`` raises ``OutOfChunks`` and this
+             method re-raises the original ``NoRegionAvailable`` so the caller
+             drops the store.
+
+        Returns:
+            A pool-relative chunk offset.
+
+        Raises:
+            NoRegionAvailable: If the pool is exhausted and eviction could not
+                free any local slot.
+        """
+        try:
+            return self._heap.alloc()
+        except NoRegionAvailable:
+            self._evict_cold_slots(target=1)
+            try:
+                return self._heap.alloc_no_claim()
+            except OutOfChunks:
+                # Nothing evictable (all cold slots pinned / in-flight).
+                logger.warning(
+                    "CXL node %d: pool exhausted and no evictable local chunk; "
+                    "dropping store",
+                    self._node_id,
+                )
+                raise NoRegionAvailable(
+                    "pool exhausted and local eviction freed no chunk"
+                ) from None
+
+    def _ensure_batch_space(self, n: int) -> bool:
+        """Ensure ``n`` chunk slots can be allocated for a store batch.
+
+        Runs once per batch, before the per-chunk store loop. Fast-path: if the
+        node can already back ``n`` chunks — from its free-list plus regions it
+        can still claim from a non-exhausted pool — nothing is evicted and this
+        returns True immediately (the common case; eviction costs nothing until
+        the pool is full).
+
+        Only when the pool is exhausted (no free-list slack and no claimable
+        region) does it evict this node's coldest chunks, asking
+        :meth:`_evict_cold_slots` to free the batch's shortfall (and at least
+        down to the low watermark). It returns whether, after that, the
+        free-list holds enough slots for the whole batch.
+
+        Args:
+            n: Number of chunks the batch will store.
+
+        Returns:
+            True if the batch can proceed (each chunk will find a slot), False
+            if the pool is exhausted and eviction could not free ``n`` slots —
+            in which case the caller drops the whole batch.
+        """
+        if n <= 0:
+            return True
+        occupied, total = self._heap.occupancy()
+        free_now = total - occupied
+        if free_now >= n:
+            return True
+        # Free-list is short. If the pool still has claimable regions, the
+        # per-chunk alloc() will grow the free-list on demand — no eviction
+        # needed. Probe cheaply by asking the region layer for free capacity.
+        if self._pool_has_claimable_region():
+            return True
+        # Pool exhausted: free the shortfall from local cold chunks.
+        shortfall = n - free_now
+        self._evict_cold_slots(target=shortfall)
+        occupied_after, total_after = self._heap.occupancy()
+        return (total_after - occupied_after) >= n
+
+    def _pool_has_claimable_region(self) -> bool:
+        """Return True if the global pool has at least one FREE region.
+
+        A cheap read of the region descriptors (the same scan the GC does);
+        used by :meth:`_ensure_batch_space` to skip eviction while the node can
+        still grow its footprint by claiming.
+        """
+        for info in self._region_allocator.iter_regions():
+            if info.owner_node_id == OWNER_FREE:
+                return True
+        return False
+
+    def _evict_cold_slots(self, target: int) -> int:
+        """Evict this node's coldest chunks to free at least ``target`` slots.
+
+        Evicts oldest-first per the node-local LRU, draining toward the
+        configured low watermark (``occupied / total`` owned slots) and, if the
+        caller needs more than that yields, continuing past the floor until
+        either ``target`` slots are freed or no evictable chunk remains. A slot
+        that is pinned or has an in-flight read is refused by
+        :meth:`CXLIndexWriter.evict` and skipped (dropped from the LRU so it is
+        not retried this pass); its chunk stays resident.
+
+        Freed chunks return to the node heap's free-list for immediate reuse by
+        the retrying store; regions are never released here.
+
+        Args:
+            target: Minimum number of slots to free (the store needs this many;
+                a single ``_put_one`` needs 1). Eviction also honors the low
+                watermark, so it may free more than ``target`` when occupancy is
+                above the floor.
+
+        Returns:
+            The number of chunks actually evicted this pass.
+        """
+        occupied, total = self._heap.occupancy()
+        if total == 0:
+            return 0
+        floor = int(self._evict_low_watermark * total)
+        freed = 0
+        # Snapshot cold victims; ask for enough to both hit the watermark floor
+        # and satisfy `target`, whichever is larger.
+        want = max(target, occupied - floor)
+        if want <= 0:
+            return 0
+        for slot_idx in self._lru.coldest(want):
+            ok, view = self._index_writer.evict(slot_idx)
+            if not ok:
+                # Pinned / in-flight — leave it resident and stop tracking it
+                # for this pass so it isn't reconsidered until re-touched.
+                self._lru.forget(slot_idx)
+                continue
+            assert view is not None
+            try:
+                self._heap.free(view.chunk_offset)
+            except Exception:
+                logger.exception(
+                    "CXL node %d: heap.free failed evicting slot %d offset %d; "
+                    "leaking chunk",
+                    self._node_id,
+                    slot_idx,
+                    view.chunk_offset,
+                )
+            self._lru.forget(slot_idx)
+            self._forget_slot_by_hash(view.chunk_hash)
+            freed += 1
+        if freed:
+            logger.info(
+                "CXL node %d: evicted %d cold chunk(s) to reclaim free-list "
+                "space (occupied=%d total=%d floor=%d)",
+                self._node_id,
+                freed,
+                occupied,
+                total,
+                floor,
+            )
+        return freed
 
     def _reserve_with_retries(
         self, key: CacheEngineKey, max_waits: int = 100, wait_sleep_s: float = 0.001
@@ -620,7 +839,59 @@ class CXLBackend(AllocatorBackendInterface):
                 view.chunk_offset,
             )
         self._forget_slot(key)
+        self._lru.forget(slot_idx)
         return True
+
+    def clear(self) -> ClearResult:
+        """Delete all of this node's chunks and trim its now-empty regions.
+
+        Bulk teardown of this node's CXL residency, in three steps:
+
+          1. ``index_writer.clear_owned_slots()`` tombstones every VALID slot
+             this node owns (skipping busy ones) and returns their heap
+             offsets.
+          2. ``heap.free_batch()`` returns those offsets to the node heap's
+             free-list, so the regions holding them become fully free.
+          3. ``heap.trim()`` releases every fully-empty region back to the
+             global pool.
+
+        Busy chunks (pinned or mid-read) are left intact and reported in the
+        result; any region still holding one of them will not be trimmed.
+        Donor slots owned by other nodes in the shared index are untouched.
+
+        Returns:
+            ClearResult: counts of chunks deleted, chunks skipped because
+            busy, and regions released to the pool.
+        """
+        freed_offsets, skipped_busy = self._index_writer.clear_owned_slots()
+        if freed_offsets:
+            try:
+                self._heap.free_batch(freed_offsets)
+            except Exception:
+                logger.exception(
+                    "heap.free_batch failed during clear() for %d offsets; "
+                    "some chunks may leak",
+                    len(freed_offsets),
+                )
+        # Every owned chunk is now tombstoned, so the whole hash->slot cache
+        # and the LRU recency map are stale. Drop them wholesale.
+        with self._key_to_slot_lock:
+            self._key_to_slot.clear()
+        self._lru.clear()
+        released = self._heap.trim()
+        logger.info(
+            "CXLBackend.clear (node=%d): deleted %d chunks, skipped %d busy, "
+            "released %d regions",
+            self._node_id,
+            len(freed_offsets),
+            skipped_busy,
+            len(released),
+        )
+        return ClearResult(
+            chunks_deleted=len(freed_offsets),
+            slots_skipped_busy=skipped_busy,
+            regions_released=len(released),
+        )
 
     # -------- AllocatorBackendInterface ---------------------------------
 
@@ -685,10 +956,24 @@ class CXLBackend(AllocatorBackendInterface):
     def _cache_slot(self, key: CacheEngineKey, slot_idx: int) -> None:
         with self._key_to_slot_lock:
             self._key_to_slot[key.chunk_hash] = slot_idx
+        # Every local resolution (read hit, pin, store) is an access: refresh
+        # the slot's recency so warm chunks survive eviction. DRAM-only,
+        # keyed by slot_idx so it is stable across key->slot re-caching.
+        self._lru.touch(slot_idx)
 
     def _forget_slot(self, key: CacheEngineKey) -> None:
         with self._key_to_slot_lock:
             self._key_to_slot.pop(key.chunk_hash, None)
+
+    def _forget_slot_by_hash(self, chunk_hash: int) -> None:
+        """Drop the key->slot cache entry for a raw chunk_hash.
+
+        Used by the eviction path, which learns the evicted slot's hash from
+        the returned ``SlotView`` rather than a ``CacheEngineKey``. The stored
+        hash is masked to u64 (matching ``_claim``), so mask here too.
+        """
+        with self._key_to_slot_lock:
+            self._key_to_slot.pop(chunk_hash & 0xFFFFFFFFFFFFFFFF, None)
 
     def _lookup_slot(self, key: CacheEngineKey) -> Optional[int]:
         with self._key_to_slot_lock:
