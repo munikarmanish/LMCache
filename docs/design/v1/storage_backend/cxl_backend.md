@@ -118,13 +118,74 @@ INSERT lifecycle:
    `WAIT_FOR_OTHER`). `ALREADY_PRESENT` → cache the slot and return (dedup);
    `INDEX_FULL` → drop the put and log.
 3. **Allocate a chunk** from the heap (reject payloads larger than
-   `chunk_size_bytes`).
+   `chunk_size_bytes`), evicting local cold chunks on region exhaustion — see
+   §4.1.
 4. **Copy** `src.raw_data` into the chunk.
-5. **Commit** the slot VALID (`commit_slot`) and cache the key→slot mapping.
+5. **Commit** the slot VALID (`commit_slot`) and cache the key→slot mapping. The
+   commit also refreshes the slot's node-local LRU recency (§4.1).
 
 On any failure after reservation, it **rolls back**: free the chunk and release
 the slot back to EMPTY, so a partial insert never leaves a stranded ALLOCATING
 slot or a leaked chunk. The `finally` clears the in-flight mark.
+
+### 4.1 Node-local LRU eviction (`_alloc_chunk_with_eviction`)
+
+The CXL pool is shared across nodes, but the backend deliberately keeps **no
+global LRU** — maintaining cross-node recency would require a CXL write and a
+cross-node fence on every read, the exact cost the read path is built to avoid.
+Instead each node keeps a **DRAM-only** recency map (`NodeLRUTracker`, keyed by
+`slot_idx`) over the slots *it* owns, and evicts its own cold chunks when it can
+no longer grow.
+
+**The allocation ladder** (chunk allocation, step 3 above):
+
+1. **`heap.alloc()`** — serve from the free-list, else **claim a new region**
+   from the global pool. Claiming is always preferred; while the pool has FREE
+   regions, no eviction ever happens (eviction costs nothing until the pool is
+   full).
+2. **On `NoRegionAvailable`** (the global pool is exhausted — this node's region
+   count is now fixed) — evict this node's coldest chunks back into the
+   free-list via `_evict_cold_slots`, then retry with **`heap.alloc_no_claim()`**
+   (free-list only, never claims). The freed slot is reused **in place**; no
+   region is trimmed or reclaimed.
+3. **If eviction frees nothing** (every cold slot is pinned or has an in-flight
+   read), the retry raises `OutOfChunks` and the store is dropped (logged) —
+   today's exhaustion behavior, now only reached when the node genuinely cannot
+   make room.
+
+**Watermark and victim order.** `_evict_cold_slots` drains toward a node-local
+occupancy floor: `occupied / total` owned slots, where `total = owned_regions ×
+slots_per_region` — both DRAM counts from `NodeHeap.occupancy()`, no CXL read.
+The floor is `evict_low_watermark` (default 0.8); eviction frees
+`max(store_shortfall, occupied − floor)` chunks, so it drops a batch down to the
+floor rather than one-at-a-time (avoiding a re-trigger on the very next store),
+but a store needing more than that evicts past the floor to the last
+non-pinned chunk. Victims come oldest-first from the LRU; a pinned / in-flight
+one is refused by `index_writer.evict` (the §6 guard) and skipped.
+
+**Why the trigger is exhaustion, not a usage threshold.** In-region reuse frees
+a slot without releasing a region, so a *claimed-region* watermark could never
+fall — it would trigger forever. Gating on `NoRegionAvailable` instead means the
+region count is fixed at the moment eviction runs, so the occupancy ratio is a
+quantity eviction can actually lower, and the feedback loop converges.
+
+**Recency updates (true LRU).** `_cache_slot` — called on every local
+resolution (read hit, pin, store commit) — refreshes the slot's recency, so a
+chunk kept warm by reads survives even if it was stored first. `forget` runs on
+`remove`/`evict`; `clear` drops the whole map. A chunk hot on *another* node
+reads as cold here; that approximation is accepted (the goal is only a sensible
+local victim order, not global optimality).
+
+**Batch admission.** `batched_submit_put_task` runs one eviction pass for the
+whole batch up front (`_ensure_batch_space`): if the pool is exhausted and
+eviction cannot free room for every chunk in the batch, the **entire batch is
+dropped** rather than storing a partial prefix. The per-chunk ladder above still
+guards the single-put path.
+
+**Scope.** A node evicts only chunks in regions it owns (matching `clear`'s
+ownership discipline). It never touches donor slots or other nodes' regions, so
+a node hoarding regions is not reclaimed by this path — that is the dead-node
+GC's job (`cxl/gc.py`), which is separate.
 
 The cross-node donor path is the *batched* analogue of this lifecycle —
 reserve-all → copy-all (NT streaming stores) → commit-all under one lock hold,
@@ -174,6 +235,35 @@ Two independent counters on each slot keep it alive for two different windows:
 
 `remove(key)` and eviction both refuse a slot while either counter is non-zero.
 
+### 6.1 Bulk clear (`clear`)
+
+`clear()` is the whole-node counterpart of `remove(key)`: it deletes **all of
+this node's chunks** and returns their now-empty regions to the global pool. It
+is the reset used between benchmark arms (e.g. `scripts/cxl/clear_cache.sh`) and
+wherever a node must drop its entire CXL residency without a restart.
+
+Three steps, layering the same primitives `remove` uses:
+
+1. **`index_writer.clear_owned_slots()`** — one bulk fence-before-read primes the
+   slot array, then every `VALID` slot whose `owner_node_id` is this node is
+   flipped to `TOMB` under its slot lock, and its `chunk_offset` is collected.
+   Returns `(freed_offsets, skipped_busy)`.
+2. **`heap.free_batch(freed_offsets)`** — the offsets go back to the node heap's
+   free-list, so the regions holding them become fully free.
+3. **`heap.trim()`** — every fully-empty region is released to the pool.
+
+Two invariants inherited from the single-key path:
+
+- **Busy chunks are skipped, never force-freed.** A slot with `ref_count > 0`
+  (in-flight read/GPU copy) or `pin_count > 0` stays `VALID`; it is counted in
+  `slots_skipped_busy`. A region still holding one will not trim. This preserves
+  the reader-vs-evictor guard (§6) — a concurrent read is never invalidated.
+- **Scope is this node only.** Donor slots owned by other nodes live in the same
+  shared index but their offsets belong to other heaps; `clear` leaves them
+  `VALID` and frees nothing on their behalf.
+
+Returns a `ClearResult(chunks_deleted, slots_skipped_busy, regions_released)`.
+
 ---
 
 ## 7. Configuration & lifecycle
@@ -183,7 +273,8 @@ adapter-facing fields (see the
 [CXL adapter doc §9](docs/design/v1/distributed/l2_adapters/cxl_l2_adapter.md) for
 the JSON surface): `dev_path`, `node_id`, `chunk_size_bytes`, `region_size`,
 `initialize`, `generation`, `run_lock_manager`, `use_process_lock_manager`,
-`pool_size_override`, `max_nodes`.
+`pool_size_override`, `max_nodes`, `evict_low_watermark` (§4.1; the node-local
+occupancy floor eviction drains toward, default 0.8, range (0.0, 1.0]).
 
 - After `__init__` the pool is mapped, host-registered, the lock manager is
   running (if enabled), and the backend serves put/get immediately.
@@ -203,6 +294,9 @@ the JSON surface): `dev_path`, `node_id`, `chunk_size_bytes`, `region_size`,
 | Reader races an evictor | `ref_count_up` + re-verify slot identity; eviction refuses non-zero `ref_count`/`pin_count`. |
 | Duplicate put of the same key | `reserve_slot` returns `ALREADY_PRESENT`; the put is a no-op. |
 | Index full | `_put_one` drops the put and logs (no crash). |
+| My regions full, pool has FREE regions | `heap.alloc()` claims a new region; no eviction (§4.1). |
+| Pool globally exhausted | Evict this node's coldest chunks and reuse a freed slot in place (§4.1). |
+| Pool exhausted + every cold slot pinned | Store (or whole batch) is dropped and logged; pinned chunks stay resident. |
 | Payload larger than a chunk | `ValueError`, slot released. |
 | Lock-manager GIL starvation | Run the arbiter as the C sidecar (default). |
 | Stale generation after controller restart | Bump `generation` on init; the shared header's `gen` is the epoch checked by the cross-node push and slot reservation. |
