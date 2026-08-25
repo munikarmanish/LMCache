@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="c2"
+HOST="g6"
 USER="manish"
 TARGET="/home/manish/code/LMCache"
 
@@ -12,7 +12,7 @@ Usage: $0 [--host HOST] [--user USER] [--target TARGET]
 Rsync the local LMCache directory to a remote node.
 
 Options:
-    --host HOST       Remote host (default: c2)
+    --host HOST       Remote host (default: g6)
     --user USER       Remote user (default: manish)
     --target TARGET   Remote target directory (default: /home/manish/code/LMCache)
     -h, --help        Show this help message
