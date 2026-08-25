@@ -671,6 +671,37 @@ class L2AdapterInterface(ABC):
     # Cleanup Interface
     #####################
 
+    def _reset_usage_accounting(self) -> None:
+        """Zero the base-class byte counters after a bulk clear.
+
+        Overriding :meth:`clear` implementations call this once their backing
+        store is emptied so ``get_usage`` and per-cache_salt eviction counts
+        return to zero without a per-key ``_notify_keys_deleted`` sweep.
+        """
+        with self._usage_lock:
+            self._total_bytes_used = 0
+            self._bytes_by_cache_salt.clear()
+
+    def clear(self) -> int:
+        """Drop all data this adapter stores, resetting it to empty.
+
+        Called by ``StorageManager.clear`` (e.g. the ``/clear-cache`` HTTP
+        endpoint) so an operator can flush both L1 and L2 without restarting
+        the server. Unlike :meth:`close`, the adapter remains usable
+        afterwards.
+
+        The default implementation is a no-op that returns ``0``: an adapter
+        that owns no reclaimable local storage (e.g. a pull-only peer tier
+        that never persists chunks) has nothing to clear and opts out
+        automatically. Adapters backed by a real store (CXL) override this to
+        delete their chunks and reset byte accounting.
+
+        Returns:
+            int: the number of chunks deleted (``0`` for adapters that do not
+            support clearing or that were already empty).
+        """
+        return 0
+
     @abstractmethod
     def close(self) -> None:
         """

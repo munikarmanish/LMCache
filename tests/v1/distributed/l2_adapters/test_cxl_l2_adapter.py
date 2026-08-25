@@ -308,6 +308,60 @@ def test_unlock_releases_pin_so_eviction_can_proceed(adapter):
         pytest.fail("remove() did not succeed after unlock within 1s")
 
 
+# ---------- clear ----------
+
+
+def test_clear_deletes_all_stored_chunks(adapter):
+    """clear() deletes every stored chunk so subsequent lookups all miss."""
+    keys = [_make_object_key(0xCA01 + i) for i in range(4)]
+    payloads = [_make_payload_obj(512, fill_byte=0x50 + i) for i in range(4)]
+    adapter.submit_store_task(keys, payloads)
+    _wait_efd(adapter.get_store_event_fd())
+    adapter.pop_completed_store_tasks()
+
+    # Nothing is pinned (no lookup-and-lock held), so clear deletes all four.
+    deleted = adapter.clear()
+    assert deleted == 4
+    # Usage accounting is zeroed (spill-path bytes, if any, are cleared).
+    assert adapter.get_usage().total_bytes_used == 0
+
+    # Every key now misses.
+    lookup_id = adapter.submit_lookup_and_lock_task(keys)
+    _wait_efd(adapter.get_lookup_and_lock_event_fd())
+    bitmap = adapter.query_lookup_and_lock_result(lookup_id)
+    assert bitmap is not None
+    assert bitmap.popcount() == 0
+
+
+def test_clear_skips_pinned_chunk(adapter):
+    """A chunk pinned by lookup-and-lock survives clear(); the rest go."""
+    keys = [_make_object_key(0xCB01 + i) for i in range(3)]
+    payloads = [_make_payload_obj(256, fill_byte=0x60 + i) for i in range(3)]
+    adapter.submit_store_task(keys, payloads)
+    _wait_efd(adapter.get_store_event_fd())
+    adapter.pop_completed_store_tasks()
+
+    # Pin only the first key.
+    pin_id = adapter.submit_lookup_and_lock_task(keys[:1])
+    _wait_efd(adapter.get_lookup_and_lock_event_fd())
+    assert adapter.query_lookup_and_lock_result(pin_id).popcount() == 1
+
+    # clear() must skip the pinned one and delete the other two.
+    deleted = adapter.clear()
+    assert deleted == 2
+
+    # The pinned key still hits; the others miss.
+    adapter.submit_unlock(keys[:1])
+    lookup_id = adapter.submit_lookup_and_lock_task(keys)
+    _wait_efd(adapter.get_lookup_and_lock_event_fd())
+    bitmap = adapter.query_lookup_and_lock_result(lookup_id)
+    assert bitmap is not None
+    assert bitmap.test(0)
+    assert not bitmap.test(1)
+    assert not bitmap.test(2)
+    adapter.submit_unlock(keys[:1])
+
+
 # ---------- task id semantics ----------
 
 

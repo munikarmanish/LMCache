@@ -943,15 +943,31 @@ class StorageManager:
 
     def clear(self, force: bool = False):
         """
-        Clear data in the storage manager.
+        Clear data in both the L1 cache and every L2 adapter.
+
+        Clears L1 first, then asks each L2 adapter to drop its stored data.
+        Adapters that own no reclaimable storage (e.g. a pull-only peer tier)
+        no-op via the base ``clear`` default; the CXL adapter deletes its
+        chunks and trims its regions. An adapter that raises is logged and
+        skipped so one failing tier cannot leave the others uncleared.
 
         Args:
-            force: If True, clear ALL objects including locked ones.
+            force: If True, clear ALL L1 objects including locked ones.
                 This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+                If False (default), only clear unlocked L1 objects, keeping
+                write-locked and read-locked objects intact. L2 adapters
+                always skip their own busy (pinned/in-flight) chunks
+                regardless of this flag.
         """
         self._l1_manager.clear(force=force)
+        for adapter in self._l2_adapters:
+            try:
+                adapter.clear()
+            except Exception:
+                logger.exception(
+                    "L2 adapter %s failed to clear; continuing with the rest",
+                    type(adapter).__name__,
+                )
 
     def close(self):
         """

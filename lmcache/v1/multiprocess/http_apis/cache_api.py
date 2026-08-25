@@ -43,10 +43,13 @@ _BLOCK_AXIS_BY_FORMAT: dict[Any, int] = {
 
 @router.post("/clear-cache")
 async def clear_cache(request: Request) -> Any:
-    """Force-clear all KV cache data stored in L1 (CPU) memory.
+    """Force-clear all KV cache data from L1 (CPU) memory and every L2 adapter.
 
-    This clears all objects including those with active read/write locks.
-    In-flight store or prefetch operations may be corrupted.
+    L1 is force-cleared, including objects with active read/write locks, so
+    in-flight store or prefetch operations may be corrupted. Each L2 adapter
+    then drops its own stored data (the CXL adapter deletes its chunks and
+    trims its regions; a pull-only peer tier no-ops). L2 adapters skip their
+    busy (pinned/in-flight) chunks rather than force-freeing them.
     """
     engine = getattr(request.app.state, "engine", None)
     if engine is None:

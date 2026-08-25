@@ -305,6 +305,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
     def delete(self, keys: list[ObjectKey]) -> None:
         self._inner.delete(keys)
 
+    def clear(self) -> int:
+        # Clearing is the inner adapter's storage concern; serde holds no
+        # persistent state of its own to drop.
+        return self._inner.clear()
+
     def register_listener(self, listener: L2AdapterListener) -> None:
         # Listeners track what's actually stored — which is inner's job.
         self._inner.register_listener(listener)

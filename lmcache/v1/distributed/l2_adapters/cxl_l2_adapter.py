@@ -1053,6 +1053,33 @@ class CXLL2Adapter(L2AdapterInterface):
         ctypes.memmove(dst_t.data_ptr(), src_t.data_ptr(), n)
         return n, time.perf_counter_ns() - t0
 
+    # ---------------- clear ----------------
+
+    def clear(self) -> int:
+        """Delete all of this node's CXL chunks and trim its empty regions.
+
+        Delegates to :meth:`CXLBackend.clear`, which tombstones every VALID
+        slot this node owns, frees their chunks back to the node heap, and
+        releases the now-empty regions to the global pool. Busy chunks
+        (pinned or mid-read) are skipped, so a concurrent read is never
+        invalidated. Donor slots owned by other nodes in the shared index are
+        left untouched. Afterwards the adapter's byte accounting is reset so
+        ``get_usage`` reflects the emptied tier.
+
+        Returns:
+            int: the number of chunks deleted.
+        """
+        result = self._backend.clear()
+        self._reset_usage_accounting()
+        logger.info(
+            "CXL L2 adapter cleared: %d chunks deleted, %d skipped busy, "
+            "%d regions released",
+            result.chunks_deleted,
+            result.slots_skipped_busy,
+            result.regions_released,
+        )
+        return result.chunks_deleted
+
     # ---------------- close ----------------
 
     def close(self) -> None:
