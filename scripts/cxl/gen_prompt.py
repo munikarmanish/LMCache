@@ -17,7 +17,7 @@ Output (two lines on stdout):
 
 Pipe the IDS line into the endpoint, e.g.:
     IDS=$(python gen_prompt.py 512 --seed 0 | sed -n 's/^IDS://p')
-    http POST http://c1:8090/lookup_hits \
+    http POST http://g5:8090/lookup_hits \
         model_name=meta-llama/Llama-3.1-8B-Instruct \
         token_ids:="[$IDS]"
 """

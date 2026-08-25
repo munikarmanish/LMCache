@@ -6,8 +6,8 @@
 # generated prompts are reproducible. When omitted, bench_ttft.py uses the
 # current timestamp (and prints the chosen seed so a run can be replayed).
 
-HOST_A=192.168.128.31
-HOST_B=192.168.128.32
+HOST_A=192.168.128.75
+HOST_B=192.168.128.76
 
 # get the required argument
 LABEL="${1:?usage: $0 <label> [<seed>]}"
@@ -27,7 +27,7 @@ mkdir -p "$HERE/results"
 python bench_ttft.py \
     --node-a-url "http://${HOST_A}:8010" \
     --node-b-url "http://${HOST_B}:8010" \
-    --prompt-tokens 27000 \
+    --prompt-tokens 30000 \
     --repeat 3 \
     --label "$LABEL" \
     "${SEED_ARG[@]}" \

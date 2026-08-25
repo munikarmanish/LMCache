@@ -10,13 +10,13 @@
 #   ./lmc_bench.sh <host> <vllm_port> <lmc_port> [<seed>]
 #
 # Examples:
-#   ./lmc_bench.sh 192.168.128.31 8010 9000        # default seed
-#   ./lmc_bench.sh 192.168.128.31 8010 9000 1234   # reproducible seed
+#   ./lmc_bench.sh 192.168.128.75 8010 9000        # default seed
+#   ./lmc_bench.sh 192.168.128.75 8010 9000 1234   # reproducible seed
 #
 # Workload parameters are overridable via environment variables (each falls
 # back to the default shown below). e.g. to sweep concurrency / doc length:
 #   WORKLOAD=long-doc-qa DOCUMENT_LENGTH=8000 NUM_INFLIGHT_REQUESTS=16 \
-#       ./lmc_bench.sh 192.168.128.31 8010 9000
+#       ./lmc_bench.sh 192.168.128.75 8010 9000
 #
 # Overridable env vars (default):
 #   WORKLOAD (long-doc-qa)          KV_CACHE_VOLUME (64)

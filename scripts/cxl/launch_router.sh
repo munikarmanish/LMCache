@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # launch_router.sh — Bring up the lightweight KV-aware router in front of the
-# two nodes (run this on c1/node0 after both nodes' launch_node.sh are up).
+# two nodes (run this on g5/node0 after both nodes' launch_node.sh are up).
 #
 # The router forwards OpenAI requests to one of the two vLLM endpoints per a
 # selectable strategy (round_robin | random | gpu_load | max_prefix |
@@ -17,7 +17,7 @@
 #   ./launch_router.sh max_prefix
 #   ./launch_router.sh weighted 0.7 0.3
 #   ./launch_router.sh random                # uniform random
-#   ./launch_router.sh random - - c1=0.7,c2=0.3   # 70/30 weighted random
+#   ./launch_router.sh random - - g5=0.7,g6=0.3   # 70/30 weighted random
 #
 # For the random strategy, the 4th arg is the per-node --weights list
 # (name=weight,...); every node must be listed. Pass "-" for w_prefix/w_load
@@ -32,8 +32,8 @@ source "$VENV/bin/activate"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # Static topology — must match launch_node.sh.
-NODE0_HOST=192.168.128.31
-NODE1_HOST=192.168.128.32
+NODE0_HOST=192.168.128.75
+NODE1_HOST=192.168.128.76
 VLLM_PORT=8010     # vLLM OpenAI API (serve + /metrics)
 LMC_HTTP_PORT=8090 # LMCache MP HTTP (/lookup_hits)
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
@@ -49,8 +49,8 @@ WEIGHTS="${4:-}"  # random strategy: name=weight,... (empty => uniform)
 [ "$W_PREFIX" = "-" ] && W_PREFIX=0.7
 [ "$W_LOAD" = "-" ] && W_LOAD=0.3
 
-NODES="c1=http://${NODE0_HOST}:${VLLM_PORT},c2=http://${NODE1_HOST}:${VLLM_PORT}"
-LOOKUP="c1=http://${NODE0_HOST}:${LMC_HTTP_PORT},c2=http://${NODE1_HOST}:${LMC_HTTP_PORT}"
+NODES="g5=http://${NODE0_HOST}:${VLLM_PORT},g6=http://${NODE1_HOST}:${VLLM_PORT}"
+LOOKUP="g5=http://${NODE0_HOST}:${LMC_HTTP_PORT},g6=http://${NODE1_HOST}:${LMC_HTTP_PORT}"
 
 LOG_LEVEL=debug  # debug | info | warning | error
 LOG_DIR="$HERE/logs"

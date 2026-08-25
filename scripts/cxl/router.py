@@ -9,7 +9,7 @@ pinning vLLM to an old version.
 Strategies (``--strategy``):
     round_robin : next node in rotation; ignores all signals.
     random      : random node. Uniform by default, or per ``--weights`` shares
-                  if given (e.g. ``c1=0.7,c2=0.3`` sends ~70% to c1).
+                  if given (e.g. ``g5=0.7,g6=0.3`` sends ~70% to g5).
     gpu_load    : node with the fewest running requests (KV-cache usage as a
                   tiebreaker), scraped from each node's vLLM /metrics.
     max_prefix  : node with the longest cached prompt prefix, via each node's
@@ -32,8 +32,8 @@ The router exposes the OpenAI surface it proxies (``/v1/completions`` and
 
 Usage:
     python router.py \
-        --nodes c1=http://192.168.128.31:8010,c2=http://192.168.128.32:8010 \
-        --lookup c1=http://192.168.128.31:8090,c2=http://192.168.128.32:8090 \
+        --nodes g5=http://192.168.128.75:8010,g6=http://192.168.128.76:8010 \
+        --lookup g5=http://192.168.128.75:8090,g6=http://192.168.128.76:8090 \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --strategy weighted --w-prefix 0.7 --w-load 0.3 \
         --port 8000
@@ -195,7 +195,7 @@ def apply_weights(nodes: list[NodeState], weights_arg: str) -> None:
     Only used by the ``random`` strategy. An empty ``weights_arg``
     leaves every node at its default weight of 1.0 (uniform). Weights are
     relative shares, not probabilities: ``random.choices`` normalises them, so
-    ``c1=0.7,c2=0.3`` and ``c1=7,c2=3`` route identically.
+    ``g5=0.7,g6=0.3`` and ``g5=7,g6=3`` route identically.
 
     Args:
         nodes: The parsed nodes to annotate (mutated in place).
@@ -663,7 +663,7 @@ def parse_args() -> RouterConfig:
         "--weights",
         default="",
         help="random: comma-separated name=weight shares "
-        "(e.g. c1=0.7,c2=0.3); every node must be listed. Default: uniform.",
+        "(e.g. g5=0.7,g6=0.3); every node must be listed. Default: uniform.",
     )
     parser.add_argument("--w-prefix", type=float, default=0.7, help="weighted: prefix weight")
     parser.add_argument("--w-load", type=float, default=0.3, help="weighted: load weight")

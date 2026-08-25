@@ -29,7 +29,7 @@
 #      substrate win. Requires BOTH nodes up in <adapter> mode AND the router
 #      already running anti_affinity (./launch_router.sh anti_affinity), which
 #      this script checks via /health. Concurrency defaults to 8 (must be >1 so
-#      both nodes see load). node1's MP log is rsync'd from c2 to tally both
+#      both nodes see load). node1's MP log is rsync'd from g6 to tally both
 #      nodes' hits. B PINS ONE working set (WS_B, default 0.8M) — it does not
 #      sweep: the cross-node effect is about the same chunk read by both nodes,
 #      not capacity, so the working set is a precondition (upper band) not the
@@ -70,8 +70,8 @@
 #   PY                 python to run the tester with (default: kv-cache-tester's
 #                      own `uv run python`; set PY=python for the active venv).
 #   ROUTER_HOST        host:port the tester hits (default: A=node0 direct
-#                      192.168.128.31:8010, B/C=router 192.168.128.31:8000).
-#   NODE1_SSH          ssh target for node1's MP log (B/C; default manish@c2).
+#                      192.168.128.75:8010, B/C=router 192.168.128.75:8000).
+#   NODE1_SSH          ssh target for node1's MP log (B/C; default manish@g6).
 #   NODE1_LOG_REMOTE   remote path of node1's MP log (B/C; default mirrors
 #                      this dir: <HERE>/logs/node1-<adapter>.log).
 #   -- Sweep C (trace replay) --
@@ -113,8 +113,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # --- topology (must match launch_node.sh) ----------------------------------
-NODE0_HOST=192.168.128.31
-NODE1_HOST=192.168.128.32
+NODE0_HOST=192.168.128.75
+NODE1_HOST=192.168.128.76
 VLLM_PORT=8010
 LMC_HTTP_PORT=8090
 ROUTER_PORT=8000
@@ -375,7 +375,7 @@ require_router() {
 
 # ---------------------------------------------------------------------------
 # sync_node1_log
-#   For router sweeps: rsync node1's MP log from c2 into logs/node1-<adapter>.log
+#   For router sweeps: rsync node1's MP log from g6 into logs/node1-<adapter>.log
 #   so tally_and_record (which reads MPLOG1) counts BOTH nodes' hits. Warns but
 #   does not fail on rsync error (node1 hits then simply go uncounted).
 # ---------------------------------------------------------------------------
@@ -426,10 +426,10 @@ elif [[ "$SWEEP" == B ]]; then
     # Requires: both nodes up in "$ADAPTER" mode AND the router already running
     # with --strategy anti_affinity (launch_router.sh anti_affinity). Concurrency
     # must be > 1 so both nodes see concurrent load; default 8. node1's MP log is
-    # rsync'd from c2 before tallying so tally_and_record counts BOTH nodes.
+    # rsync'd from g6 before tallying so tally_and_record counts BOTH nodes.
     ENDPOINT="${ROUTER_HOST:-$NODE0_HOST:$ROUTER_PORT}"
     FIXED_CONCURRENCY="${FIXED_CONCURRENCY:-8}"
-    NODE1_SSH="${NODE1_SSH:-manish@c2}"
+    NODE1_SSH="${NODE1_SSH:-manish@g6}"
     NODE1_LOG_REMOTE="${NODE1_LOG_REMOTE:-$HERE/logs/node1-${ADAPTER}.log}"
 
     # Sweep B pins ONE working set, it does not sweep. The cross-node effect is
@@ -476,7 +476,7 @@ else
     # check for, matching B). All tester seeds are pinned (TRACE_SEED) so the cxl
     # and nixl arms replay an IDENTICAL sequence — the only fair comparison.
     ENDPOINT="${ROUTER_HOST:-$NODE0_HOST:$ROUTER_PORT}"
-    NODE1_SSH="${NODE1_SSH:-manish@c2}"
+    NODE1_SSH="${NODE1_SSH:-manish@g6}"
     NODE1_LOG_REMOTE="${NODE1_LOG_REMOTE:-$HERE/logs/node1-${ADAPTER}.log}"
 
     # Trace-replay knobs. Defaults sized to this testbed (64 GB L1/node ~0.52M

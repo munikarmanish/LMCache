@@ -23,13 +23,13 @@
 #   ./clear_cache.sh
 #
 # Override the target list with LMC_URLS (space- or comma-separated), e.g.:
-#   LMC_URLS="http://c1:8090 http://c2:8090" ./clear_cache.sh
+#   LMC_URLS="http://g5:8090 http://g6:8090" ./clear_cache.sh
 
 set -uo pipefail
 
 # Static topology — must match launch_node.sh / launch_router.sh.
-NODE0_HOST=192.168.128.31
-NODE1_HOST=192.168.128.32
+NODE0_HOST=192.168.128.75
+NODE1_HOST=192.168.128.76
 LMC_HTTP_PORT=8090
 
 # Default targets = both nodes' MP HTTP servers. LMC_URLS overrides.
