@@ -30,24 +30,52 @@ reproduce the cache-warm (DDIO-inflated) numbers. (For D2H, even rotation
 cannot fully expose media bandwidth at small payloads -- the write completes
 into the LLC and is written back to media asynchronously; see _time_copy.)
 
+With --gpus, several GPUs drive the SAME host buffer at once (one CUDA stream
+each) and the table reports solo vs aggregate bandwidth plus scaling
+efficiency. That answers whether the host side is a shared budget: ~100%
+efficiency means the GPUs have independent paths, while ~1/n means they are
+splitting one ceiling (expected when the limit is the host media or a link
+they share rather than each GPU's own PCIe link).
+
 Run on a CUDA box (lmcache venv). For the CXL source, run where the DAX
 device is mappable (not in a sandbox that SIGBUSes on DAX mmap):
   ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_h2d.py
   ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_h2d.py \
       --cxl-dev /dev/dax0.0
+  # both GPUs pulling from one shared host buffer:
+  ~/.virtualenvs/lmcache/bin/python scripts/cxl/bench_h2d.py \
+      --cxl-dev /dev/dax0.0 --gpus all --dir h2d
 """
 
-# Standard
+# Future
 from __future__ import annotations
+
+# Standard
 import argparse
 import ctypes
+import dataclasses
 import mmap
 import os
 import statistics
 import sys
+import time
 
 # Third Party
 import torch
+
+
+@dataclasses.dataclass
+class GpuContext:
+    """One GPU's participation in a transfer: the device, its own copy stream,
+    the device buffer it copies into/out of, and that buffer's address.
+
+    `buf` is held only to keep the allocation alive for the lifetime of the
+    context; `ptr` is what the copy primitive is handed."""
+
+    device: torch.device
+    stream: torch.cuda.Stream
+    buf: torch.Tensor
+    ptr: int
 
 
 def _sizes(min_kib: int, max_kib: int) -> list[int]:
@@ -151,39 +179,75 @@ def _verify_pinned(lib: ctypes.CDLL, addr: int, size: int) -> bool:
     return rc == 0 and devptr.value is not None
 
 
+def _dax_device_size(dev_path: str) -> int:
+    """Size in bytes of a DAX character device, read from sysfs, or 0 if it
+    cannot be determined. ``fstat`` reports 0 for a DAX chardev, so sysfs is
+    the only way to learn the real extent without mapping it."""
+    name = os.path.basename(dev_path)  # e.g. "dax0.0"
+    for path in (
+        f"/sys/bus/dax/devices/{name}/size",
+        f"/sys/class/dax/{name}/size",
+    ):
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return 0
+
+
 def _open_cxl_source(
-    dev_path: str, want_bytes: int, flags: int
+    dev_path: str,
+    want_bytes: int,
+    flags: int,
+    windows: tuple[tuple[int, int], ...] = (),
 ) -> tuple[int, mmap.mmap, int]:
     """mmap a CXL DAX device and cudaHostRegister it with ``flags``. Returns
-    (ptr, mmap, registered_size). Verifies the pinning actually took (loud
-    error if cudaHostRegister fails or the range isn't device-resolvable —
-    which would silently fall back to a DRAM bounce buffer)."""
+    (ptr, mmap, mapped_size). Verifies the pinning actually took (loud error if
+    cudaHostRegister fails or the range isn't device-resolvable — which would
+    silently fall back to a DRAM bounce buffer).
+
+    The whole device is mapped so any offset within it is addressable, but only
+    `windows` — a list of (offset, length) byte ranges relative to the mapping
+    — is pinned. Pinning is a scarce resource: registering a whole 256 GiB pool
+    fails with cudaErrorMemoryAllocation, so callers pass just the ranges they
+    will actually touch. An empty list pins [0, want_bytes), the single-window
+    default."""
     fd = os.open(dev_path, os.O_RDWR)
     try:
         size = os.fstat(fd).st_size
         if size == 0:  # DAX char device reports 0 via fstat
-            size = want_bytes
+            # sysfs knows the real extent; fall back to the caller's request
+            # only if it is unreadable. Mapping the whole device (rather than
+            # just the rotation span) is what lets --offset-gap-gib reach a
+            # second backing module further up the address range.
+            size = _dax_device_size(dev_path) or want_bytes
         mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
     finally:
         os.close(fd)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
 
     lib = _cudart()
-    rc = lib.cudaHostRegister(
-        ctypes.c_void_p(base), ctypes.c_size_t(size), ctypes.c_uint(flags)
-    )
-    print(
-        f"[bench] cudaHostRegister(base=0x{base:x}, size={size}, flags={flags}) "
-        f"-> rc={rc} ({'OK' if rc == 0 else 'FAILED'})",
-        flush=True,
-    )
+    pin = windows if windows else [(0, min(want_bytes, size))]
+    rc = 0
+    for off, length in pin:
+        rc = lib.cudaHostRegister(
+            ctypes.c_void_p(base + off), ctypes.c_size_t(length), ctypes.c_uint(flags)
+        )
+        print(
+            f"[bench] cudaHostRegister(base=0x{base + off:x}, size={length}, "
+            f"flags={flags}) -> rc={rc} ({'OK' if rc == 0 else 'FAILED'})",
+            flush=True,
+        )
+        if rc != 0:
+            break
     if rc != 0:
         raise RuntimeError(
             f"cudaHostRegister failed rc={rc}; the CXL source would NOT be "
             f"pinned (copies would bounce through DRAM). Try --cxl-register-flags "
             f"4 (cudaHostRegisterIoMemory) for device memory."
         )
-    pinned = _verify_pinned(lib, base, size)
+    pinned = _verify_pinned(lib, base + pin[0][0], pin[0][1])
     verdict = (
         "OK (true pinned DMA)"
         if pinned
@@ -204,6 +268,96 @@ def _open_cxl_source(
 
 def _cuda_host_unregister(addr: int) -> None:
     _cudart().cudaHostUnregister(ctypes.c_void_p(addr))
+
+
+def _time_copy_parallel(
+    gpus: list[GpuContext],
+    host_base: int,
+    nbytes: int,
+    iters: int,
+    rotate_span: int,
+    direction: str,
+    offset_gap: int = 0,
+) -> tuple[float, list[float]]:
+    """Drive every GPU in `gpus` against the SAME host buffer at once and
+    return (aggregate_GB_per_s, [per_gpu_GB_per_s, ...]).
+
+    `offset_gap` spaces the GPUs apart in the host mapping: GPU i works at
+    ``host_base + i * offset_gap``, each rotating over its own `rotate_span`
+    window. With the default 0 every GPU hammers the same window, which is what
+    measures contention on one region. A gap large enough to land the GPUs in
+    different backing devices instead measures whether those devices are
+    independent -- see ``--offset-gap-gib``.
+
+    Each GPU issues `iters` back-to-back `nbytes` copies on its own stream, so
+    all of them are in flight over the shared host buffer simultaneously. This
+    is what reveals whether the host-side media/link is a shared budget: if two
+    GPUs each sustain their solo bandwidth the path scales, and if each falls
+    to about half then they are contending for one ceiling.
+
+    Timing is wall-clock across the whole overlapping batch rather than the
+    per-copy CUDA-event timing used by the single-GPU path: event pairs on
+    different devices cannot be compared, and the quantity of interest here is
+    aggregate throughput while every GPU is busy, not the latency of one copy.
+    Every stream is synchronized before the clock starts and again before it
+    stops, so the measured window covers only fully overlapped transfers.
+
+    Per-GPU GB/s is computed from that same shared window (bytes moved by that
+    GPU divided by the wall time), so the per-GPU figures sum to the aggregate.
+
+    `direction`, `rotate_span` and the DDIO caveats are exactly as described in
+    ``_time_copy``. Each GPU walks the rotation region from a different
+    starting slot, so concurrent GPUs read disjoint lines rather than sharing
+    cache-resident ones."""
+    # First Party
+    import lmcache.c_ops as lmc_ops
+
+    nslots = max(1, rotate_span // nbytes)
+    is_h2d = direction == "h2d"
+    xfer = lmc_ops.TransferDirection.H2D if is_h2d else lmc_ops.TransferDirection.D2H
+
+    def _issue(gpu: GpuContext, gpu_idx: int, slot: int) -> None:
+        host = host_base + gpu_idx * offset_gap + (slot % nslots) * nbytes
+        dst, src = (gpu.ptr, host) if is_h2d else (host, gpu.ptr)
+        lmc_ops.lmcache_memcpy_async(dst, src, nbytes, xfer, 0, nbytes)
+
+    # Within a shared window, stagger the starting slots so concurrent GPUs
+    # touch different lines. With an offset gap the GPUs are already in
+    # separate windows, so each starts at the top of its own.
+    stride = 0 if offset_gap else max(1, nslots // len(gpus))
+
+    # Warm up: first copy on each device pays one-time setup.
+    for idx, gpu in enumerate(gpus):
+        torch.cuda.set_device(gpu.device)
+        with torch.cuda.stream(gpu.stream):
+            for j in range(5):
+                _issue(gpu, idx, idx * stride + j)
+    for gpu in gpus:
+        gpu.stream.synchronize()
+
+    # Enqueue round-robin across GPUs rather than draining one GPU's whole
+    # batch before starting the next. Each _issue is a Python call, so filling
+    # N copies takes real CPU time; enqueueing per-GPU would let the first GPU
+    # run (and finish) while the last was still being fed, shrinking the
+    # overlap window as `iters` grows and understating aggregate bandwidth.
+    # Round-robin keeps every stream fed from the start.
+    handles = [
+        (idx, gpu, torch.cuda.stream(gpu.stream)) for idx, gpu in enumerate(gpus)
+    ]
+    start = time.perf_counter()
+    for i in range(iters):
+        for idx, gpu, ctx in handles:
+            torch.cuda.set_device(gpu.device)
+            with ctx:
+                _issue(gpu, idx, idx * stride + i)
+    for gpu in gpus:
+        gpu.stream.synchronize()
+    elapsed = time.perf_counter() - start
+
+    if elapsed <= 0.0:
+        return 0.0, [0.0 for _ in gpus]
+    per_gpu = [(iters * nbytes) / elapsed / 1e9 for _ in gpus]
+    return sum(per_gpu), per_gpu
 
 
 def _time_copy(
@@ -268,6 +422,59 @@ def _time_copy(
     return statistics.median(samples_ms) / 1000.0  # seconds
 
 
+def _run_direction_parallel(
+    direction: str,
+    sizes: list[int],
+    gpus: list[GpuContext],
+    hosts: list[tuple[str, int]],
+    iters: int,
+    rotate: bool,
+    rotate_span: int,
+    offset_gap: int = 0,
+) -> None:
+    """For each host buffer in `hosts` (label, base pointer), measure one
+    `direction` across every payload in `sizes` twice: once with a single GPU
+    (the solo baseline) and once with every GPU in `gpus` driving the host
+    buffer concurrently. Print solo, aggregate, per-GPU and scaling efficiency.
+
+    Efficiency is aggregate / (solo * n_gpus): near 100% means the GPUs have
+    independent paths to the host buffer, while near 1/n_gpus means they are
+    splitting one shared ceiling.
+
+    `offset_gap` spaces the concurrent GPUs apart in the host mapping (GPU i at
+    ``base + i * offset_gap``) so they can be aimed at different backing
+    devices; the solo baseline always runs at the base, so the comparison is
+    against the same region in both cases."""
+    arrow = "host->GPU (H2D read)" if direction == "h2d" else "GPU->host (D2H write)"
+    ngpu = len(gpus)
+
+    for label, host_ptr in hosts:
+        if not host_ptr:
+            continue
+        print(f"\n=== {direction.upper()}  {arrow}  [{label}] ===")
+        print(
+            f"{'payload':>10} {'solo GB/s':>11} {'aggr GB/s':>11} "
+            f"{'speedup':>9} {'effic':>7}   per-GPU GB/s"
+        )
+        for n in sizes:
+            span = rotate_span if rotate else n
+            solo, _ = _time_copy_parallel(gpus[:1], host_ptr, n, iters, span, direction)
+            aggr, per_gpu = _time_copy_parallel(
+                gpus, host_ptr, n, iters, span, direction, offset_gap
+            )
+            speedup = aggr / solo if solo > 0 else 0.0
+            effic = speedup / ngpu if ngpu else 0.0
+            label_n = (
+                f"{n // 1024} KiB" if n < 1024 * 1024 else f"{n // (1024 * 1024)} MiB"
+            )
+            per_txt = "  ".join(f"{g:.2f}" for g in per_gpu)
+            print(
+                f"{label_n:>10} {solo:>11.2f} {aggr:>11.2f} "
+                f"{speedup:>8.2f}x {effic * 100:>6.0f}%   {per_txt}",
+                flush=True,
+            )
+
+
 def _run_direction(
     direction: str,
     sizes: list[int],
@@ -317,6 +524,30 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=200, help="timed copies per size")
     p.add_argument("--device", default="cuda:0", help="CUDA device")
     p.add_argument(
+        "--gpus",
+        default="",
+        help="comma-separated CUDA device indices to drive in parallel against "
+        "the SAME host buffer (e.g. '0,1', or 'all'). Each GPU gets its own "
+        "stream and they copy concurrently, so the table reports solo vs "
+        "aggregate bandwidth and the scaling efficiency -- this is what shows "
+        "whether the host media/link is a shared budget. Omit for the "
+        "original single-GPU per-payload table.",
+    )
+    p.add_argument(
+        "--offset-gap-gib",
+        type=float,
+        default=0.0,
+        help="with --gpus, place GPU i at base + i*GAP in the host mapping "
+        "(default 0 = every GPU on the same region). Use it to aim concurrent "
+        "GPUs at DIFFERENT backing devices: a pool built by concatenating two "
+        "modules puts the second module's address range after the first, so a "
+        "gap of half the pool size lands GPU 1 on the other module. Comparing "
+        "gap=0 (same module) against gap=half-the-pool (different modules) "
+        "shows whether the modules are independent -- if aggregate roughly "
+        "doubles, the hardware has the bandwidth and the pool is concatenated "
+        "rather than interleaved.",
+    )
+    p.add_argument(
         "--dir",
         choices=("h2d", "d2h", "both"),
         default="both",
@@ -332,10 +563,13 @@ def main() -> int:
     p.add_argument(
         "--cxl-register-flags",
         type=int,
-        default=_CUDA_HOST_REGISTER_DEFAULT,
+        default=_CUDA_HOST_REGISTER_PORTABLE,
         help="cudaHostRegister flags for the CXL mapping: 0=Default, "
-        "1=Portable, 2=Mapped, 4=IoMemory. Use 4 if the default registers "
-        "but isn't device-resolvable (DMA bounces).",
+        "1=Portable, 2=Mapped, 4=IoMemory (values OR together). Defaults to "
+        "Portable so the mapping is pinned for EVERY CUDA context -- required "
+        "by --gpus, since a non-portable registration is true pinned DMA only "
+        "for the registering device and silently bounces for the others. Use "
+        "4 if the default registers but isn't device-resolvable.",
     )
     p.add_argument(
         "--no-rotate",
@@ -369,6 +603,21 @@ def main() -> int:
     max_bytes = sizes[-1]
     stream = torch.cuda.Stream(device=dev)
 
+    # Parallel mode: which devices drive the shared host buffer together.
+    if args.gpus.strip().lower() == "all":
+        gpu_indices = list(range(torch.cuda.device_count()))
+    elif args.gpus.strip():
+        gpu_indices = [int(x) for x in args.gpus.split(",") if x.strip()]
+    else:
+        gpu_indices = []
+    for idx in gpu_indices:
+        if idx < 0 or idx >= torch.cuda.device_count():
+            print(
+                f"--gpus: device {idx} out of range (have {torch.cuda.device_count()})",
+                file=sys.stderr,
+            )
+            return 1
+
     # Rotation region: with --no-rotate every copy reuses offset 0 (one
     # payload's worth, cache-warm); otherwise the host buffer spans a region
     # larger than the LLC so rotating accesses stay cache-cold (DDIO-immune).
@@ -393,12 +642,25 @@ def main() -> int:
     cxl_ptr = None
     cxl_mm = None
     cxl_size = 0
+    offset_gap = int(args.offset_gap_gib * (1 << 30))
+    ngpu_par = len(gpu_indices)
+    if offset_gap and not ngpu_par:
+        print("--offset-gap-gib has no effect without --gpus.", file=sys.stderr)
+        return 1
+
+    # Each participating GPU works in its own window when a gap is set, so pin
+    # one region_bytes range per GPU. Pinning the entire pool would fail: CUDA
+    # cannot register 256 GiB (cudaErrorMemoryAllocation).
+    cxl_windows = tuple(
+        (i * offset_gap, region_bytes) for i in range(ngpu_par if offset_gap else 1)
+    )
     if args.cxl_dev is not None:
         cxl_ptr, cxl_mm, cxl_size = _open_cxl_source(
-            args.cxl_dev, region_bytes, args.cxl_register_flags
+            args.cxl_dev, region_bytes, args.cxl_register_flags, cxl_windows
         )
         if args.verify_only:
-            _cuda_host_unregister(cxl_ptr)
+            for off, _ in cxl_windows:
+                _cuda_host_unregister(cxl_ptr + off)
             return 0
         if cxl_size < max_bytes:
             print(
@@ -408,20 +670,41 @@ def main() -> int:
             )
             sizes = [n for n in sizes if n <= cxl_size]
             max_bytes = sizes[-1]
+        if offset_gap:
+            needed = (ngpu_par - 1) * offset_gap + region_bytes
+            if needed > cxl_size:
+                print(
+                    f"--offset-gap-gib {args.offset_gap_gib:g} needs "
+                    f"{needed / (1 << 30):.1f} GiB but the CXL device is only "
+                    f"{cxl_size / (1 << 30):.1f} GiB.",
+                    file=sys.stderr,
+                )
+                return 1
+    elif offset_gap:
+        print(
+            "--offset-gap-gib applies to the CXL mapping; pass --cxl-dev.",
+            file=sys.stderr,
+        )
+        return 1
 
-    # The rotation span is the region clamped to what every source can hold.
+    # The rotation span is the region each GPU walks. With a gap the windows
+    # are separate ranges of region_bytes each, so the span is region_bytes
+    # rather than the whole (much larger) device.
     rotate_span = region_bytes
-    if cxl_ptr is not None:
+    if cxl_ptr is not None and not offset_gap:
         rotate_span = min(rotate_span, cxl_size)
 
     # Populate page-table entries over the span so rotating accesses do not
     # fold a first-touch fault into the median (DAX mmaps fault lazily). The
     # sequential read leaves only the LLC-sized tail warm, so accesses stay
-    # cold for both directions.
+    # cold for both directions. With an offset gap each GPU's CXL window is a
+    # separate range, so every one of them is faulted.
     if rotate:
         _prefault(dram_ptr, rotate_span)
         if cxl_ptr is not None:
-            _prefault(cxl_ptr, rotate_span)
+            nwin = ngpu_par if (offset_gap and ngpu_par) else 1
+            for i in range(nwin):
+                _prefault(cxl_ptr + i * offset_gap, rotate_span)
 
     mode = (
         f"cold (rotating over {rotate_span / (1 << 20):.0f} MiB, "
@@ -438,24 +721,75 @@ def main() -> int:
     directions = ("h2d", "d2h") if args.dir == "both" else (args.dir,)
     cxl_arg = cxl_ptr if cxl_ptr is not None else 0
     try:
-        for direction in directions:
-            _run_direction(
-                direction,
-                sizes,
-                gpu_ptr,
-                dram_ptr,
-                cxl_arg,
-                stream,
-                args.iters,
-                rotate,
-                rotate_span,
+        if gpu_indices:
+            # One stream and one device buffer per participating GPU; they all
+            # copy against the single shared host buffer.
+            gpus = []
+            for idx in gpu_indices:
+                gdev = torch.device(f"cuda:{idx}")
+                torch.cuda.set_device(gdev)
+                gbuf = torch.empty(max_bytes, dtype=torch.uint8, device=gdev)
+                gpus.append(
+                    GpuContext(
+                        device=gdev,
+                        stream=torch.cuda.Stream(device=gdev),
+                        buf=gbuf,
+                        ptr=gbuf.data_ptr(),
+                    )
+                )
+            gap_note = (
+                f", CXL offset gap {args.offset_gap_gib:g} GiB/GPU (DRAM always 0)"
+                if offset_gap
+                else " sharing one host buffer"
             )
+            print(
+                f"[bench] parallel mode: {len(gpus)} GPU(s) "
+                f"{[g.device.index for g in gpus]}{gap_note}",
+                flush=True,
+            )
+            # The gap is a property of the CXL pool's layout, so DRAM keeps
+            # gap 0 and remains the "this is what scaling looks like" row.
+            for direction in directions:
+                _run_direction_parallel(
+                    direction,
+                    sizes,
+                    gpus,
+                    [("DRAM", dram_ptr)],
+                    args.iters,
+                    rotate,
+                    rotate_span,
+                    0,
+                )
+                _run_direction_parallel(
+                    direction,
+                    sizes,
+                    gpus,
+                    [("CXL", cxl_arg)],
+                    args.iters,
+                    rotate,
+                    rotate_span,
+                    offset_gap,
+                )
+        else:
+            for direction in directions:
+                _run_direction(
+                    direction,
+                    sizes,
+                    gpu_ptr,
+                    dram_ptr,
+                    cxl_arg,
+                    stream,
+                    args.iters,
+                    rotate,
+                    rotate_span,
+                )
     finally:
         if cxl_ptr is not None:
-            try:
-                _cuda_host_unregister(cxl_ptr)
-            except Exception:
-                pass
+            for off, _ in cxl_windows:
+                try:
+                    _cuda_host_unregister(cxl_ptr + off)
+                except Exception:
+                    pass
             try:
                 cxl_mm.close()
             except BufferError:

@@ -361,6 +361,18 @@ the venv python (`~/.virtualenvs/lmcache/bin/python`).
   roles) to study the descriptor-size effect described in the NIXL design doc.
 - **`gen_prompt.py <num_tokens>`** — emit an exact-length prompt + its token IDs
   to feed a node's `/lookup_hits` endpoint.
+- **`bench_rdma_scaling.py --sweep <knob>`** — does RDMA on `mlx5_0` degrade as
+  software scales it out? Drives `perftest` g5→g6 (ssh) and sweeps ONE knob at
+  a time — RC QP count (`qps`), process count (`procs`), per-QP depth
+  (`tx-depth`), outstanding READs (`outs`), message size, doorbell/CQ
+  batching, MTU, RC-vs-DC — recording Gbps, Mpps, requester CPU (in
+  core-equivalents), RoCE retransmit/CNP counters on both ends, and
+  (`--probe-lat`) the p99 of a concurrent 1-QP victim flow. Fixed knobs
+  (`--verb read`, `--hugepages`, `--mr-per-qp`, `--conn DC`, `--cuda-*`)
+  attribute a cliff to translation cache vs QP context vs transport.
+  `--dry-run` prints the raw perftest commands. Output:
+  `results/rdma_scaling-<label>.csv` + a per-size summary table normalized to
+  the best point. See the module docstring for the full sweep rationale.
 
 ---
 
