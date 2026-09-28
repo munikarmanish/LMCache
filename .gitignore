@@ -146,6 +146,9 @@ operator/coverage.html
 operator/Dockerfile.cross
 *.spv
 
+# CXL native build artifacts (compiled from the .c in the same dir)
+lmcache/v1/storage_backend/cxl/_native/cxl_lock_manager
+
 # Compiled gettext catalogs (built from .po at HTML build time)
 docs/source/locale/**/*.mo
 
