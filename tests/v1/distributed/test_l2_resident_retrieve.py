@@ -15,6 +15,7 @@ The CXL-specific pin-vs-evict invariant (``evict`` refuses while
 """
 
 # Standard
+import threading
 import time
 
 # Third Party
@@ -406,3 +407,86 @@ class TestResidentMultiReader:
             lambda: adapter.debug_get_locked_key_count() == 0, timeout=2.0
         )
         adapter.close()
+
+
+# =============================================================================
+# Tier-info lifetime under TP>1
+# =============================================================================
+#
+# `_prefetch_tier_info` is keyed by request_id alone, but under TP>1 the
+# retrieve handler runs once per *worker* for that one request_id, and the
+# entry holds every rank's resident keys. A destructive read by the first
+# worker leaves the rest unable to tell their resident keys from L1 keys —
+# they look for them in L1, miss, and fail the retrieve, so half the KV
+# heads are never populated and the model emits garbage.
+#
+# Reproduces the TP=2 cross-node failure seen on the testbed:
+#   "Failed to read prefetched object ... from L1 storage:
+#    The specified key does not exist."
+
+
+class TestTierInfoSurvivesMultipleWorkers:
+    def _ctx(self):
+        # First Party
+        from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+
+        # Only the tier-info methods are exercised; skip __init__ so the
+        # test does not need a live server, allocator or event bus.
+        ctx = MPCacheEngineContext.__new__(MPCacheEngineContext)
+        ctx._tier_info_lock = threading.Lock()
+        ctx._prefetch_tier_info = {}
+        return ctx
+
+    def test_every_worker_sees_the_resident_keys(self):
+        """Reading tier info must not consume it: TP=N means N readers."""
+        ctx = self._ctx()
+        # Non-MLA TP=2: each rank has its own keys, both in one entry.
+        rank0 = (make_object_key(0), make_object_key(1))
+        rank1 = (make_object_key(2), make_object_key(3))
+        ctx.set_tier_info(
+            "req-1",
+            L2ResidentTierInfo(keys=rank0 + rank1, adapter_indices=(0,) * 4),
+        )
+
+        # Worker A retrieves; worker B must still see its own keys.
+        for _ in range(2):
+            info = ctx.get_tier_info("req-1")
+            assert set(info.keys) == set(rank0 + rank1)
+
+    def test_worker_takes_only_its_own_subset(self):
+        """Each worker filters the shared entry by its own obj_keys."""
+        ctx = self._ctx()
+        rank0 = [make_object_key(0), make_object_key(1)]
+        rank1 = [make_object_key(2), make_object_key(3)]
+        ctx.set_tier_info(
+            "req-1",
+            L2ResidentTierInfo(keys=tuple(rank0 + rank1), adapter_indices=(0,) * 4),
+        )
+
+        info = ctx.get_tier_info("req-1")
+        resident_by_key = dict(zip(info.keys, info.adapter_indices, strict=True))
+        # This is the filter the retrieve handler applies.
+        for own in (rank0, rank1):
+            l1_keys = [k for k in own if k not in resident_by_key]
+            assert l1_keys == [], "a resident key must never fall to the L1 path"
+
+    def test_end_of_request_drops_it(self):
+        """The entry is reclaimed once per request, not once per worker."""
+        ctx = self._ctx()
+        ctx.set_tier_info(
+            "req-1",
+            L2ResidentTierInfo(keys=(make_object_key(0),), adapter_indices=(0,)),
+        )
+        assert ctx.get_tier_info("req-1").keys != ()
+
+        # end_session's cleanup.
+        ctx.pop_tier_info("req-1")
+        assert ctx.get_tier_info("req-1").keys == ()
+
+        # Popping again (e.g. a duplicate end_session) is harmless.
+        assert ctx.pop_tier_info("req-1").keys == ()
+
+    def test_unknown_request_yields_empty(self):
+        """A request with no resident keys reads as empty, not KeyError."""
+        ctx = self._ctx()
+        assert ctx.get_tier_info("never-seen").keys == ()

@@ -955,9 +955,20 @@ class GPUTransferModule:
                         list(resident_by_key.keys()),
                         list(resident_by_key.values()),
                     )
-                # Tier info is consumed exactly once per request — drop it so
-                # it can't leak (which would strand a CXL pin).
-                self._ctx.pop_tier_info(key.request_id)
+                # Do NOT drop the tier info here. Under TP>1 this handler
+                # runs once per worker for the same request_id, and the
+                # entry holds *every* rank's resident keys — popping it on
+                # the first worker leaves the rest unable to tell their
+                # resident keys from L1 keys, so they look for them in L1,
+                # miss, and fail the retrieve. Half the KV heads are then
+                # never populated and the model emits garbage.
+                #
+                # Each worker takes only its own subset (``resident_by_key``
+                # is filtered by this worker's ``obj_keys``), and each
+                # releases only the pins it took, via its own h2d tokens.
+                # The entry is dropped once per request in
+                # ``LookupModule.end_session`` / ``free_lookup_locks``,
+                # both of which run on the scheduler.
                 # On a failed retrieve (early return) the PROFILE line is never
                 # emitted, so drop the profile entry here to avoid a leak.
                 if not retrieve_succeeded:

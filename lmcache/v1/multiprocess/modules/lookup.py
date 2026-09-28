@@ -431,7 +431,14 @@ class LookupModule:
         # read lock), so they must be unlocked on the adapter rather than
         # via finish_read_prefetched. Without this an aborted request would
         # leak the pin and block eviction of that slot forever.
-        tier_info = self._ctx.pop_tier_info(key.request_id)
+        #
+        # Read, do not pop: this is called per *token range*, so it may
+        # cover only part of the request (chunks vLLM already computed),
+        # and it may be called several times. Popping would discard the
+        # tier info for the keys outside this range, leaving the retrieve
+        # path unable to recognize them as resident. The entry is dropped
+        # once per request in ``end_session``.
+        tier_info = self._ctx.get_tier_info(key.request_id)
         resident_by_key = dict(
             zip(tier_info.keys, tier_info.adapter_indices, strict=True)
         )
@@ -470,6 +477,14 @@ class LookupModule:
             )
         )
         session = self._ctx.session_manager.remove(request_id)
+        # Drop the request's L2-resident tier info. The retrieve handler
+        # deliberately does not, because under TP>1 it runs once per worker
+        # against one shared entry; this runs once per request on the
+        # scheduler, after every worker is done. Any pins those keys held
+        # were released per-worker on the retrieve path (or by
+        # ``free_lookup_locks`` if the request was aborted), so this only
+        # reclaims the bookkeeping.
+        self._ctx.pop_tier_info(request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,
