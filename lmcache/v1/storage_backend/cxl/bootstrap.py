@@ -3,10 +3,10 @@
 
 Responsibilities:
 - Open /dev/dax0.0 (or any file/device) and mmap it.
-- Compute the geom_hash for the current cluster config.
 - If the pool is uninitialized (or the caller is the bootstrap node),
   write the header; otherwise, validate the existing header and reject
-  on generation/geom mismatch.
+  on a magic, layout-version, or sizing mismatch. The pool carries no
+  model identity, so any model may attach.
 - Pin the mapping with cudaHostRegister so CUDA treats it as
   page-locked host memory (TraCT §4.4) — this is what avoids the
   DRAM bounce buffer on GPU transfers.
@@ -18,35 +18,30 @@ Concurrency and lock-manager bootstrap live in cxl/locks.py (next slice).
 
 # Standard
 from dataclasses import dataclass
-from hashlib import blake2b
+from typing import Optional
 import ctypes
 import json
 import mmap
 import os
 import stat
 import subprocess
-from typing import Optional
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_management import MemoryFormat
-from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.layout import (
-    CACHELINE_SIZE,
     DEFAULT_MAX_NODES,
     DEFAULT_NUM_LOCKS,
     DEFAULT_REGION_SIZE,
-    GEOM_HASH_SIZE,
-    Header,
-    LockSlot,
     MAGIC,
     OWNER_FREE,
+    SLOT_STATE_EMPTY,
+    Header,
+    LockSlot,
     PoolLayout,
     RegionDesc,
-    SLOT_STATE_EMPTY,
     Slot,
 )
 
@@ -75,33 +70,6 @@ class CXLBootstrapConfig:
     # Optional NUMA node id to bind backend threads to. If None, the
     # caller's default binding is used.
     numa_node: Optional[int] = None
-    # Compile-time assertion min: we need at least this many chunks of
-    # capacity or the backend would be pointless. Tuned upward by
-    # callers via config; the default is intentionally tiny for tests.
-    min_chunks_per_region: int = 1
-
-
-def compute_geom_hash(metadata: LMCacheMetadata) -> bytes:
-    """Digest the fields that must match bit-for-bit across peers.
-
-    If two peers disagree on any of these, raw bytes on CXL cannot be
-    safely DMA'd: the layout of a KV chunk, its dtype, or the chunk
-    hash scheme differs. The 16-byte digest is stored in the pool
-    header at bootstrap and in every slot at insert.
-    """
-    payload = {
-        "model_name": metadata.model_name,
-        "world_size": metadata.world_size,
-        "kv_dtype": str(metadata.kv_dtype),
-        "kv_shape": list(metadata.kv_shape),
-        "use_mla": metadata.use_mla,
-        "chunk_size": metadata.chunk_size,
-        # We don't hash worker_id: different TP ranks share geometry.
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    return blake2b(encoded, digest_size=GEOM_HASH_SIZE).digest()
 
 
 @dataclass
@@ -115,7 +83,6 @@ class PoolHandle:
     mmap_obj: mmap.mmap
     layout: PoolLayout
     header: Header
-    geom_hash: bytes
     cuda_registered: bool = False
 
     # -- accessor views -----------------------------------------------
@@ -147,11 +114,7 @@ class PoolHandle:
     def region_address(self, region_id: int) -> int:
         if not 0 <= region_id < self.layout.region_count:
             raise IndexError(region_id)
-        return (
-            self.base
-            + self.layout.off_regions
-            + region_id * self.layout.region_size
-        )
+        return self.base + self.layout.off_regions + region_id * self.layout.region_size
 
     def close(self) -> None:
         if self.cuda_registered:
@@ -172,15 +135,25 @@ class PoolHandle:
 # -------- top-level entry points ----------------------------------------
 
 
-def bootstrap_pool(
-    cfg: CXLBootstrapConfig, metadata: LMCacheMetadata
-) -> PoolHandle:
+def bootstrap_pool(cfg: CXLBootstrapConfig) -> PoolHandle:
     """Open the pool and return a live PoolHandle.
 
     If `cfg.initialize` is True, the pool is (re)initialized: header is
     written, region bitmap cleared, descriptors reset, index zeroed.
-    Otherwise the existing header is validated against `cfg` and
-    `metadata`, and the caller attaches without mutating the pool.
+    Otherwise the existing header is checked for *compatibility* — magic,
+    layout version, and sizing — and the caller attaches without mutating
+    the pool.
+
+    The pool carries no model identity. A slot's tenant is recorded per
+    slot (``line0.geom_hash``, see
+    :func:`~lmcache.v1.storage_backend.cxl.store.object_key_to_tenant_digest`),
+    so one pool serves many models, TP degrees, and tenants concurrently.
+
+    Args:
+        cfg: Device path, sizing, and initialize/generation flags.
+
+    Returns:
+        A live PoolHandle over the mapped pool.
     """
     fd, size = _open_pool(cfg.dev_path)
     if cfg.pool_size_override is not None:
@@ -203,7 +176,6 @@ def bootstrap_pool(
         raise
 
     base = _mmap_base_address(mm)
-    geom_hash = compute_geom_hash(metadata)
 
     try:
         if cfg.initialize:
@@ -213,8 +185,7 @@ def bootstrap_pool(
                 num_locks=cfg.num_locks,
                 max_nodes=cfg.max_nodes,
             )
-            _validate_sizing(layout, cfg, metadata)
-            header = _initialize_pool(base, layout, geom_hash, cfg.generation)
+            header = _initialize_pool(base, layout, cfg.generation)
             logger.info(
                 "CXL pool initialized: path=%s size=%d regions=%d region_size=%d "
                 "index_slots=%d gen=%d",
@@ -226,7 +197,7 @@ def bootstrap_pool(
                 cfg.generation,
             )
         else:
-            header, layout = _attach_existing(base, size, geom_hash)
+            header, layout = _attach_existing(base, size)
             logger.info(
                 "CXL pool attached: path=%s size=%d regions=%d gen=%d",
                 cfg.dev_path,
@@ -243,7 +214,6 @@ def bootstrap_pool(
             mmap_obj=mm,
             layout=layout,
             header=header,
-            geom_hash=geom_hash,
         )
 
         _cuda_host_register_if_available(handle)
@@ -355,9 +325,7 @@ def _struct_at(base: int, offset: int, struct_type):
     return struct_type.from_address(base + offset)
 
 
-def _initialize_pool(
-    base: int, layout: PoolLayout, geom_hash: bytes, gen: int
-) -> Header:
+def _initialize_pool(base: int, layout: PoolLayout, gen: int) -> Header:
     """Write the header and zero out all metadata sections."""
     # Zero the metadata region (header + locks + bitmap + descs + index).
     # We don't zero the region payload area — that's the bulk of the pool
@@ -381,13 +349,11 @@ def _initialize_pool(
 
     # Write header last so a partially-initialized pool can't be attached.
     header = _struct_at(base, layout.off_header, Header)
-    layout.write_to_header(header, geom_hash, gen)
+    layout.write_to_header(header, gen)
     return header
 
 
-def _attach_existing(
-    base: int, size: int, geom_hash: bytes
-) -> tuple[Header, PoolLayout]:
+def _attach_existing(base: int, size: int) -> tuple[Header, PoolLayout]:
     header = _struct_at(base, 0, Header)
 
     # Check magic/version FIRST — other fields can't be trusted before this.
@@ -407,35 +373,7 @@ def _attach_existing(
     # Remaining header sanity (version, region_size, pool_size).
     layout.validate_against(header)
 
-    observed_geom = bytes(header.geom_hash)
-    if observed_geom != geom_hash:
-        raise RuntimeError(
-            "CXL pool geom_hash mismatch: pool was initialized with a different "
-            "model/chunk geometry. Refusing to attach. "
-            f"pool={observed_geom.hex()} local={geom_hash.hex()}"
-        )
     return header, layout
-
-
-def _validate_sizing(
-    layout: PoolLayout, cfg: CXLBootstrapConfig, metadata: LMCacheMetadata
-) -> None:
-    """Assert that regions are big enough to hold a useful number of chunks."""
-    # Rough estimate of a chunk's bytes: use the default KV_2LTD layout.
-    # We deliberately keep this a loose lower bound — the backend
-    # computes the real chunk size lazily once allocators are wired.
-    dtype_size = torch.tensor([], dtype=metadata.kv_dtype).element_size()
-    shapes = metadata.get_shapes(num_tokens=metadata.chunk_size)
-    if not shapes:
-        return
-    chunk_bytes = int(shapes[0].numel()) * dtype_size
-    if chunk_bytes <= 0:
-        return
-    if layout.region_size < cfg.min_chunks_per_region * chunk_bytes:
-        raise ValueError(
-            f"region_size {layout.region_size} < {cfg.min_chunks_per_region} x "
-            f"estimated chunk bytes {chunk_bytes}; increase cxl_region_size"
-        )
 
 
 def _cuda_host_register_if_available(handle: PoolHandle) -> None:

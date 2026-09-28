@@ -1,49 +1,57 @@
-# CXLBackend
+# CXLStore
 
-`CXLBackend` is the **synchronous storage backend over a CXL shared-memory
-pool**. It implements `AllocatorBackendInterface` so it plugs into LMCache's
-`StorageManager` like any other backend, and it is the engine that the
+`CXLStore` is the **synchronous, content-addressed KV object store over a CXL
+shared-memory pool**. It is the engine that the
 [CXL L2 adapter](docs/design/v1/distributed/l2_adapters/cxl_l2_adapter.md) wraps
 with an async/eventfd shim.
 
+It is deliberately **not** a `StorageBackendInterface`. It was originally
+written as an in-process backend and only later wrapped as an L2 adapter; that
+inherited base class was the sole reason `CacheEngineKey` — which cannot
+represent `kv_rank` or `cache_salt` — ever appeared on the CXL path. The store
+is now keyed on `ObjectKey` directly, and nothing registers it as an in-process
+backend. See
+[`cxl_multi_tenant.md`](docs/design/v1/distributed/l2_adapters/cxl_multi_tenant.md)
+§5.1.
+
 Where the L2 adapter is about *scheduling* (task ids, eventfds, the
-controller-facing store/lookup/load/unlock contract), `CXLBackend` is about
+controller-facing store/lookup/load/unlock contract), `CXLStore` is about
 *mechanism*: it owns the mmap'd pool and turns a `(key, bytes)` into a committed,
 addressable chunk in shared memory, and a `key` back into a copy of those bytes —
 all under the rack-wide distributed lock.
 
 Source:
-[`cxl_backend.py`](lmcache/v1/storage_backend/cxl_backend.py). The primitives it
+[`cxl/store.py`](lmcache/v1/storage_backend/cxl/store.py). The primitives it
 composes live under
 [`lmcache/v1/storage_backend/cxl/`](lmcache/v1/storage_backend/cxl/).
 
-> **Doc-vs-code note.** The module docstring still calls this a "single-process
-> skeleton for step 5" with cross-node push "not yet wired." That prose is stale:
-> the cross-node donor
-> ([`cross_node.py`](lmcache/v1/storage_backend/cxl/cross_node.py)) drives this
-> backend's index writer and heap, and the GPU-direct and batched-lock paths are
-> live. This doc describes the backend as it actually is.
+> **Key type.** The store speaks `ObjectKey`. The shared CXL index addresses
+> slots by a single u64, so the full identity — content hash, `model_name`,
+> `kv_rank`, `cache_salt` — is folded into that u64 by
+> `object_key_to_chunk_hash`. Anything folded out would alias in the shared
+> pool; that is exactly the TP>1 bug the old `CacheEngineKey` bridge caused.
 
 ---
 
 ## 1. Responsibilities
 
-`CXLBackend` is the single owner, per MP-server process, of one CXL pool. It:
+`CXLStore` is the single owner, per MP-server process, of one CXL pool. It:
 
 - **Bootstraps** the pool: mmap the `/dev/dax` device, read or write the header,
   and `cudaHostRegister` the whole mapping so chunks can DMA to GPU.
 - **Wires the subsystems** that operate on the pool (§3) and hands them a single
   shared distributed lock.
-- **Runs the store path** (`batched_submit_put_task` → `_put_one`): reserve a
+- **Runs the store path** (`put_batch` → `_put_one`): reserve a
   slot, allocate a chunk, copy bytes, commit VALID.
-- **Runs the read paths**: `read_into` (fast memcpy into a caller buffer),
-  `get_blocking` (materialize a `MemoryObj`), and `gpu_src_view` (a pointer for a
+- **Runs the read paths**: `read_into` (memcpy into a caller-owned buffer)
+  and `gpu_src_view` (a pointer for a
   GPU-direct DMA).
 - **Manages slot liveness**: `pin`/`unpin` (eviction protection across a
   lookup→use window) and `ref_count` (protection across an in-flight DMA), plus
   their batched variants.
-- **Exposes an allocator** (`get_memory_allocator`) so the pool can also serve as
-  a `MemoryAllocatorInterface` target.
+- **Separates tenants**: every slot carries a 16-byte tenant digest derived from
+  its `ObjectKey` (plus the model's geometry salt, set through `set_geometry`),
+  so one pool serves many models, TP degrees, and cache salts at once.
 
 It deliberately does **not** emit `KVAdmitMsg`/`KVEvictMsg` to the cache
 controller: CXL residency is discovered by *looking in the shared index*, not by
@@ -55,40 +63,41 @@ broadcasting local-tier admit/evict events.
 
 ```
         StorageManager
-             │  put / get / pin / remove  (AllocatorBackendInterface)
+             │  L2AdapterInterface (store / lookup-and-lock / load / unlock)
+             ▼
+        CXLL2Adapter     ── async/eventfd shim, controller contract
+             │  put_batch / read_into / gpu_src_view / pin / remove
              ▼
      ┌──────────────────────────────────────────────────────┐
-     │ CXLBackend                                            │
+     │ CXLStore                                              │
      │   bootstrap → PoolHandle (mmap + header + hostReg)    │
-     │   TwoTierLock  ── shared by all subsystems ──┐        │
-     │   RegionAllocator → NodeHeap → CXLMemoryAllocator     │
+     │   TwoTierLock  ── shared by all subsystems            │
+     │   RegionAllocator → HeapSet (one NodeHeap per size)   │
      │   CXLIndex (lock-free reads) / CXLIndexWriter (writes)│
-     │   key→slot cache, in-flight-put set                   │
+     │   key→slot cache, node-local LRU                      │
      └───────────────┬──────────────────────────────────────┘
-                     │ (same object, shared with)
-        CXLL2Adapter ┘   ── async/eventfd shim, controller contract
-        CXLDonor         ── cross-node PushKVToCXL uses the index_writer + heap
+                     │ (same pool, index_writer and heaps shared with)
+        CXLDonor     ┘   ── cross-node PushKVToCXL
 ```
 
-The same `CXLBackend` instance is shared by the L2 adapter (which schedules
-operations onto it) and, on the donor side, by the cross-node push handler (which
-reserves/commits slots and allocates chunks through it). All three go through the
-one `TwoTierLock`, so concurrent local puts, cross-node commits, and pins are
-mutually consistent.
+The L2 adapter is the store's only caller; nothing registers it as an in-process
+backend. On the donor side, the cross-node push handler reserves/commits slots
+and allocates chunks through the same `index_writer` and `heaps`. Everything goes
+through the one `TwoTierLock`, so concurrent local puts, cross-node commits, and
+pins are mutually consistent.
 
 ---
 
 ## 3. Composed subsystems
 
-`CXLBackend.__init__` runs the full bootstrap and wires these, in order:
+`CXLStore.__init__` runs the full bootstrap and wires these, in order:
 
 | Subsystem | Source | Role |
 |---|---|---|
-| Bootstrap → `PoolHandle` | [`bootstrap.py`](lmcache/v1/storage_backend/cxl/bootstrap.py) | mmap the DAX device, validate/write the header (magic, `gen`, `geom_hash`), `cudaHostRegister` the mapping. |
+| Bootstrap → `PoolHandle` | [`bootstrap.py`](lmcache/v1/storage_backend/cxl/bootstrap.py) | mmap the DAX device, validate/write the header (magic, layout version, `gen`, sizing), `cudaHostRegister` the mapping. The header carries no model identity. |
 | `TwoTierLock` | [`locks.py`](lmcache/v1/storage_backend/cxl/locks.py) | rack-wide sharded lock; one shared instance for every writer. |
 | Lock-manager arbiter | [`lock_manager_proc.py`](lmcache/v1/storage_backend/cxl/lock_manager_proc.py) (C sidecar) / [`lock_manager.py`](lmcache/v1/storage_backend/cxl/lock_manager.py) (Python fallback) | the single writer that flips `WAITING → LOCKED`. Run on **one** node. |
-| `RegionAllocator` → `NodeHeap` | [`regions.py`](lmcache/v1/storage_backend/cxl/regions.py), [`heap.py`](lmcache/v1/storage_backend/cxl/heap.py) | claim coarse regions, carve them into fixed `chunk_size` chunks, hand out pool-relative offsets. |
-| `CXLMemoryAllocator` | [`allocator.py`](lmcache/v1/storage_backend/cxl/allocator.py) | expose the heap as a `MemoryAllocatorInterface`. |
+| `RegionAllocator` → `HeapSet` → `NodeHeap` | [`regions.py`](lmcache/v1/storage_backend/cxl/regions.py), [`heap_set.py`](lmcache/v1/storage_backend/cxl/heap_set.py), [`heap.py`](lmcache/v1/storage_backend/cxl/heap.py) | claim coarse regions and carve them into chunks. `HeapSet` keeps one `NodeHeap` per distinct chunk byte size, created on first store, and routes a `free(offset)` back to the class owning that region. Sizes are exact-fit; the only waste is a region tail smaller than one chunk. |
 | `CXLIndex` / `CXLIndexWriter` | [`index.py`](lmcache/v1/storage_backend/cxl/index.py), [`index_writer.py`](lmcache/v1/storage_backend/cxl/index_writer.py) | lock-free hash-index reads; lock-protected reserve/commit/evict/pin. |
 
 The pool layout (header / index slots / heap / lock rows) and the slot state
@@ -108,25 +117,24 @@ the Python thread.
 
 ## 4. The store path (`_put_one`)
 
-`batched_submit_put_task` completes **synchronously** and inline (there is no
-async DMA yet on the store side); it loops `_put_one` per key and swallows
-per-key failures so one bad key can't fail the batch. Each `_put_one` is a full
-INSERT lifecycle:
+`put_batch` completes **synchronously** and inline (there is no async DMA yet on
+the store side); it loops `_put_one` per key and swallows per-key failures so
+one bad key can't fail the batch. Each `_put_one` is a full INSERT lifecycle:
 
-1. **Mark in-flight** (so `exists_in_put_tasks` answers correctly mid-insert).
-2. **Reserve a slot** (`reserve_slot`, with bounded retries on
-   `WAIT_FOR_OTHER`). `ALREADY_PRESENT` → cache the slot and return (dedup);
-   `INDEX_FULL` → drop the put and log.
-3. **Allocate a chunk** from the heap (reject payloads larger than
-   `chunk_size_bytes`), evicting local cold chunks on region exhaustion — see
-   §4.1.
-4. **Copy** `src.raw_data` into the chunk.
-5. **Commit** the slot VALID (`commit_slot`) and cache the key→slot mapping. The
+1. **Reserve a slot** (`reserve_slot(chunk_hash, tenant_digest)`, with bounded
+   retries on `WAIT_FOR_OTHER`). `ALREADY_PRESENT` → cache the slot and return
+   (dedup); `INDEX_FULL` → drop the put and log.
+2. **Allocate a chunk** of exactly the payload's size from that size's heap
+   class, evicting local cold chunks on region exhaustion — see §4.1. There is
+   no configured chunk size; the optional `max_chunk_size_bytes` is only a guard
+   against a garbled geometry, and a size larger than `region_size` fails loudly.
+3. **Copy** `src.raw_data` into the chunk.
+4. **Commit** the slot VALID (`commit_slot`) and cache the key→slot mapping. The
    commit also refreshes the slot's node-local LRU recency (§4.1).
 
 On any failure after reservation, it **rolls back**: free the chunk and release
 the slot back to EMPTY, so a partial insert never leaves a stranded ALLOCATING
-slot or a leaked chunk. The `finally` clears the in-flight mark.
+slot or a leaked chunk.
 
 ### 4.1 Node-local LRU eviction (`_alloc_chunk_with_eviction`)
 
@@ -139,15 +147,17 @@ no longer grow.
 
 **The allocation ladder** (chunk allocation, step 3 above):
 
-1. **`heap.alloc()`** — serve from the free-list, else **claim a new region**
+1. **`heaps.alloc(size)`** — serve from that size class's free-list, else **claim a new region**
    from the global pool. Claiming is always preferred; while the pool has FREE
    regions, no eviction ever happens (eviction costs nothing until the pool is
    full).
 2. **On `NoRegionAvailable`** (the global pool is exhausted — this node's region
    count is now fixed) — evict this node's coldest chunks back into the
-   free-list via `_evict_cold_slots`, then retry with **`heap.alloc_no_claim()`**
-   (free-list only, never claims). The freed slot is reused **in place**; no
-   region is trimmed or reclaimed.
+   free-list via `_evict_cold_slots`, then retry with
+   **`heaps.alloc_no_claim(size)`** (free-list only, never claims). The freed
+   slot is reused **in place**; no region is trimmed or reclaimed. The retry is
+   scoped to the requested size class: a freed chunk of another size does not
+   satisfy it.
 3. **If eviction frees nothing** (every cold slot is pinned or has an in-flight
    read), the retry raises `OutOfChunks` and the store is dropped (logged) —
    today's exhaustion behavior, now only reached when the node genuinely cannot
@@ -155,7 +165,8 @@ no longer grow.
 
 **Watermark and victim order.** `_evict_cold_slots` drains toward a node-local
 occupancy floor: `occupied / total` owned slots, where `total = owned_regions ×
-slots_per_region` — both DRAM counts from `NodeHeap.occupancy()`, no CXL read.
+slots_per_region`, summed over the size classes — DRAM counts from
+`HeapSet.occupancy()`, no CXL read.
 The floor is `evict_low_watermark` (default 0.8); eviction frees
 `max(store_shortfall, occupied − floor)` chunks, so it drops a batch down to the
 floor rather than one-at-a-time (avoiding a re-trigger on the very next store),
@@ -176,7 +187,7 @@ chunk kept warm by reads survives even if it was stored first. `forget` runs on
 reads as cold here; that approximation is accepted (the goal is only a sensible
 local victim order, not global optimality).
 
-**Batch admission.** `batched_submit_put_task` runs one eviction pass for the
+**Batch admission.** `put_batch` runs one eviction pass for the
 whole batch up front (`_ensure_batch_space`): if the pool is exhausted and
 eviction cannot free room for every chunk in the batch, the **entire batch is
 dropped** rather than storing a partial prefix. The per-chunk ladder above still
@@ -196,8 +207,11 @@ optionally born-pinned — described in the
 
 ## 5. The read paths
 
-All three start with a **lock-free** `CXLIndex.lookup(key)` (readers never take
-the distributed lock), then protect the chunk for the duration of the use:
+Both start with a **lock-free** `CXLIndex.lookup_by_hash(chunk_hash,
+tenant_digest)` (readers never take the distributed lock). A slot matches only
+if both the u64 hash and the 16-byte tenant digest agree, so another model's,
+rank's, or geometry's chunk is a miss rather than a misread. The chunk is then
+protected for the duration of the use:
 
 - **`read_into(key, dst_ptr, dst_size)`** — the fast hit path used by L2 load.
   `ref_count_up` → re-verify the slot didn't get evicted between lookup and pin →
@@ -205,8 +219,6 @@ the distributed lock), then protect the chunk for the duration of the use:
   `ref_count_down` in `finally`. It skips building a `MemoryObj` wrapper (the
   numpy/torch/ctypes wrapping dominated the per-chunk cost) and can record an
   11-slot per-phase ns timing breakdown for profiling.
-- **`get_blocking(key)`** — same protect-and-verify, but returns a materialized
-  `MemoryObj` view over the chunk (for callers that want a Python-level tensor).
 - **`gpu_src_view(key)`** — returns `(n_bytes, pool.base + chunk_offset)` for a
   GPU-direct `cudaMemcpyAsync`. It does **not** bump `ref_count`; the
   GPU-direct path instead relies on the `pin_count` held since the caller's
@@ -225,8 +237,8 @@ guaranteed the bytes stay put for the copy.
 
 Two independent counters on each slot keep it alive for two different windows:
 
-- **`ref_count`** — held for the duration of a single read/DMA (`read_into`,
-  `get_blocking`). Short-lived, taken and dropped inside one call.
+- **`ref_count`** — held for the duration of a single read/DMA (`read_into`).
+  Short-lived, taken and dropped inside one call.
 - **`pin_count`** — held across a *lookup → later use* window (the "lock" in the
   adapter's lookup-and-lock). `pin`/`unpin` and their batched forms
   (`pin_batch`/`unpin_batch`) bump/drop it; the batched forms resolve N keys under
@@ -248,9 +260,11 @@ Three steps, layering the same primitives `remove` uses:
    slot array, then every `VALID` slot whose `owner_node_id` is this node is
    flipped to `TOMB` under its slot lock, and its `chunk_offset` is collected.
    Returns `(freed_offsets, skipped_busy)`.
-2. **`heap.free_batch(freed_offsets)`** — the offsets go back to the node heap's
-   free-list, so the regions holding them become fully free.
-3. **`heap.trim()`** — every fully-empty region is released to the pool.
+2. **`heaps.free_batch(freed_offsets)`** — each offset goes back to the
+   free-list of the size class owning its region, so the regions holding them
+   become fully free.
+3. **`heaps.trim()`** — every fully-empty region, in every size class, is
+   released to the pool.
 
 Two invariants inherited from the single-key path:
 
@@ -268,13 +282,22 @@ Returns a `ClearResult(chunks_deleted, slots_skipped_busy, regions_released)`.
 
 ## 7. Configuration & lifecycle
 
-Constructed from a `CXLBackendConfig` + `LMCacheMetadata`. The config mirrors the
-adapter-facing fields (see the
+Constructed from a `CXLStoreConfig` alone — no model metadata. The config
+mirrors the adapter-facing fields (see the
 [CXL adapter doc §9](docs/design/v1/distributed/l2_adapters/cxl_l2_adapter.md) for
-the JSON surface): `dev_path`, `node_id`, `chunk_size_bytes`, `region_size`,
-`initialize`, `generation`, `run_lock_manager`, `use_process_lock_manager`,
-`pool_size_override`, `max_nodes`, `evict_low_watermark` (§4.1; the node-local
-occupancy floor eviction drains toward, default 0.8, range (0.0, 1.0]).
+the JSON surface): `dev_path`, `node_id`, `region_size`, `max_chunk_size_bytes`
+(optional guard), `initialize`, `generation`, `run_lock_manager`,
+`use_process_lock_manager`, `pool_size_override`, `max_nodes`, `num_locks`,
+`evict_low_watermark` (§4.1; the node-local occupancy floor eviction drains
+toward, default 0.8, range (0.0, 1.0]).
+
+Model geometry arrives later, from the live model: when the serving engine
+registers its KV caches, the adapter's `register_layout` calls
+`set_geometry(model_name, geometry_salt)`, and the salt is folded into the
+tenant digest of that model's chunks. Two nodes running one model under
+different geometry therefore miss each other's chunks instead of misreading
+them. Re-declaring a *different* geometry for a model in the same process
+raises `ValueError`.
 
 - After `__init__` the pool is mapped, host-registered, the lock manager is
   running (if enabled), and the backend serves put/get immediately.
@@ -288,16 +311,18 @@ occupancy floor eviction drains toward, default 0.8, range (0.0, 1.0]).
 
 ## 8. Failure & safety properties
 
-| Concern | How CXLBackend handles it |
+| Concern | How CXLStore handles it |
 |---|---|
 | Partial insert (crash/exception mid-`_put_one`) | Rollback frees the chunk and releases the slot; no stranded ALLOCATING slot or leaked chunk. |
 | Reader races an evictor | `ref_count_up` + re-verify slot identity; eviction refuses non-zero `ref_count`/`pin_count`. |
 | Duplicate put of the same key | `reserve_slot` returns `ALREADY_PRESENT`; the put is a no-op. |
+| Two tenants collide on the u64 index hash | The 16-byte tenant digest differs, so the probe skips the slot; each tenant gets its own. |
+| Same model, different geometry across nodes | Geometry salt makes the tenant digests differ; the nodes miss rather than misread (§7). |
 | Index full | `_put_one` drops the put and logs (no crash). |
-| My regions full, pool has FREE regions | `heap.alloc()` claims a new region; no eviction (§4.1). |
+| My regions full, pool has FREE regions | `heaps.alloc()` claims a new region; no eviction (§4.1). |
 | Pool globally exhausted | Evict this node's coldest chunks and reuse a freed slot in place (§4.1). |
 | Pool exhausted + every cold slot pinned | Store (or whole batch) is dropped and logged; pinned chunks stay resident. |
-| Payload larger than a chunk | `ValueError`, slot released. |
+| Payload larger than `max_chunk_size_bytes` or `region_size` | `ValueError`, slot released. |
 | Lock-manager GIL starvation | Run the arbiter as the C sidecar (default). |
 | Stale generation after controller restart | Bump `generation` on init; the shared header's `gen` is the epoch checked by the cross-node push and slot reservation. |
 

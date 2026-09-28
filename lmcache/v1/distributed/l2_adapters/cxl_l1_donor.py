@@ -6,12 +6,13 @@ chunk's bytes from this node's local DRAM tier and copy them into a
 CXL chunk it then commits. In MP mode, "local DRAM tier" is the
 `L1Manager`. This module provides the bridge:
 
-    provider = L1LocalCopyProvider(l1_manager, metadata)
+    provider = L1LocalCopyProvider(l1_manager)
     cxl_donor = CXLDonor(..., local_copy_provider=provider)
 
 The provider's contract (see `cross_node.LocalCopyProvider`) is:
 
-    __call__(key_str: str) -> Optional[MemoryObj]
+    __call__(chunk_hash: bytes, model_name: str, kv_rank: int,
+             cache_salt: str) -> Optional[MemoryObj]
 
 Returning a MemoryObj implies the caller will eventually call
 `memory_obj.ref_count_down()`. We wrap the L1Manager's
@@ -29,34 +30,12 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l1_manager import L1Manager
-from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata
-from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
-
-
-def _cek_chunk_hash_to_objkey_bytes(chunk_hash: int) -> bytes:
-    """Recover the ObjectKey.chunk_hash bytes from a CacheEngineKey int.
-
-    The L2 adapter's `_object_key_to_chunk_hash` reinterprets the first
-    8 bytes of `ObjectKey.chunk_hash` as a little-endian unsigned u64
-    and stores that int as `CacheEngineKey.chunk_hash`. To recover the
-    original 8 bytes here, we reverse: write the int back as 8 bytes
-    little-endian unsigned. The bytes themselves are byte-order-
-    independent — only the integer interpretation differs.
-
-    NOTE: this round-trip is byte-exact only when the original
-    ObjectKey.chunk_hash is exactly 8 bytes (i.e. the hash algorithm
-    yields 64 bits). The builtin Python hash satisfies this. blake3 /
-    sha256 produce 32-byte digests that get truncated by the adapter,
-    so the donor cannot reconstruct them; lookup will fail-soft (None)
-    for those.
-    """
-    return chunk_hash.to_bytes(8, byteorder="little", signed=False)
 
 
 class _L1FinishReadOnDrop:
@@ -100,56 +79,52 @@ class _L1FinishReadOnDrop:
         try:
             self._l1.finish_read([self._obj_key])
         except Exception:
-            logger.exception(
-                "L1Manager.finish_read failed for %s", self._obj_key
-            )
+            logger.exception("L1Manager.finish_read failed for %s", self._obj_key)
 
 
 class L1LocalCopyProvider:
-    """Donor-side bridge: fetch a chunk from L1Manager by CacheEngineKey string.
+    """Donor-side bridge: fetch a chunk from L1Manager by ObjectKey identity.
 
     Passed to `CXLDonor` as its `local_copy_provider`. On each call:
-    1. Parse the wire-form CacheEngineKey string.
-    2. Recover the ObjectKey (chunk_hash bytes, model_name, kv_rank).
-    3. reserve_read on L1Manager. If miss, return None.
-    4. unsafe_read to get the underlying MemoryObj.
-    5. Wrap so that the donor's ref_count_down releases the L1 read lock.
+    1. Rebuild the ObjectKey from the identity the requester sent.
+    2. reserve_read on L1Manager. If miss, return None.
+    3. unsafe_read to get the underlying MemoryObj.
+    4. Wrap so that the donor's ref_count_down releases the L1 read lock.
 
-    The kv_rank is taken from `metadata` (the same LMCacheMetadata the
-    L2 adapter uses to bridge ObjectKey→CacheEngineKey on the requester
-    side). For TP=1 this is always 0.
+    The ObjectKey identity (chunk_hash bytes, model_name, kv_rank,
+    cache_salt) arrives over the wire from the requester rather than
+    being reconstructed locally: L1Manager is keyed on the full
+    ObjectKey, and the pool's u64 index hash is one-way. Taking
+    kv_rank from local `metadata` would also be wrong under TP>1,
+    where the requester may ask for any rank's shard, not this
+    donor's.
     """
 
-    def __init__(self, l1_manager: L1Manager, metadata: LMCacheMetadata):
+    def __init__(self, l1_manager: L1Manager):
         self._l1 = l1_manager
-        self._metadata = metadata
-        self._kv_rank = ObjectKey.ComputeKVRank(
-            world_size=metadata.world_size,
-            global_rank=metadata.worker_id,
-            local_world_size=metadata.local_world_size,
-            local_rank=metadata.local_worker_id,
-        )
 
-    def __call__(self, key_str: str) -> Optional[MemoryObj]:
+    def __call__(
+        self,
+        chunk_hash: bytes,
+        model_name: str,
+        kv_rank: int,
+        cache_salt: str,
+    ) -> Optional[MemoryObj]:
         try:
-            cek = CacheEngineKey.from_string(key_str)
-        except Exception:
-            logger.warning("could not parse CacheEngineKey: %s", key_str)
+            obj_key = ObjectKey(
+                chunk_hash=chunk_hash,
+                model_name=model_name,
+                kv_rank=kv_rank,
+                cache_salt=cache_salt,
+            )
+        except ValueError:
+            # ObjectKey enforces its own field invariants; a peer that
+            # sends something malformed is a miss, not a crash.
+            logger.warning(
+                "malformed ObjectKey identity from peer (model_name=%r)",
+                model_name,
+            )
             return None
-
-        if cek.model_name != self._metadata.model_name:
-            return None
-
-        try:
-            ch_bytes = _cek_chunk_hash_to_objkey_bytes(cek.chunk_hash)
-        except (OverflowError, ValueError):
-            return None
-
-        obj_key = ObjectKey(
-            chunk_hash=ch_bytes,
-            model_name=cek.model_name,
-            kv_rank=self._kv_rank,
-        )
 
         results = self._l1.reserve_read([obj_key])
         err, mem_obj = results.get(obj_key, (L1Error.KEY_NOT_EXIST, None))

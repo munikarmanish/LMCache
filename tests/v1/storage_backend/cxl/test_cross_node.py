@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cross-node CXL tests (step 6): two CXLBackends on the same pool.
+"""Cross-node CXL tests (step 6): two CXLStores on the same pool.
 
 These exercise:
 
@@ -14,10 +14,9 @@ These exercise:
 """
 
 # Standard
+from typing import Optional
 import os
 import tempfile
-import threading
-from typing import Optional
 
 # Third Party
 import numpy as np
@@ -25,7 +24,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
@@ -38,12 +37,7 @@ from lmcache.v1.storage_backend.cxl.cross_node import (
     PushStatus,
     remote_fetch,
 )
-from lmcache.v1.storage_backend.cxl.p2p_messages import (
-    PushKVToCXLMsg,
-    PushKVToCXLRetMsg,
-)
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
-
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -63,14 +57,13 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(h: int) -> CacheEngineKey:
+def _make_key(h: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=h.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=h,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -100,24 +93,24 @@ def two_node_pool():
         f.truncate(POOL_SIZE)
         path = f.name
 
-    cfg_a = CXLBackendConfig(
+    cfg_a = CXLStoreConfig(
         dev_path=path,
         node_id=0,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=True,
         run_lock_manager=True,
     )
-    cfg_b = CXLBackendConfig(
+    cfg_b = CXLStoreConfig(
         dev_path=path,
         node_id=1,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=False,
         run_lock_manager=False,
     )
-    a = CXLBackend(cfg_a, _metadata())
-    b = CXLBackend(cfg_b, _metadata())
+    a = CXLStore(cfg_a)
+    b = CXLStore(cfg_b)
     try:
         yield a, b
     finally:
@@ -132,6 +125,13 @@ def two_node_pool():
 # ---------- warm CXL: A writes, B reads ----------
 
 
+def _read(store, key, size: int = 4096):
+    """Read a chunk into a fresh buffer. Returns None on miss."""
+    buf = torch.empty(size, dtype=torch.uint8)
+    n = store.read_into(key, buf.data_ptr(), buf.numel())
+    return None if n == 0 else buf[:n]
+
+
 def test_node_b_reads_what_node_a_put_into_cxl(two_node_pool):
     """The defining CXL property: any peer can read a chunk A published.
 
@@ -142,14 +142,13 @@ def test_node_b_reads_what_node_a_put_into_cxl(two_node_pool):
     payload = (np.arange(2048, dtype=np.uint8) & 0xFF).astype(np.uint8)
     src = _make_source_obj(2048, fill_byte=0xCC)
     src.raw_data = torch.from_numpy(payload.copy())  # overwrite fill
-    a.batched_submit_put_task([key], [src])
+    a.put_batch([key], [src])
 
     # Node B sees the slot through its own attach.
     assert b.contains(key)
-    got = b.get_blocking(key)
+    got = _read(b, key)
     assert got is not None
-    np.testing.assert_array_equal(got.raw_data[:2048].numpy(), payload)
-    got.ref_count_down()
+    np.testing.assert_array_equal(got[:2048].numpy(), payload)
 
 
 def test_node_a_can_evict_after_node_b_releases_get(two_node_pool):
@@ -162,14 +161,17 @@ def test_node_a_can_evict_after_node_b_releases_get(two_node_pool):
     """
     a, b = two_node_pool
     key = _make_key(0xAA02)
-    a.batched_submit_put_task([key], [_make_source_obj(512, 0x11)])
+    a.put_batch([key], [_make_source_obj(512, 0x11)])
 
-    held = b.get_blocking(key)
-    assert held is not None
-    # B is holding a ref; A's remove must refuse.
+    # B reads the chunk A wrote — the read completes and releases its own
+    # ref before returning, so it does not itself block eviction.
+    assert _read(b, key) is not None
+
+    # B pins across a lookup->retrieve window; A's remove must refuse.
+    assert b.pin(key)
     assert not a.remove(key)
-    held.ref_count_down()
-    # Now A can evict.
+    # Once B unpins, A can evict.
+    assert b.unpin(key)
     assert a.remove(key)
 
 
@@ -184,16 +186,29 @@ class _FakeLocalTier:
     """
 
     def __init__(self):
-        self._store: dict[str, tuple[bytes, MemoryFormat]] = {}
+        self._store: dict[ObjectKey, tuple[bytes, MemoryFormat]] = {}
 
-    def put(self, key: CacheEngineKey, payload: bytes, fmt=MemoryFormat.KV_2LTD):
-        self._store[key.to_string()] = (payload, fmt)
+    def put(self, key: ObjectKey, payload: bytes, fmt=MemoryFormat.KV_2LTD):
+        self._store[key] = (payload, fmt)
 
-    def evict(self, key: CacheEngineKey):
-        self._store.pop(key.to_string(), None)
+    def evict(self, key: ObjectKey):
+        self._store.pop(key, None)
 
-    def __call__(self, key_str: str) -> Optional[MemoryObj]:
-        record = self._store.get(key_str)
+    def __call__(
+        self,
+        chunk_hash: bytes,
+        model_name: str,
+        kv_rank: int,
+        cache_salt: str,
+    ) -> Optional[MemoryObj]:
+        record = self._store.get(
+            ObjectKey(
+                chunk_hash=chunk_hash,
+                model_name=model_name,
+                kv_rank=kv_rank,
+                cache_salt=cache_salt,
+            )
+        )
         if record is None:
             return None
         payload, fmt = record
@@ -211,12 +226,12 @@ class _FakeLocalTier:
         return TensorMemoryObj(raw_data=data, metadata=meta, parent_allocator=None)
 
 
-def _build_donor(backend: CXLBackend, local: _FakeLocalTier) -> CXLDonor:
+def _build_donor(backend: CXLStore, local: _FakeLocalTier) -> CXLDonor:
     return CXLDonor(
-        handle=backend._pool,
-        index_writer=backend._index_writer,
-        heap=backend._heap,
-        node_id=backend._node_id,
+        handle=backend.pool,
+        index_writer=backend.index_writer,
+        heaps=backend.heaps,
+        node_id=backend.node_id,
         local_copy_provider=local,
     )
 
@@ -228,31 +243,31 @@ def test_remote_fetch_publishes_donor_local_copy_into_cxl(two_node_pool):
 
     keys = [_make_key(0xBB01 + i) for i in range(3)]
     payloads = [bytes([i & 0xFF] * 1024) for i in range(3)]
-    for k, p in zip(keys, payloads):
-        a_local.put(k, p)
+    for ok, p in zip(keys, payloads):
+        a_local.put(ok, p)
 
     # B starts cold — no CXL_LOOKUP hits.
     assert all(not b.contains(k) for k in keys)
 
     # B runs the cold-path fallback, asking A to push.
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 3
     assert result.status == PushStatus.OK
 
     # Now B's CXL_LOOKUP hits all three.
     for i, k in enumerate(keys):
-        got = b.get_blocking(k)
+        got = _read(b, k)
         assert got is not None
-        assert int(got.raw_data[0]) == i
-        got.ref_count_down()
+        assert int(got[0]) == i
 
 
 def test_remote_fetch_truncates_when_donor_evicted_some(two_node_pool):
@@ -267,13 +282,14 @@ def test_remote_fetch_truncates_when_donor_evicted_some(two_node_pool):
     a_local.put(keys[1], payloads[1])
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     # Donor's local hit prefix is 2 → status PARTIAL.
     assert result.num_satisfied == 2
@@ -292,13 +308,14 @@ def test_remote_fetch_all_nack_when_donor_has_nothing(two_node_pool):
 
     keys = [_make_key(0xBB20 + i) for i in range(2)]
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 0
     assert result.status == PushStatus.ALL_NACK
@@ -312,14 +329,15 @@ def test_remote_fetch_rejects_stale_epoch(two_node_pool):
 
     key = _make_key(0xBB30)
     a_local.put(key, b"x" * 256)
-    real_epoch = int(b._pool.header.gen)
+    real_epoch = int(b.pool.header.gen)
 
     # Pass a deliberately-stale epoch (real_epoch - 1).
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=[key],
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
         epoch=real_epoch - 1,
@@ -342,18 +360,19 @@ def test_remote_fetch_skips_keys_already_in_cxl(two_node_pool):
     a_donor = _build_donor(a, a_local)
 
     key = _make_key(0xBB40)
-    a.batched_submit_put_task([key], [_make_source_obj(512, 0x77)])
+    a.put_batch([key], [_make_source_obj(512, 0x77)])
 
     # We don't even need to put it in a_local — the requester sees
     # ALREADY_PRESENT and short-circuits.
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=[key],
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 1
     # No DMA happened, but we still consider the prefix satisfied.
@@ -375,19 +394,20 @@ def test_remote_fetch_releases_slots_when_donor_partial(two_node_pool):
     a_local.put(keys[0], b"\x10" * 256)  # only 1 of 3
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 1
     # B can now put fresh data for the un-fetched keys without
     # tripping ALREADY_PRESENT or running out of slots.
     src = _make_source_obj(256, 0x99)
-    b.batched_submit_put_task(keys[1:], [_make_source_obj(256, 0x99) for _ in range(2)])
+    b.put_batch(keys[1:], [_make_source_obj(256, 0x99) for _ in range(2)])
     for k in keys[1:]:
         assert b.contains(k)
 
@@ -395,12 +415,12 @@ def test_remote_fetch_releases_slots_when_donor_partial(two_node_pool):
 # ---------- commit-with-pin (born-pinned cross-node fetch) ----------
 
 
-def _pin_count(backend: CXLBackend, key: CacheEngineKey) -> int:
+def _pin_count(backend: CXLStore, key: ObjectKey) -> int:
     """Read the on-CXL pin_count for ``key`` (-1 if no VALID slot)."""
-    view = backend._index.lookup(key)
-    if view is None:
+    slot_idx = backend.slot_index_of(key)
+    if slot_idx is None:
         return -1
-    return int(backend._pool.slots()[view.slot_idx].line1.pin_count)
+    return int(backend.pool.slots()[slot_idx].line1.pin_count)
 
 
 def test_remote_fetch_commits_born_pinned(two_node_pool):
@@ -419,13 +439,14 @@ def test_remote_fetch_commits_born_pinned(two_node_pool):
         a_local.put(k, bytes([i & 0xFF] * 1024))
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 3
     assert result.status == PushStatus.OK
@@ -449,13 +470,14 @@ def test_born_pinned_slot_survives_eviction(two_node_pool):
     a_local.put(key, b"\x5a" * 1024)
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=[key],
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 1
     assert _pin_count(b, key) == 1
@@ -482,17 +504,18 @@ def test_already_present_slot_not_born_pinned(two_node_pool):
     a_donor = _build_donor(a, a_local)
 
     key = _make_key(0xCC30)
-    a.batched_submit_put_task([key], [_make_source_obj(512, 0x77)])
+    a.put_batch([key], [_make_source_obj(512, 0x77)])
     assert _pin_count(b, key) == 0  # warm put leaves it unpinned
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=[key],
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 1
     assert result.born_pinned == [False]
@@ -515,13 +538,14 @@ def test_partial_fetch_does_not_leave_pinned_uncommitted_slots(two_node_pool):
     a_local.put(keys[0], b"\x10" * 256)  # only 1 of 3
 
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == 1
     assert result.born_pinned == [True]
@@ -548,15 +572,16 @@ def test_batched_alloc_multi_chunk_fetch(two_node_pool):
     for i, k in enumerate(keys):
         a_local.put(k, bytes([i & 0xFF] * 2048))
 
-    used_before = a._heap.stats().total_slots - a._heap.stats().free_slots
+    used_before = a.heaps.total_stats().total_slots - a.heaps.total_stats().free_slots
     result = remote_fetch(
-        requester_node_id=b._node_id,
+        requester_node_id=b.node_id,
         keys=keys,
-        index_writer=b._index_writer,
-        donor_node_id=a._node_id,
+        tenant_digest_fn=b.tenant_digest_for,
+        index_writer=b.index_writer,
+        donor_node_id=a.node_id,
         donor=a_donor,
         sender_id="node-b",
-        epoch=int(b._pool.header.gen),
+        epoch=int(b.pool.header.gen),
     )
     assert result.num_satisfied == n
     assert result.status == PushStatus.OK
@@ -564,14 +589,13 @@ def test_batched_alloc_multi_chunk_fetch(two_node_pool):
 
     # The donor consumed exactly n chunks for the committed batch (used-slot
     # count grew by n, regardless of lazy region claims).
-    stats = a._heap.stats()
+    stats = a.heaps.total_stats()
     assert stats.total_slots - stats.free_slots == used_before + n
 
     # B reads every chunk back with the right payload, and each is pinned.
     for i, k in enumerate(keys):
         assert b.contains(k)
         assert _pin_count(b, k) == 1
-        got = b.get_blocking(k)
+        got = _read(b, k)
         assert got is not None
-        assert int(got.raw_data[0]) == (i & 0xFF)
-        got.ref_count_down()
+        assert int(got[0]) == (i & 0xFF)

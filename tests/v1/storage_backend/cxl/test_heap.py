@@ -24,7 +24,6 @@ from lmcache.v1.storage_backend.cxl.regions import (
     RegionAllocator,
 )
 
-
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)  # 2 MiB per region
 CHUNK_SIZE = 64 * 1024  # 64 KiB per chunk → 32 chunks per region
@@ -48,10 +47,8 @@ def ctx():
     with tempfile.NamedTemporaryFile(prefix="cxl-heap-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
-    cfg = CXLBootstrapConfig(
-        dev_path=path, region_size=REGION_SIZE, initialize=True
-    )
-    handle = bootstrap_pool(cfg, _metadata())
+    cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
+    handle = bootstrap_pool(cfg)
     lock = TwoTierLock(handle, node_id=0)
     alloc = RegionAllocator(handle, lock)
     mgr = LockManager(handle)
@@ -70,10 +67,27 @@ def ctx():
 # ---------- init ----------
 
 
-def test_heap_rejects_non_divisible_chunk_size(ctx):
+def test_heap_accepts_non_divisible_chunk_size(ctx):
+    """A chunk size need not divide region_size; the tail is left unused.
+
+    Exact-fit classes are the point of the multi-geometry heap: rounding
+    the size up to divide evenly would waste space in every chunk, where
+    the tail wastes at most one slot per region.
+    """
     _, alloc = ctx
-    with pytest.raises(ValueError, match="does not evenly divide"):
-        NodeHeap(alloc, node_id=0, chunk_size=REGION_SIZE - 1)
+    odd = (REGION_SIZE // 3) + 1  # divides neither evenly nor by a power of 2
+    heap = NodeHeap(alloc, node_id=0, chunk_size=odd)
+    assert heap.slots_per_region == REGION_SIZE // odd
+    # The carved slots all fit inside one region.
+    off = heap.alloc()
+    assert off + odd <= alloc.handle.layout.off_regions + REGION_SIZE
+
+
+def test_heap_rejects_chunk_larger_than_region(ctx):
+    """A chunk cannot span regions, so an oversize class fails loudly."""
+    _, alloc = ctx
+    with pytest.raises(ValueError, match="exceeds region_size"):
+        NodeHeap(alloc, node_id=0, chunk_size=REGION_SIZE + 1)
 
 
 def test_heap_rejects_zero_chunk_size(ctx):
@@ -175,10 +189,7 @@ def test_allocated_offset_points_into_claimed_region(ctx):
     heap = NodeHeap(alloc, node_id=0, chunk_size=CHUNK_SIZE)
     off = heap.alloc()
     region_id = heap.owned_regions()[0]
-    region_base = (
-        heap._regions._handle.layout.off_regions
-        + region_id * REGION_SIZE
-    )
+    region_base = heap._regions._handle.layout.off_regions + region_id * REGION_SIZE
     assert region_base <= off < region_base + REGION_SIZE
 
 

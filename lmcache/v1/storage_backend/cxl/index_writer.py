@@ -33,15 +33,14 @@ isn't claimed yet and the local-tier mutex still serializes reservers.
 """
 
 # Standard
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 import ctypes
 import enum
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend.cxl.bootstrap import PoolHandle
 from lmcache.v1.storage_backend.cxl.fence import Fence, default_fence
@@ -138,12 +137,14 @@ class CXLIndexWriter:
 
     # -------- reserve / commit ------------------------------------------
 
-    def reserve_slot(self, key: CacheEngineKey) -> ReserveResult:
+    def reserve_slot(self, chunk_hash: int, tenant_digest: bytes) -> ReserveResult:
         """Reserve a slot for the local node. See `_reserve_slot_with_owner`."""
-        return self._reserve_slot_with_owner(key, owner_node_id=self._node_id)
+        return self._reserve_slot_with_owner(
+            chunk_hash, tenant_digest, owner_node_id=self._node_id
+        )
 
     def reserve_slot_for_donor(
-        self, key: CacheEngineKey, donor_node_id: int
+        self, chunk_hash: int, tenant_digest: bytes, donor_node_id: int
     ) -> ReserveResult:
         """Reserve a slot on behalf of a peer (the future donor of a push).
 
@@ -152,11 +153,82 @@ class CXLIndexWriter:
         then asks the donor to commit them. If the donor crashes or
         NACKs, the requester calls `release_slot_for_donor` to
         return the slot to EMPTY.
+
+        Prefer :meth:`reserve_slot_for_donor_batch` when reserving more than
+        one key: this method takes one distributed-lock acquisition, i.e. one
+        arbiter sweep, per call.
         """
-        return self._reserve_slot_with_owner(key, owner_node_id=donor_node_id)
+        return self._reserve_slot_with_owner(
+            chunk_hash, tenant_digest, owner_node_id=donor_node_id
+        )
+
+    def reserve_slot_for_donor_batch(
+        self,
+        chunk_hashes: List[int],
+        tenant_digests: List[bytes],
+        donor_node_id: int,
+    ) -> List[ReserveResult]:
+        """Reserve slots for many keys under a single batched lock acquisition.
+
+        Equivalent to calling :meth:`reserve_slot_for_donor` per key, but
+        acquires all the distinct start-slot locks together (see
+        :meth:`TwoTierLock.acquire_batch`) so the whole batch is granted in
+        ~one arbiter sweep instead of one sweep per key.
+
+        This is the dominant cost of the cross-node fetch at long prompts:
+        each acquisition waits ~half an arbiter sweep, so a 117-chunk prompt
+        paid ~117 sweeps (measured 91.7 ms) where the batched form pays ~1.
+
+        **Locking is per-key-identical to the single-key path.** Each key's
+        probe chain is governed by the lock for *its own* start slot, exactly
+        as in :meth:`_reserve_slot_with_owner`; batching only changes how those
+        locks are acquired (together, in ascending ``lock_id`` order, so two
+        batch callers cannot deadlock). Keys whose start slots map to the same
+        ``lock_id`` are naturally covered by that single lock.
+
+        Unlike the single-key method, results are reported per key rather than
+        terminating the batch: a caller wanting the old "stop at the first
+        non-reservable key" behavior computes that prefix from the returned
+        list (see ``remote_fetch``). This matches ``commit_slot_batch``'s
+        report-per-slot contract.
+
+        Args:
+            chunk_hashes: Index hashes to reserve, in order.
+            tenant_digests: The 16-byte tenant discriminator for each
+                hash, positionally matching ``chunk_hashes``.
+            donor_node_id: Node id stamped as ``owner_node_id`` on each
+                claimed slot.
+
+        Returns:
+            One :class:`ReserveResult` per hash, parallel to ``chunk_hashes``.
+
+        Raises:
+            ValueError: If the two input lists differ in length.
+        """
+        if len(tenant_digests) != len(chunk_hashes):
+            raise ValueError(
+                f"reserve_slot_for_donor_batch: {len(chunk_hashes)} hashes "
+                f"vs {len(tenant_digests)} tenant_digests"
+            )
+        n = len(chunk_hashes)
+        if n == 0:
+            return []
+
+        needles = [h & 0xFFFFFFFFFFFFFFFF for h in chunk_hashes]
+        starts = [h % self._slot_count for h in needles]
+        lock_ids = [self._lock_id_for_slot(s) for s in starts]
+        results: List[ReserveResult] = []
+        with self._lock.acquire_batch(lock_ids):
+            for needle, digest, start in zip(
+                needles, tenant_digests, starts, strict=True
+            ):
+                results.append(
+                    self._probe_and_claim_locked(needle, digest, start, donor_node_id)
+                )
+        return results
 
     def _reserve_slot_with_owner(
-        self, key: CacheEngineKey, owner_node_id: int
+        self, chunk_hash: int, tenant_digest: bytes, owner_node_id: int
     ) -> ReserveResult:
         """Atomically claim a slot for writing `key`.
 
@@ -170,75 +242,95 @@ class CXLIndexWriter:
             of writing this same key. Caller polls and retries.
           * INDEX_FULL + None — probe exhausted with no reusable slot.
         """
-        needle = key.chunk_hash & 0xFFFFFFFFFFFFFFFF
+        needle = chunk_hash & 0xFFFFFFFFFFFFFFFF
         start = needle % self._slot_count
+
+        # A single acquisition at `start`'s lock_id serializes concurrent
+        # reserves for any key that starts at the same slot. Different
+        # start-slots with unrelated hashes don't collide.
+        #
+        # Correctness argument: all reservers for `key` start at `start`, so
+        # they serialize on that one lock. The probe chain from `start` is
+        # atomic from the reserver's POV because writers never *move* slots
+        # sideways — a slot only transitions in place.
+        with self._lock.acquire(self._lock_id_for_slot(start)):
+            return self._probe_and_claim_locked(
+                needle, tenant_digest, start, owner_node_id
+            )
+
+    def _probe_and_claim_locked(
+        self, needle: int, tenant_digest: bytes, start: int, owner_node_id: int
+    ) -> ReserveResult:
+        """Walk the probe chain from ``start`` and claim a slot if possible.
+
+        The body shared by :meth:`_reserve_slot_with_owner` (one lock) and
+        :meth:`reserve_slot_for_donor_batch` (one batched acquisition).
+
+        **The caller MUST hold the lock for ``start``'s ``lock_id``.** This
+        method takes no locks of its own.
+
+        Args:
+            needle: The u64 index hash being reserved, already masked.
+            tenant_digest: The 16-byte tenant discriminator to stamp.
+            start: Its probe-chain start slot (``needle % slot_count``).
+            owner_node_id: Node id to stamp on a claimed slot.
+
+        Returns:
+            The reserve outcome for this hash (see
+            :meth:`_reserve_slot_with_owner` for the outcome semantics).
+        """
         first_tomb: Optional[int] = None
 
-        # Take the lock for the first probe position. If we can't
-        # claim there, we'll release and retry with the next position's
-        # lock. This keeps the critical section small while guaranteeing
-        # only one reserver per (key, slot-range) at a time. Simple
-        # global serialization under one lock is possible but wastes
-        # the sharded lock array.
-        #
-        # Correctness argument: all reservers for `key` start at
-        # `start`; they serialize on the lock for `start`. A reserver
-        # that needs to look past `start` holds locks as it goes,
-        # ensuring no peer re-examines a slot we've already passed.
-        locks_held = []  # list of lock_ids held, in acquisition order
+        self._fence.flush_before_read(
+            self._slots_base_addr + start * self._slot_size,
+            self._max_probe * self._slot_size,
+        )
+        for step in range(self._max_probe):
+            slot_idx = (start + step) % self._slot_count
+            line0 = self._slots[slot_idx].line0
+            state = line0.state
 
-        def _release_all():
-            for lid in reversed(locks_held):
-                # Each held lock's critical section belongs to this call
-                # tree; we release them via the managed context below.
-                pass
-
-        # We use a single acquisition at `start`'s lock_id — this
-        # serializes concurrent reserves for any key that starts at
-        # the same slot. Different start-slots with unrelated hashes
-        # don't collide. This is a simplification vs. the plan's
-        # per-slot locking walk but is correct as long as the probe
-        # chain from `start` is atomic from the reserver's POV, which
-        # it is because writers never *move* slots sideways.
-        with self._lock.acquire(self._lock_id_for_slot(start)):
-            self._fence.flush_before_read(
-                self._slots_base_addr + start * self._slot_size,
-                self._max_probe * self._slot_size,
-            )
-            for step in range(self._max_probe):
-                slot_idx = (start + step) % self._slot_count
-                line0 = self._slots[slot_idx].line0
-                state = line0.state
-
-                if state == SLOT_STATE_VALID and line0.chunk_hash == needle:
-                    # Match. Defensive generation/geom check.
-                    if line0.generation == self._handle.header.gen and bytes(
-                        line0.geom_hash
-                    ) == bytes(self._handle.header.geom_hash):
-                        return ReserveResult(ReserveOutcome.ALREADY_PRESENT, slot_idx)
-                    # Stale slot with matching hash — treat as TOMB
-                    # candidate. We'll overwrite it.
+            if state == SLOT_STATE_VALID and line0.chunk_hash == needle:
+                if (
+                    line0.generation == self._handle.header.gen
+                    and bytes(line0.geom_hash) == tenant_digest
+                ):
+                    return ReserveResult(ReserveOutcome.ALREADY_PRESENT, slot_idx)
+                if line0.generation != self._handle.header.gen:
+                    # Stale generation — reusable as a TOMB candidate.
                     if first_tomb is None:
                         first_tomb = slot_idx
+                # Otherwise a *different tenant* collided on this u64 and
+                # legitimately owns this slot. Keep probing; do NOT claim it.
 
-                if state == SLOT_STATE_ALLOCATING and line0.chunk_hash == needle:
-                    return ReserveResult(ReserveOutcome.WAIT_FOR_OTHER, slot_idx)
+            if (
+                state == SLOT_STATE_ALLOCATING
+                and line0.chunk_hash == needle
+                and bytes(line0.geom_hash) == tenant_digest
+            ):
+                return ReserveResult(ReserveOutcome.WAIT_FOR_OTHER, slot_idx)
 
-                if state == SLOT_STATE_EMPTY:
-                    target = first_tomb if first_tomb is not None else slot_idx
-                    self._claim(target, key.chunk_hash, owner_node_id)
-                    return ReserveResult(ReserveOutcome.RESERVED, target)
+            if state == SLOT_STATE_EMPTY:
+                target = first_tomb if first_tomb is not None else slot_idx
+                self._claim(target, needle, tenant_digest, owner_node_id)
+                return ReserveResult(ReserveOutcome.RESERVED, target)
 
-                if state == SLOT_STATE_TOMB and first_tomb is None:
-                    first_tomb = slot_idx
+            if state == SLOT_STATE_TOMB and first_tomb is None:
+                first_tomb = slot_idx
 
-            # Probe exhausted.
-            if first_tomb is not None:
-                self._claim(first_tomb, key.chunk_hash, owner_node_id)
-                return ReserveResult(ReserveOutcome.RESERVED, first_tomb)
-            return ReserveResult(ReserveOutcome.INDEX_FULL, None)
+        # Probe exhausted.
+        if first_tomb is not None:
+            self._claim(first_tomb, needle, tenant_digest, owner_node_id)
+            return ReserveResult(ReserveOutcome.RESERVED, first_tomb)
+        return ReserveResult(ReserveOutcome.INDEX_FULL, None)
 
-    def _claim(self, slot_idx: int, chunk_hash: int, owner_node_id: int) -> None:
+    def _claim(
+        self,
+        slot_idx: int,
+        chunk_hash: int,
+        tenant_digest: bytes,
+        owner_node_id: int,
+    ) -> None:
         """Write ALLOCATING to `slot_idx`. Caller holds the slot's lock."""
         slot = self._slots[slot_idx]
         slot.line0.chunk_hash = chunk_hash & 0xFFFFFFFFFFFFFFFF
@@ -247,11 +339,7 @@ class CXLIndexWriter:
         slot.line0.fmt = MemoryFormat.UNDEFINED.value
         slot.line0.owner_node_id = owner_node_id
         slot.line0.generation = self._handle.header.gen
-        ctypes.memmove(
-            slot.line0.geom_hash,
-            bytes(self._handle.header.geom_hash),
-            GEOM_HASH_SIZE,
-        )
+        ctypes.memmove(slot.line0.geom_hash, tenant_digest, GEOM_HASH_SIZE)
         # Publish ALLOCATING last so readers see it as a single
         # cacheline transition from EMPTY/TOMB → ALLOCATING.
         slot.line0.state = SLOT_STATE_ALLOCATING
@@ -744,7 +832,7 @@ class CXLIndexWriter:
         """Evict every VALID slot this node owns, returning their offsets.
 
         Bulk counterpart of :meth:`evict` for a full node clear (see
-        ``CXLBackend.clear``). Scans the whole slot array once and, for each
+        ``CXLStore.clear``). Scans the whole slot array once and, for each
         VALID slot whose ``owner_node_id`` matches this node, flips it to TOMB
         under the slot lock and collects its ``chunk_offset`` so the caller can
         free the chunk from the node heap. Slots owned by other nodes (donor
@@ -754,7 +842,7 @@ class CXLIndexWriter:
         Busy slots are skipped, never force-freed: a slot with
         ``ref_count > 0`` (in-flight GET/GPU copy) or ``pin_count > 0`` stays
         VALID and is counted in the returned skip total. This matches
-        :meth:`evict`/``CXLBackend.remove`` semantics, so a concurrent read is
+        :meth:`evict`/``CXLStore.remove`` semantics, so a concurrent read is
         never invalidated underneath the reader.
 
         A single bulk fence-before-read primes the whole slot array up front

@@ -12,18 +12,17 @@ from lmcache.v1.storage_backend.cxl.layout import (
     CACHELINE_SIZE,
     GEOM_HASH_SIZE,
     HEADER_SIZE,
-    Header,
-    LockSlot,
     MAGIC,
     OWNER_FREE,
+    SLOT_STATE_EMPTY,
+    Header,
+    LockSlot,
     PoolLayout,
     RegionDesc,
-    SLOT_STATE_EMPTY,
     Slot,
     SlotLine0,
     SlotLine1,
 )
-
 
 # ---------- struct sizing invariants ----------
 
@@ -54,9 +53,7 @@ def test_slot_line0_field_layout_matches_plan():
 
 def _compute(pool_size, region_size=1 << 20, **kw):
     """Small helper: most tests use 1 MiB regions."""
-    return PoolLayout.compute(
-        pool_size=pool_size, region_size=region_size, **kw
-    )
+    return PoolLayout.compute(pool_size=pool_size, region_size=region_size, **kw)
 
 
 def test_planner_rejects_nonpow2_region_size():
@@ -94,9 +91,7 @@ def test_planner_sized_for_realistic_64gib_pool():
     # Plan's reference sizing table: 64 GiB pool, 256 MiB regions,
     # should yield hundreds of regions.
     region_size = 256 * (1 << 20)
-    layout = PoolLayout.compute(
-        pool_size=64 * (1 << 30), region_size=region_size
-    )
+    layout = PoolLayout.compute(pool_size=64 * (1 << 30), region_size=region_size)
     # Expect ~255 regions (not quite 256 because of metadata overhead).
     assert 200 <= layout.region_count <= 256
 
@@ -125,13 +120,14 @@ def test_write_and_read_back_header():
     buf, base = _make_buffer(layout.pool_size)
     header = Header.from_address(base)
 
-    geom = bytes(range(GEOM_HASH_SIZE))
-    layout.write_to_header(header, geom, gen=7)
+    layout.write_to_header(header, gen=7)
 
     # Header reads back exactly.
     assert header.magic == MAGIC
     assert header.gen == 7
-    assert bytes(header.geom_hash) == geom
+    # The pool carries no model identity as of LAYOUT_VERSION 2: tenant
+    # identity is per slot, so the header's copy is written as zeroes.
+    assert bytes(header.geom_hash) == b"\x00" * GEOM_HASH_SIZE
     assert header.region_size == layout.region_size
     assert header.region_count == layout.region_count
     assert header.pool_size == layout.pool_size
@@ -144,19 +140,11 @@ def test_write_and_read_back_header():
     assert layout2.index_slot_count == layout.index_slot_count
 
 
-def test_write_header_rejects_wrong_geom_hash_size():
-    layout = _compute(pool_size=64 * (1 << 20))
-    buf, base = _make_buffer(layout.pool_size)
-    header = Header.from_address(base)
-    with pytest.raises(ValueError):
-        layout.write_to_header(header, b"too-short", gen=1)
-
-
 def test_validate_against_detects_magic_mismatch():
     layout = _compute(pool_size=64 * (1 << 20))
     buf, base = _make_buffer(layout.pool_size)
     header = Header.from_address(base)
-    layout.write_to_header(header, b"\x00" * GEOM_HASH_SIZE, gen=1)
+    layout.write_to_header(header, gen=1)
     header.magic = 0xDEADBEEF
     with pytest.raises(ValueError, match="bad magic"):
         layout.validate_against(header)
@@ -166,7 +154,7 @@ def test_validate_against_detects_region_size_mismatch():
     layout = _compute(pool_size=64 * (1 << 20))
     buf, base = _make_buffer(layout.pool_size)
     header = Header.from_address(base)
-    layout.write_to_header(header, b"\x00" * GEOM_HASH_SIZE, gen=1)
+    layout.write_to_header(header, gen=1)
     header.region_size = layout.region_size * 2
     with pytest.raises(ValueError, match="region_size mismatch"):
         layout.validate_against(header)
@@ -177,6 +165,7 @@ def test_validate_against_detects_region_size_mismatch():
 
 def test_owner_free_distinct_from_orphaned():
     # If these ever collide with a real node id someone will be very sad.
+    # First Party
     from lmcache.v1.storage_backend.cxl.layout import OWNER_ORPHANED
 
     assert OWNER_FREE != OWNER_ORPHANED

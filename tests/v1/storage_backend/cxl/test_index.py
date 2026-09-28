@@ -19,28 +19,26 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.bootstrap import (
     CXLBootstrapConfig,
     bootstrap_pool,
-    compute_geom_hash,
 )
 from lmcache.v1.storage_backend.cxl.index import (
-    CXLIndex,
     DEFAULT_MAX_PROBE,
+    CXLIndex,
     SlotView,
     _slot_probe_order,
 )
 from lmcache.v1.storage_backend.cxl.layout import (
     GEOM_HASH_SIZE,
     SLOT_STATE_ALLOCATING,
-    SLOT_STATE_EMPTY,
     SLOT_STATE_TOMB,
     SLOT_STATE_VALID,
 )
-
+from lmcache.v1.storage_backend.cxl.store import object_key_to_chunk_hash
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -67,7 +65,7 @@ def handle():
     cfg = CXLBootstrapConfig(
         dev_path=path, region_size=REGION_SIZE, initialize=True, generation=7
     )
-    h = bootstrap_pool(cfg, _metadata())
+    h = bootstrap_pool(cfg)
     try:
         yield h
     finally:
@@ -78,15 +76,25 @@ def handle():
             pass
 
 
-def _make_key(chunk_hash: int) -> CacheEngineKey:
+def _make_hash(h: int) -> int:
+    """The u64 index hash the store derives for `_make_key(h)`."""
+    return object_key_to_chunk_hash(_make_key(h))
+
+
+def _make_key(chunk_hash: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=chunk_hash.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=chunk_hash,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
+
+
+# All slots and lookups in this file use one tenant unless a test
+# deliberately varies it, so a fixed digest keeps the probe logic the
+# subject of the test rather than the digest derivation.
+TENANT = bytes(range(GEOM_HASH_SIZE))
 
 
 def _write_slot(
@@ -110,10 +118,8 @@ def _write_slot(
     slot.line0.state = state
     slot.line0.fmt = fmt
     slot.line0.owner_node_id = owner
-    slot.line0.generation = (
-        generation if generation is not None else handle.header.gen
-    )
-    gh = geom_hash if geom_hash is not None else bytes(handle.header.geom_hash)
+    slot.line0.generation = generation if generation is not None else handle.header.gen
+    gh = geom_hash if geom_hash is not None else TENANT
     assert len(gh) == GEOM_HASH_SIZE
     ctypes.memmove(slot.line0.geom_hash, gh, GEOM_HASH_SIZE)
 
@@ -137,26 +143,26 @@ def test_probe_order_starts_at_hash_mod_n():
 
 def test_empty_index_lookup_misses(handle):
     idx = CXLIndex(handle)
-    assert idx.lookup(_make_key(0x1234)) is None
+    assert idx.lookup_by_hash(_make_hash(0x1234), TENANT) is None
 
 
 def test_valid_slot_hit(handle):
     idx = CXLIndex(handle)
-    key = _make_key(0xCAFEBABE)
-    slot_idx = key.chunk_hash % idx.slot_count
+    key = _make_hash(0xCAFEBABE)
+    slot_idx = key % idx.slot_count
     _write_slot(
         handle,
         slot_idx,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
         chunk_offset=1024,
         chunk_len=512,
     )
-    view = idx.lookup(key)
+    view = idx.lookup_by_hash(key, TENANT)
     assert view is not None
     assert isinstance(view, SlotView)
     assert view.slot_idx == slot_idx
-    assert view.chunk_hash == key.chunk_hash
+    assert view.chunk_hash == key
     assert view.chunk_offset == 1024
     assert view.chunk_len == 512
     assert view.state == SLOT_STATE_VALID
@@ -170,31 +176,31 @@ def test_empty_slot_terminates_probe(handle):
     been the target of this probe chain — it's for some other hash.
     """
     idx = CXLIndex(handle)
-    key = _make_key(1)
-    start = key.chunk_hash % idx.slot_count
+    key = _make_hash(1)
+    start = key % idx.slot_count
     # Leave slot `start` empty; place the key two slots later.
     _write_slot(
         handle,
         (start + 2) % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
     )
-    assert idx.lookup(key) is None
+    assert idx.lookup_by_hash(key, TENANT) is None
 
 
 def test_tomb_slot_is_skipped(handle):
     """TOMB does not terminate probing — a real hit can follow."""
     idx = CXLIndex(handle)
-    key = _make_key(2)
-    start = key.chunk_hash % idx.slot_count
+    key = _make_hash(2)
+    start = key % idx.slot_count
     _write_slot(handle, start, chunk_hash=0, state=SLOT_STATE_TOMB)
     _write_slot(
         handle,
         (start + 1) % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
     )
-    view = idx.lookup(key)
+    view = idx.lookup_by_hash(key, TENANT)
     assert view is not None
     assert view.slot_idx == (start + 1) % idx.slot_count
 
@@ -207,16 +213,16 @@ def test_allocating_slot_is_skipped(handle):
     from an uninitialized chunk.
     """
     idx = CXLIndex(handle)
-    key = _make_key(3)
-    start = key.chunk_hash % idx.slot_count
-    _write_slot(handle, start, chunk_hash=key.chunk_hash, state=SLOT_STATE_ALLOCATING)
+    key = _make_hash(3)
+    start = key % idx.slot_count
+    _write_slot(handle, start, chunk_hash=key, state=SLOT_STATE_ALLOCATING)
     _write_slot(
         handle,
         (start + 1) % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
     )
-    view = idx.lookup(key)
+    view = idx.lookup_by_hash(key, TENANT)
     assert view is not None
     assert view.slot_idx == (start + 1) % idx.slot_count
 
@@ -224,20 +230,18 @@ def test_allocating_slot_is_skipped(handle):
 def test_different_hash_on_probe_chain_is_skipped(handle):
     """Wrong-hash VALID slots don't cause false hits; probing continues."""
     idx = CXLIndex(handle)
-    target = _make_key(4)
-    intruder = _make_key(4 + idx.slot_count)  # same slot, different hash
-    start = target.chunk_hash % idx.slot_count
+    target = _make_hash(4)
+    intruder = _make_hash(4 + idx.slot_count)  # same slot, different hash
+    start = target % idx.slot_count
     # Intruder sits at `start`, target one after.
-    _write_slot(
-        handle, start, chunk_hash=intruder.chunk_hash, state=SLOT_STATE_VALID
-    )
+    _write_slot(handle, start, chunk_hash=intruder, state=SLOT_STATE_VALID)
     _write_slot(
         handle,
         (start + 1) % idx.slot_count,
-        chunk_hash=target.chunk_hash,
+        chunk_hash=target,
         state=SLOT_STATE_VALID,
     )
-    view = idx.lookup(target)
+    view = idx.lookup_by_hash(target, TENANT)
     assert view is not None
     assert view.slot_idx == (start + 1) % idx.slot_count
 
@@ -248,17 +252,17 @@ def test_different_hash_on_probe_chain_is_skipped(handle):
 def test_stale_generation_slot_is_skipped(handle):
     """A slot with an older generation is a fossil from a previous pool epoch."""
     idx = CXLIndex(handle)
-    key = _make_key(5)
-    start = key.chunk_hash % idx.slot_count
+    key = _make_hash(5)
+    start = key % idx.slot_count
     # Writer stamps an older gen — simulates survivor from gen bump.
     _write_slot(
         handle,
         start,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
         generation=handle.header.gen - 1,
     )
-    assert idx.lookup(key) is None
+    assert idx.lookup_by_hash(key, TENANT) is None
 
 
 def test_geom_mismatch_slot_is_skipped(handle):
@@ -269,17 +273,17 @@ def test_geom_mismatch_slot_is_skipped(handle):
     can't be reinterpreted as the reader's KV geometry.
     """
     idx = CXLIndex(handle)
-    key = _make_key(6)
-    start = key.chunk_hash % idx.slot_count
+    key = _make_hash(6)
+    start = key % idx.slot_count
     bogus = bytes(GEOM_HASH_SIZE)  # all zeros, definitely not our header's
     _write_slot(
         handle,
         start,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
         geom_hash=bogus,
     )
-    assert idx.lookup(key) is None
+    assert idx.lookup_by_hash(key, TENANT) is None
 
 
 def test_chunk_hash_zero_does_not_match_empty_slot(handle):
@@ -289,14 +293,15 @@ def test_chunk_hash_zero_does_not_match_empty_slot(handle):
     The state check is what disambiguates.
     """
     idx = CXLIndex(handle)
-    key_zero = _make_key(0)
+    # The literal zero hash — the value an all-zero EMPTY slot carries.
+    key_zero = 0
     # Do NOT write anything — the whole index is EMPTY with chunk_hash=0.
-    assert idx.lookup(key_zero) is None
+    assert idx.lookup_by_hash(key_zero, TENANT) is None
 
     # Now stamp a real slot at probe start with chunk_hash=0 and VALID.
     slot_idx = 0  # 0 % N = 0
     _write_slot(handle, slot_idx, chunk_hash=0, state=SLOT_STATE_VALID)
-    view = idx.lookup(key_zero)
+    view = idx.lookup_by_hash(key_zero, TENANT)
     assert view is not None and view.slot_idx == 0
 
 
@@ -305,13 +310,13 @@ def test_chunk_hash_zero_does_not_match_empty_slot(handle):
 
 def test_max_probe_bounds_lookup_cost(handle):
     idx = CXLIndex(handle, max_probe=4)
-    key = _make_key(7)
-    start = key.chunk_hash % idx.slot_count
+    key = _make_hash(7)
+    start = key % idx.slot_count
     # Place the match 5 slots out — beyond max_probe=4.
     _write_slot(
         handle,
         (start + 5) % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
     )
     # Fill the preceding 4 slots with TOMBs to force full probing.
@@ -320,15 +325,17 @@ def test_max_probe_bounds_lookup_cost(handle):
             _write_slot(handle, start, chunk_hash=0, state=SLOT_STATE_TOMB)
         else:
             _write_slot(
-                handle, (start + j) % idx.slot_count, chunk_hash=0,
+                handle,
+                (start + j) % idx.slot_count,
+                chunk_hash=0,
                 state=SLOT_STATE_TOMB,
             )
     # max_probe=4 means we scan slots [start, start+3], miss the match.
-    assert idx.lookup(key) is None
+    assert idx.lookup_by_hash(key, TENANT) is None
 
     # With a generous max_probe we find it.
     idx2 = CXLIndex(handle, max_probe=16)
-    assert idx2.lookup(key) is not None
+    assert idx2.lookup_by_hash(key, TENANT) is not None
 
 
 def test_max_probe_clamped_to_slot_count(handle):
@@ -337,20 +344,20 @@ def test_max_probe_clamped_to_slot_count(handle):
     assert idx.max_probe <= idx.slot_count
 
 
-# ---------- contains convenience ----------
+# ---------- presence ----------
 
 
-def test_contains_matches_lookup(handle):
+def test_lookup_reports_presence(handle):
     idx = CXLIndex(handle)
-    key = _make_key(99)
-    assert not idx.contains(key)
+    key = _make_hash(99)
+    assert idx.lookup_by_hash(key, TENANT) is None
     _write_slot(
         handle,
-        key.chunk_hash % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        key % idx.slot_count,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
     )
-    assert idx.contains(key)
+    assert idx.lookup_by_hash(key, TENANT) is not None
 
 
 # ---------- concurrency sanity ----------
@@ -363,11 +370,11 @@ def test_concurrent_reads_do_not_block(handle):
     observe a torn value, and they should never get stuck.
     """
     idx = CXLIndex(handle)
-    key = _make_key(0xABCDEF)
+    key = _make_hash(0xABCDEF)
     _write_slot(
         handle,
-        key.chunk_hash % idx.slot_count,
-        chunk_hash=key.chunk_hash,
+        key % idx.slot_count,
+        chunk_hash=key,
         state=SLOT_STATE_VALID,
         chunk_offset=4096,
         chunk_len=8192,
@@ -378,7 +385,7 @@ def test_concurrent_reads_do_not_block(handle):
 
     def worker():
         for _ in range(1000):
-            v = idx.lookup(key)
+            v = idx.lookup_by_hash(key, TENANT)
             with results_lock:
                 results.append(v)
 
@@ -409,8 +416,8 @@ def test_reader_and_writer_race_is_safe(handle):
     Never a corrupted (torn) view.
     """
     idx = CXLIndex(handle)
-    key = _make_key(0xDEAD)
-    slot_idx = key.chunk_hash % idx.slot_count
+    key = _make_hash(0xDEAD)
+    slot_idx = key % idx.slot_count
 
     stop = threading.Event()
     corruption = []
@@ -427,7 +434,7 @@ def test_reader_and_writer_race_is_safe(handle):
         _write_slot(
             handle,
             slot_idx,
-            chunk_hash=key.chunk_hash,
+            chunk_hash=key,
             state=SLOT_STATE_VALID,
             chunk_offset=offsets[0][0],
             chunk_len=offsets[0][1],
@@ -447,7 +454,7 @@ def test_reader_and_writer_race_is_safe(handle):
     def reader():
         valid_pairs = {(1024, 512), (2048, 1024), (4096, 256)}
         for _ in range(5000):
-            v = idx.lookup(key)
+            v = idx.lookup_by_hash(key, TENANT)
             if v is None:
                 continue  # ALLOCATING or pre-first-write
             if (v.chunk_offset, v.chunk_len) not in valid_pairs:

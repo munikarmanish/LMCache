@@ -26,21 +26,22 @@ Permissions: /dev/dax0.0 is typically root-only. Either run with
 sudo or pre-chmod the device for the test session.
 """
 
-# Standard
+# Future
 from __future__ import annotations
+
+# Standard
+from typing import Optional
 import argparse
 import json
 import logging
-import os
 import sys
 import time
-from typing import Optional
 
 # Third Party
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
@@ -59,14 +60,12 @@ from lmcache.v1.storage_backend.cxl.gc import (
     CXLGarbageCollector,
     CXLGCConfig,
 )
-from lmcache.v1.storage_backend.cxl.layout import SLOT_STATE_VALID
 from lmcache.v1.storage_backend.cxl.p2p_messages import PushStatus
 from lmcache.v1.storage_backend.cxl.p2p_transport import (
     CXLP2PClient,
     CXLP2PServer,
 )
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
-
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
 # Test parameters that BOTH sides must agree on so geom_hash matches.
 SHARED_MODEL_NAME = "cxl-cross-host-test"
@@ -75,7 +74,7 @@ SHARED_KV_DTYPE = torch.float16
 SHARED_CHUNK_SIZE = 16
 DEFAULT_REGION_SIZE = 256 * 1024 * 1024  # 256 MiB
 DEFAULT_POOL_SIZE = 128 * 1024 * 1024 * 1024  # 128 GiB — fits cudaHostRegister
-                                              # per-call cap on our test rig.
+# per-call cap on our test rig.
 
 # Sentinel keys used by the warm-CXL test.
 SENTINEL_KEYS = [0xCC000000 + i for i in range(4)]
@@ -95,14 +94,13 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(int_hash: int) -> CacheEngineKey:
+def _make_key(int_hash: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=int_hash.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=int_hash,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -124,14 +122,24 @@ class _LocalTier:
     """Simple key->payload mapping the donor reads from."""
 
     def __init__(self):
-        self._store: dict[str, tuple[bytes, MemoryFormat]] = {}
+        self._store: dict[ObjectKey, tuple[bytes, MemoryFormat]] = {}
 
-    def put(self, key: CacheEngineKey, payload: bytes,
-            fmt: MemoryFormat = MemoryFormat.KV_2LTD):
-        self._store[key.to_string()] = (payload, fmt)
+    def put(
+        self, key: ObjectKey, payload: bytes, fmt: MemoryFormat = MemoryFormat.KV_2LTD
+    ):
+        self._store[key] = (payload, fmt)
 
-    def __call__(self, key_str: str) -> Optional[MemoryObj]:
-        record = self._store.get(key_str)
+    def __call__(
+        self, chunk_hash: bytes, model_name: str, kv_rank: int, cache_salt: str
+    ) -> Optional[MemoryObj]:
+        record = self._store.get(
+            ObjectKey(
+                chunk_hash=chunk_hash,
+                model_name=model_name,
+                kv_rank=kv_rank,
+                cache_salt=cache_salt,
+            )
+        )
         if record is None:
             return None
         payload, fmt = record
@@ -146,9 +154,7 @@ class _LocalTier:
             pin_count=0,
             fmt=fmt,
         )
-        return TensorMemoryObj(
-            raw_data=data, metadata=meta, parent_allocator=None
-        )
+        return TensorMemoryObj(raw_data=data, metadata=meta, parent_allocator=None)
 
 
 # ---------- server ----------
@@ -163,26 +169,26 @@ def run_server(args) -> int:
     _force_fence(args.fence_mode)
     log.info("using fence: %s", type(default_fence()).__name__)
 
-    cfg = CXLBackendConfig(
+    cfg = CXLStoreConfig(
         dev_path=args.dev_path,
         node_id=args.node_id,
-        chunk_size_bytes=args.chunk_size_bytes,
+        max_chunk_size_bytes=args.chunk_size_bytes,
         region_size=args.region_size,
         initialize=True,
         generation=args.generation,
         run_lock_manager=True,
         pool_size_override=args.pool_size if args.pool_size > 0 else None,
     )
-    backend = CXLBackend(cfg, _metadata())
+    backend = CXLStore(cfg)
     log.info(
         "server initialized pool: regions=%d, chunk_size=%d",
-        backend._pool.layout.region_count,
+        backend.pool.layout.region_count,
         args.chunk_size_bytes,
     )
 
     # Warm-CXL test: write SENTINEL_KEYS into CXL so the client can read.
     for i, h in enumerate(SENTINEL_KEYS):
-        backend.batched_submit_put_task(
+        backend.put_batch(
             [_make_key(h)],
             [_make_obj(args.payload_size, SENTINEL_FILL_BASE + i)],
         )
@@ -196,15 +202,13 @@ def run_server(args) -> int:
     log.info("staged %d keys in local tier (not in CXL)", args.num_push_keys)
 
     donor = CXLDonor(
-        handle=backend._pool,
-        index_writer=backend._index_writer,
-        heap=backend._heap,
-        node_id=backend._node_id,
+        handle=backend.pool,
+        index_writer=backend.index_writer,
+        heaps=backend.heaps,
+        node_id=backend.node_id,
         local_copy_provider=local,
     )
-    p2p_server = CXLP2PServer(
-        donor=donor, bind_url=f"tcp://0.0.0.0:{args.listen_port}"
-    )
+    p2p_server = CXLP2PServer(donor=donor, bind_url=f"tcp://0.0.0.0:{args.listen_port}")
     p2p_server.start()
 
     # Optional GC, useful if the client wants to test dead-node handling
@@ -218,9 +222,9 @@ def run_server(args) -> int:
             return alive_box["alive"]
 
         gc = CXLGarbageCollector(
-            allocator=backend._region_allocator,
-            index_writer=backend._index_writer,
-            pool=backend._pool,
+            allocator=backend.region_allocator,
+            index_writer=backend.index_writer,
+            pool=backend.pool,
             liveness=liveness,
             config=CXLGCConfig(sweep_interval_s=2.0),
         )
@@ -251,16 +255,16 @@ def run_client(args) -> int:
     _force_fence(args.fence_mode)
     log.info("using fence: %s", type(default_fence()).__name__)
 
-    cfg = CXLBackendConfig(
+    cfg = CXLStoreConfig(
         dev_path=args.dev_path,
         node_id=args.node_id,
-        chunk_size_bytes=args.chunk_size_bytes,
+        max_chunk_size_bytes=args.chunk_size_bytes,
         region_size=args.region_size,
         initialize=False,
         run_lock_manager=False,
         pool_size_override=args.pool_size if args.pool_size > 0 else None,
     )
-    backend = CXLBackend(cfg, _metadata())
+    backend = CXLStore(cfg)
     log.info("client attached")
 
     failures = []
@@ -274,22 +278,26 @@ def run_client(args) -> int:
         if not backend.contains(key):
             failures.append(f"warm miss for h=0x{h:08x}")
             continue
-        got = backend.get_blocking(key)
-        if got is None:
-            failures.append(f"warm get returned None for h=0x{h:08x}")
+        buf = torch.empty(args.payload_size, dtype=torch.uint8)
+        n = backend.read_into(key, buf.data_ptr(), buf.numel())
+        if n == 0:
+            failures.append(f"warm read returned 0 bytes for h=0x{h:08x}")
             continue
-        first_byte = int(got.raw_data[0])
+        first_byte = int(buf[0])
         if first_byte != (SENTINEL_FILL_BASE + i) & 0xFF:
             warm_mismatches += 1
             failures.append(
                 f"warm fill mismatch for h=0x{h:08x}: "
-                f"got 0x{first_byte:02x}, want 0x{(SENTINEL_FILL_BASE+i)&0xFF:02x}"
+                f"got 0x{first_byte:02x}, want 0x{(SENTINEL_FILL_BASE + i) & 0xFF:02x}"
             )
         else:
             warm_hits += 1
-        got.ref_count_down()
-    log.info("scenario 1: warm_hits=%d mismatches=%d failures=%d",
-             warm_hits, warm_mismatches, len(failures))
+    log.info(
+        "scenario 1: warm_hits=%d mismatches=%d failures=%d",
+        warm_hits,
+        warm_mismatches,
+        len(failures),
+    )
 
     # ---- Scenario 2: PushKVToCXL via ZMQ ----
     log.info("scenario 2: PushKVToCXL via ZMQ")
@@ -303,16 +311,20 @@ def run_client(args) -> int:
     client = CXLP2PClient(donor_url=donor_url)
     try:
         result = remote_fetch(
-            requester_node_id=backend._node_id,
+            requester_node_id=backend.node_id,
             keys=push_keys,
-            index_writer=backend._index_writer,
+            tenant_digest_fn=backend.tenant_digest_for,
+            index_writer=backend.index_writer,
             donor_node_id=args.donor_node_id,
             donor=client,
             sender_id=f"node-{args.node_id}",
-            epoch=int(backend._pool.header.gen),
+            epoch=backend.epoch,
         )
-        log.info("remote_fetch result: num_satisfied=%d status=%s",
-                 result.num_satisfied, result.status.name)
+        log.info(
+            "remote_fetch result: num_satisfied=%d status=%s",
+            result.num_satisfied,
+            result.status.name,
+        )
         if result.status not in (PushStatus.OK, PushStatus.PARTIAL):
             failures.append(f"push-test: unexpected status {result.status.name}")
 
@@ -320,13 +332,14 @@ def run_client(args) -> int:
         # right bytes.
         post_hits = 0
         post_mismatches = 0
-        for i, k in enumerate(push_keys[:result.num_satisfied]):
-            got = backend.get_blocking(k)
-            if got is None:
+        for i, k in enumerate(push_keys[: result.num_satisfied]):
+            buf = torch.empty(args.payload_size, dtype=torch.uint8)
+            n = backend.read_into(k, buf.data_ptr(), buf.numel())
+            if n == 0:
                 failures.append(f"push-test: post-fetch miss for key #{i}")
                 continue
             expect = (0xB0 + i) & 0xFF
-            actual = int(got.raw_data[0])
+            actual = int(buf[0])
             if actual != expect:
                 post_mismatches += 1
                 failures.append(
@@ -335,9 +348,9 @@ def run_client(args) -> int:
                 )
             else:
                 post_hits += 1
-            got.ref_count_down()
-        log.info("scenario 2: post_hits=%d post_mismatches=%d",
-                 post_hits, post_mismatches)
+        log.info(
+            "scenario 2: post_hits=%d post_mismatches=%d", post_hits, post_mismatches
+        )
     finally:
         client.close()
 
@@ -387,39 +400,71 @@ def _force_fence(mode: str) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--role", choices=("server", "client"), required=True)
-    p.add_argument("--dev-path", required=True,
-                   help="Path to /dev/dax0.0 or a shared regular file")
+    p.add_argument(
+        "--dev-path", required=True, help="Path to /dev/dax0.0 or a shared regular file"
+    )
     p.add_argument("--node-id", type=int, required=True)
-    p.add_argument("--pool-size", type=int, default=DEFAULT_POOL_SIZE,
-                   help="Cap the usable pool size in bytes. Must match on "
-                        "client and server. 0 means use the device's full "
-                        f"size. Default: {DEFAULT_POOL_SIZE} "
-                        f"({DEFAULT_POOL_SIZE >> 30} GiB).")
+    p.add_argument(
+        "--pool-size",
+        type=int,
+        default=DEFAULT_POOL_SIZE,
+        help="Cap the usable pool size in bytes. Must match on "
+        "client and server. 0 means use the device's full "
+        f"size. Default: {DEFAULT_POOL_SIZE} "
+        f"({DEFAULT_POOL_SIZE >> 30} GiB).",
+    )
     p.add_argument("--region-size", type=int, default=DEFAULT_REGION_SIZE)
     p.add_argument("--chunk-size-bytes", type=int, default=64 * 1024)
-    p.add_argument("--payload-size", type=int, default=4096,
-                   help="Payload bytes per sentinel/push key")
+    p.add_argument(
+        "--payload-size",
+        type=int,
+        default=4096,
+        help="Payload bytes per sentinel/push key",
+    )
     p.add_argument("--generation", type=int, default=1)
     p.add_argument("--num-push-keys", type=int, default=4)
-    p.add_argument("--fence-mode", choices=("auto", "stub", "clflush"),
-                   default="clflush",
-                   help="Force a fence implementation. 'clflush' is the "
-                        "correct choice for cross-host CXL on hardware "
-                        "without HW coherence (our test rack).")
+    p.add_argument(
+        "--fence-mode",
+        choices=("auto", "stub", "clflush"),
+        default="clflush",
+        help="Force a fence implementation. 'clflush' is the "
+        "correct choice for cross-host CXL on hardware "
+        "without HW coherence (our test rack).",
+    )
     # Server-only.
-    p.add_argument("--listen-port", type=int, default=8447,
-                   help="(server) bind port for the CXLP2PServer")
-    p.add_argument("--hold-seconds", type=int, default=120,
-                   help="(server) keep server alive for this long")
-    p.add_argument("--run-gc", action="store_true",
-                   help="(server) start a periodic GC sweeper")
+    p.add_argument(
+        "--listen-port",
+        type=int,
+        default=8447,
+        help="(server) bind port for the CXLP2PServer",
+    )
+    p.add_argument(
+        "--hold-seconds",
+        type=int,
+        default=120,
+        help="(server) keep server alive for this long",
+    )
+    p.add_argument(
+        "--run-gc", action="store_true", help="(server) start a periodic GC sweeper"
+    )
     # Client-only.
-    p.add_argument("--donor-host", default="127.0.0.1",
-                   help="(client) hostname/IP of the server's CXLP2PServer")
-    p.add_argument("--donor-port", type=int, default=8447,
-                   help="(client) port of the server's CXLP2PServer")
-    p.add_argument("--donor-node-id", type=int, default=0,
-                   help="(client) the server's node_id (for slot ownership)")
+    p.add_argument(
+        "--donor-host",
+        default="127.0.0.1",
+        help="(client) hostname/IP of the server's CXLP2PServer",
+    )
+    p.add_argument(
+        "--donor-port",
+        type=int,
+        default=8447,
+        help="(client) port of the server's CXLP2PServer",
+    )
+    p.add_argument(
+        "--donor-node-id",
+        type=int,
+        default=0,
+        help="(client) the server's node_id (for slot ownership)",
+    )
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args()
 

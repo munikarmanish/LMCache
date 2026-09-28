@@ -26,10 +26,10 @@ default `NUM_LOCKS == 4096` easily spares this.
 """
 
 # Standard
-import ctypes
-import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, List, Optional
+import ctypes
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -95,6 +95,15 @@ class RegionAllocator:
 
     def region_size(self) -> int:
         return self._handle.layout.region_size
+
+    @property
+    def handle(self) -> PoolHandle:
+        """The pool this allocator carves regions out of.
+
+        Exposed so heaps can resolve an offset to a region without
+        reaching into private state.
+        """
+        return self._handle
 
     def claim(self, node_id: int) -> int:
         """Claim a FREE region for `node_id`. Returns the region_id.
@@ -271,16 +280,12 @@ class RegionAllocator:
     def _set_bit(self, i: int) -> None:
         byte_idx = i >> 3
         self._bitmap[byte_idx] = self._bitmap[byte_idx] | (1 << (i & 7))
-        self._fence.fence_after_write(
-            self._bitmap_base + byte_idx, 1
-        )
+        self._fence.fence_after_write(self._bitmap_base + byte_idx, 1)
 
     def _clear_bit(self, i: int) -> None:
         byte_idx = i >> 3
         self._bitmap[byte_idx] = self._bitmap[byte_idx] & ~(1 << (i & 7))
-        self._fence.fence_after_write(
-            self._bitmap_base + byte_idx, 1
-        )
+        self._fence.fence_after_write(self._bitmap_base + byte_idx, 1)
 
     def _write_desc(
         self,

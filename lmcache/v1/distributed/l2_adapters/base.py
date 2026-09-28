@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.memory_management import MemoryObj
 
@@ -434,6 +434,43 @@ class L2AdapterInterface(ABC):
             ValueError: If the adapter requires GPU-direct but the buffer is
                 unusable (e.g. wrong alignment for its transport). The caller
                 logs and continues with this adapter on its non-GPU path.
+        """
+        return None
+
+    def register_layout(
+        self,
+        model_name: str,
+        world_size: int,
+        layout_desc: MemoryLayoutDesc,
+    ) -> None:
+        """Declare the KV geometry a model writes under.
+
+        Called when the serving engine registers its KV caches, which is
+        the first point the true geometry is known — it is derived from
+        the live model rather than from configuration. Adapters that
+        persist bytes to storage shared with other processes can use it
+        to detect a peer writing the *same* model under a *different*
+        geometry, which would otherwise be read back misinterpreted.
+
+        The default is a no-op: an adapter whose storage is private to
+        this process, or which records geometry alongside each object,
+        needs nothing here.
+
+        Note the asymmetry this exists to bridge: the store path carries
+        geometry (it is on the ``MemoryObj``), but the lookup path is
+        handed only keys. An adapter that must compare geometry on read
+        has to remember it from here.
+
+        Args:
+            model_name: The model these caches belong to.
+            world_size: The world size the caches were registered under.
+            layout_desc: Per-group shapes and dtypes of one chunk.
+
+        Raises:
+            ValueError: If the geometry conflicts with one already
+                recorded for the same ``(model_name, world_size)``, i.e.
+                the deployment is inconsistent. The caller logs and
+                continues; the adapter decides whether to keep serving.
         """
         return None
 

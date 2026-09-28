@@ -48,10 +48,17 @@
 #define HAS_X86 0
 #endif
 
-/* ---------- layout constants. MUST match layout.py. ---------------- */
+/* ---------- layout constants. MUST match layout.py. ----------------
+ *
+ * LAYOUT_VERSION in particular: the arbiter refuses to attach to a pool
+ * whose header version differs, and a refused arbiter exits silently
+ * while Python waiters spin forever on a lock nobody grants. Bump it
+ * here in the SAME change that bumps layout.py, or the whole cluster
+ * deadlocks on the first store.
+ */
 
 #define HEADER_SIZE   4096u
-#define LAYOUT_VERSION 1u
+#define LAYOUT_VERSION 2u
 #define MAGIC_LE      0x4C4D43584C504F4FULL  /* "LMCXLPOO" little-endian */
 #define CACHELINE     64u
 #define GEOM_HASH_SZ  16u

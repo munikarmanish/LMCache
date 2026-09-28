@@ -14,20 +14,19 @@ exercises the same code as production.
 """
 
 # Standard
+from typing import Any
 import asyncio
 import os
 import socket
 import tempfile
 import threading
 import time
-from typing import Any, Optional
 
 # Third Party
 import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_controller.message import (
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
@@ -35,9 +34,9 @@ from lmcache.v1.cache_controller.message import (
     QueryWorkerInfoRetMsg,
     WorkerInfo,
 )
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
-    MemoryObj,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
@@ -51,8 +50,7 @@ from lmcache.v1.storage_backend.cxl.controller_integration import (
 from lmcache.v1.storage_backend.cxl.cross_node import CXLDonor
 from lmcache.v1.storage_backend.cxl.p2p_messages import PushStatus
 from lmcache.v1.storage_backend.cxl.p2p_transport import CXLP2PServer
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
-
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
 # ---------- fakes ----------
 
@@ -124,6 +122,13 @@ def _make_worker_info(
         registration_time=last_heartbeat_time - 1,
         last_heartbeat_time=last_heartbeat_time,
     )
+
+
+def _read(store, key, size: int = 4096):
+    """Read a chunk into a fresh buffer. Returns None on miss."""
+    buf = torch.empty(size, dtype=torch.uint8)
+    n = store.read_into(key, buf.data_ptr(), buf.numel())
+    return None if n == 0 else buf[:n]
 
 
 def test_liveness_returns_alive_node_ids(fake_worker):
@@ -207,7 +212,7 @@ def test_liveness_one_alive_worker_keeps_instance_alive(fake_worker):
             event_id=msg.event_id,
             worker_infos=[
                 _make_worker_info("inst-A", 0, now - 1000),  # stale
-                _make_worker_info("inst-A", 1, now),         # fresh
+                _make_worker_info("inst-A", 1, now),  # fresh
                 _make_worker_info("inst-A", 2, now - 1000),  # stale
             ],
         ),
@@ -228,6 +233,7 @@ def test_liveness_failsafe_on_rpc_error(fake_worker):
     negligible; the cost of a false-negative (GC reclaims a live
     node's chunks) is catastrophic.
     """
+
     def _explode(_msg):
         raise RuntimeError("controller down")
 
@@ -280,9 +286,7 @@ def test_router_translates_p2p_lookup_to_donor_route(fake_worker):
         mapping=[InstanceMapping("inst-A", cxl_node_id=7)],
     )
     keys = [_make_key(0xC001 + i) for i in range(3)]
-    route = router.lookup(
-        keys, requester_instance_id="inst-B", requester_worker_id=0
-    )
+    route = router.lookup(keys, requester_instance_id="inst-B", requester_worker_id=0)
     assert route is not None
     assert route.donor_node_id == 7
     assert route.num_hit == 3
@@ -293,9 +297,7 @@ def test_router_translates_p2p_lookup_to_donor_route(fake_worker):
 def test_router_returns_none_on_zero_hits(fake_worker):
     fake_worker.install(
         BatchedP2PLookupMsg,
-        lambda msg: BatchedP2PLookupRetMsg(
-            layout_info=[("", "", 0, "")]
-        ),
+        lambda msg: BatchedP2PLookupRetMsg(layout_info=[("", "", 0, "")]),
     )
     router = ControllerDonorRouter(
         worker=fake_worker,
@@ -386,7 +388,7 @@ def test_router_close_is_idempotent(fake_worker):
     router.close()  # second call: no-op, no exception
 
 
-# ---------- end-to-end with real CXLBackend pair ----------
+# ---------- end-to-end with real CXLStore pair ----------
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -414,26 +416,32 @@ def _metadata():
     )
 
 
-def _make_key(int_hash: int) -> CacheEngineKey:
+def _make_key(int_hash: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=int_hash.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=int_hash,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
 class _LocalTier:
     def __init__(self):
-        self._store: dict[str, tuple[bytes, MemoryFormat]] = {}
+        self._store: dict[ObjectKey, tuple[bytes, MemoryFormat]] = {}
 
-    def put(self, key, payload, fmt=MemoryFormat.KV_2LTD):
-        self._store[key.to_string()] = (payload, fmt)
+    def put(self, key: ObjectKey, payload, fmt=MemoryFormat.KV_2LTD):
+        self._store[key] = (payload, fmt)
 
-    def __call__(self, key_str):
-        rec = self._store.get(key_str)
+    def __call__(self, chunk_hash, model_name, kv_rank, cache_salt):
+        rec = self._store.get(
+            ObjectKey(
+                chunk_hash=chunk_hash,
+                model_name=model_name,
+                kv_rank=kv_rank,
+                cache_salt=cache_salt,
+            )
+        )
         if rec is None:
             return None
         payload, fmt = rec
@@ -454,28 +462,36 @@ class _LocalTier:
 
 @pytest.fixture
 def end_to_end_setup(fake_worker):
-    """Two CXLBackends, A's CXLP2PServer running, fake controller wired."""
+    """Two CXLStores, A's CXLP2PServer running, fake controller wired."""
     with tempfile.NamedTemporaryFile(prefix="cxl-ctrl-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
 
-    cfg_a = CXLBackendConfig(
-        dev_path=path, node_id=0, chunk_size_bytes=CHUNK_SIZE,
-        region_size=REGION_SIZE, initialize=True, run_lock_manager=True,
+    cfg_a = CXLStoreConfig(
+        dev_path=path,
+        node_id=0,
+        max_chunk_size_bytes=CHUNK_SIZE,
+        region_size=REGION_SIZE,
+        initialize=True,
+        run_lock_manager=True,
     )
-    cfg_b = CXLBackendConfig(
-        dev_path=path, node_id=1, chunk_size_bytes=CHUNK_SIZE,
-        region_size=REGION_SIZE, initialize=False, run_lock_manager=False,
+    cfg_b = CXLStoreConfig(
+        dev_path=path,
+        node_id=1,
+        max_chunk_size_bytes=CHUNK_SIZE,
+        region_size=REGION_SIZE,
+        initialize=False,
+        run_lock_manager=False,
     )
-    backend_a = CXLBackend(cfg_a, _metadata())
-    backend_b = CXLBackend(cfg_b, _metadata())
+    backend_a = CXLStore(cfg_a)
+    backend_b = CXLStore(cfg_b)
 
     a_local = _LocalTier()
     a_donor = CXLDonor(
-        handle=backend_a._pool,
-        index_writer=backend_a._index_writer,
-        heap=backend_a._heap,
-        node_id=backend_a._node_id,
+        handle=backend_a.pool,
+        index_writer=backend_a.index_writer,
+        heaps=backend_a.heaps,
+        node_id=backend_a.node_id,
         local_copy_provider=a_local,
     )
     port = _free_port()
@@ -514,29 +530,30 @@ def test_end_to_end_controller_backed_fetch(end_to_end_setup):
 
     # Stage payloads on A's local tier.
     keys = [_make_key(0xE000 + i) for i in range(3)]
-    for i, k in enumerate(keys):
-        a_local.put(k, bytes([(0x40 + i) & 0xFF] * 256))
+    for i, ok in enumerate(keys):
+        a_local.put(ok, bytes([(0x40 + i) & 0xFF] * 256))
 
     # Fake controller routes inst-A -> donor URL we created.
     fake_worker.install(
         BatchedP2PLookupMsg,
         lambda msg: BatchedP2PLookupRetMsg(
-            layout_info=[("inst-A", "LocalCPUBackend", 3, f"127.0.0.1:99")]
+            layout_info=[("inst-A", "LocalCPUBackend", 3, "127.0.0.1:99")]
         ),
     )
 
     router = ControllerDonorRouter(
         worker=fake_worker,
-        mapping=[InstanceMapping("inst-A", cxl_node_id=a._node_id)],
+        mapping=[InstanceMapping("inst-A", cxl_node_id=a.node_id)],
         derive_donor_url=lambda _peer: donor_url,
     )
     fetch = ControllerBackedFetch(
         router=router,
-        index_writer=b._index_writer,
-        requester_node_id=b._node_id,
+        index_writer=b.index_writer,
+        tenant_digest_fn=b.tenant_digest_for,
+        requester_node_id=b.node_id,
         requester_instance_id="inst-B",
         requester_worker_id=0,
-        epoch_provider=lambda: int(b._pool.header.gen),
+        epoch_provider=lambda: int(b.pool.header.gen),
         sender_id="node-b",
     )
 
@@ -546,12 +563,9 @@ def test_end_to_end_controller_backed_fetch(end_to_end_setup):
         assert result.num_satisfied == 3
         assert result.status == PushStatus.OK
         for i, k in enumerate(keys):
-            got = b.get_blocking(k)
+            got = _read(b, k)
             assert got is not None
-            assert int(got.raw_data[0]) == (0x40 + i) & 0xFF, (
-                f"byte mismatch for key #{i}"
-            )
-            got.ref_count_down()
+            assert int(got[0]) == (0x40 + i) & 0xFF, f"byte mismatch for key #{i}"
     finally:
         router.close()
 
@@ -573,11 +587,12 @@ def test_end_to_end_no_donor_returns_none(end_to_end_setup):
     )
     fetch = ControllerBackedFetch(
         router=router,
-        index_writer=b._index_writer,
-        requester_node_id=b._node_id,
+        index_writer=b.index_writer,
+        tenant_digest_fn=b.tenant_digest_for,
+        requester_node_id=b.node_id,
         requester_instance_id="inst-B",
         requester_worker_id=0,
-        epoch_provider=lambda: int(b._pool.header.gen),
+        epoch_provider=lambda: int(b.pool.header.gen),
         sender_id="node-b",
     )
     try:

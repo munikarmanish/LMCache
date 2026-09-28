@@ -2,7 +2,7 @@
 """Tests for the bulk node-clear path.
 
 Covers ``CXLIndexWriter.clear_owned_slots`` — the writer-level primitive that
-``CXLBackend.clear`` builds on:
+``CXLStore.clear`` builds on:
 
   - Only VALID slots owned by *this* node are tombstoned; their offsets are
     returned so the caller can free them from the node heap.
@@ -23,7 +23,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.bootstrap import (
@@ -44,7 +44,10 @@ from lmcache.v1.storage_backend.cxl.layout import (
 from lmcache.v1.storage_backend.cxl.lock_manager import LockManager
 from lmcache.v1.storage_backend.cxl.locks import TwoTierLock
 from lmcache.v1.storage_backend.cxl.regions import RegionAllocator
-
+from lmcache.v1.storage_backend.cxl.store import (
+    object_key_to_chunk_hash,
+    object_key_to_tenant_digest,
+)
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -67,13 +70,23 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(h: int) -> CacheEngineKey:
-    return CacheEngineKey(
-        model_name="cxl-clear-test",
-        world_size=1,
-        worker_id=0,
-        chunk_hash=h,
-        dtype=torch.float16,
+def _make_digest(h: int) -> bytes:
+    """The 16-byte tenant digest the store stamps for `_make_key(h)`."""
+    return object_key_to_tenant_digest(_make_key(h))
+
+
+def _make_hash(h: int) -> int:
+    """The u64 index hash the store derives for `_make_key(h)`."""
+    return object_key_to_chunk_hash(_make_key(h))
+
+
+def _make_key(h: int) -> ObjectKey:
+    md = _metadata()
+    return ObjectKey(
+        chunk_hash=h.to_bytes(8, "little"),
+        model_name=md.model_name,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -88,7 +101,7 @@ def ctx():
         f.truncate(POOL_SIZE)
         path = f.name
     cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
-    handle = bootstrap_pool(cfg, _metadata())
+    handle = bootstrap_pool(cfg)
     lock = TwoTierLock(handle, node_id=0)
     mgr = LockManager(handle)
     mgr.start()
@@ -113,7 +126,7 @@ def _store_chunk(iw: CXLIndexWriter, heap: NodeHeap, key_hash: int, *, pin=False
     Returns (slot_idx, chunk_offset).
     """
     offset = heap.alloc()
-    res = iw.reserve_slot(_make_key(key_hash))
+    res = iw.reserve_slot(_make_hash(key_hash), _make_digest(key_hash))
     assert res.outcome == ReserveOutcome.RESERVED
     iw.commit_slot(
         res.slot_idx,
@@ -153,7 +166,7 @@ def test_clear_owned_slots_skips_other_nodes(ctx):
     )
     foreign_heap = NodeHeap(region_alloc, node_id=foreign_id, chunk_size=CHUNK_SIZE)
     foreign_off = foreign_heap.alloc()
-    r = iw_foreign.reserve_slot(_make_key(0x2002))
+    r = iw_foreign.reserve_slot(_make_hash(0x2002), _make_digest(0x2002))
     assert r.outcome == ReserveOutcome.RESERVED
     iw_foreign.commit_slot(
         r.slot_idx,

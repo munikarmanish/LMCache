@@ -23,10 +23,8 @@ from lmcache.v1.storage_backend.cxl.lock_manager import LockManager
 from lmcache.v1.storage_backend.cxl.locks import TwoTierLock
 from lmcache.v1.storage_backend.cxl.regions import (
     NoRegionAvailable,
-    REGION_LOCK_ID,
     RegionAllocator,
 )
-
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -53,7 +51,7 @@ def handle():
     cfg = CXLBootstrapConfig(
         dev_path=path, region_size=REGION_SIZE, initialize=True, generation=11
     )
-    h = bootstrap_pool(cfg, _metadata())
+    h = bootstrap_pool(cfg)
     try:
         yield h
     finally:
@@ -207,7 +205,10 @@ def test_promote_orphaned_respects_drain_predicate(allocator_and_manager):
     # search_hint may skip forward; verify that eventually we can
     # reach the promoted region after enough claims wrap.
     reclaim_seen = {r2}
-    while r not in reclaim_seen and len(reclaim_seen) < allocator_and_manager[0]._region_count:
+    while (
+        r not in reclaim_seen
+        and len(reclaim_seen) < allocator_and_manager[0]._region_count
+    ):
         try:
             rid = alloc.claim(node_id=2)
         except NoRegionAvailable:

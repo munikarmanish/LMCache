@@ -719,6 +719,41 @@ class StorageManager:
             handle.prefetch_request_id
         )
 
+    def register_layout(
+        self,
+        model_name: str,
+        world_size: int,
+        layout_desc: MemoryLayoutDesc,
+    ) -> None:
+        """Declare a model's KV geometry to every L2 adapter.
+
+        Called when the serving engine registers its KV caches. Adapters
+        that share storage with other processes use it to detect a peer
+        writing the same model under a different geometry; the rest
+        ignore it.
+
+        A rejection is logged and swallowed rather than raised: refusing
+        the whole KV-cache registration would take the engine down, and
+        the adapter has already decided how to behave (typically by
+        declining to serve that model).
+
+        Args:
+            model_name: The model these caches belong to.
+            world_size: The world size the caches were registered under.
+            layout_desc: Per-group shapes and dtypes of one chunk.
+        """
+        for adapter_idx, adapter in enumerate(self._l2_adapters):
+            try:
+                adapter.register_layout(model_name, world_size, layout_desc)
+            except Exception:
+                logger.exception(
+                    "L2 adapter %d rejected the layout for model %s "
+                    "(world_size=%d); it may refuse to serve that model",
+                    adapter_idx,
+                    model_name,
+                    world_size,
+                )
+
     def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
         """Offer the GPU retrieve staging buffer to every L2 adapter.
 

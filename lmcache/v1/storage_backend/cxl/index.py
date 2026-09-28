@@ -22,21 +22,17 @@ Correctness invariants (plan "Locking Summary"):
 """
 
 # Standard
-import ctypes
 from dataclasses import dataclass
 from typing import Optional
+import ctypes
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend.cxl.bootstrap import PoolHandle
 from lmcache.v1.storage_backend.cxl.fence import Fence, default_fence
 from lmcache.v1.storage_backend.cxl.layout import (
     GEOM_HASH_SIZE,
-    SLOT_STATE_ALLOCATING,
     SLOT_STATE_EMPTY,
-    SLOT_STATE_TOMB,
     SLOT_STATE_VALID,
     Slot,
     SlotLine0,
@@ -98,16 +94,19 @@ class CXLIndex:
         self._max_probe = min(max_probe, self._slot_count)
 
         # Cache addresses we'll reach for on every lookup.
+        # Standard
         import ctypes
+
         self._slots = handle.slots()
         self._slots_base_addr = ctypes.addressof(self._slots)
         self._slot_struct_size = ctypes.sizeof(Slot)
         self._line0_size = ctypes.sizeof(SlotLine0)
 
-        # Freeze a local copy of the header's geom_hash and generation
-        # at construction. Callers rebuild the index object if the
-        # header's generation bumps (plan F8).
-        self._header_geom_hash = bytes(handle.header.geom_hash)
+        # Freeze a local copy of the header's generation at construction.
+        # Callers rebuild the index object if the header's generation
+        # bumps (plan F8). The header no longer carries a pool-wide
+        # geometry hash: ``line0.geom_hash`` is a per-slot *tenant*
+        # discriminator supplied by the caller (see ``lookup_by_hash``).
         self._header_generation = int(handle.header.gen)
 
     # -------- public API -------------------------------------------------
@@ -120,28 +119,46 @@ class CXLIndex:
     def max_probe(self) -> int:
         return self._max_probe
 
-    def lookup(self, key: CacheEngineKey) -> Optional[SlotView]:
-        """Return a SlotView for `key` if it is VALID in the index, else None.
+    def lookup_by_hash(
+        self, chunk_hash: int, tenant_digest: bytes
+    ) -> Optional[SlotView]:
+        """Return a SlotView for `chunk_hash` if VALID in the index, else None.
+
+        The index addresses slots by the u64 alone — callers fold whatever
+        identity must not alias into it (see
+        :func:`~lmcache.v1.storage_backend.cxl.store.object_key_to_chunk_hash`).
+        Because a u64 can collide across tenants, a matching slot must ALSO
+        carry the caller's 16-byte ``tenant_digest``; a mismatch keeps
+        probing, so two tenants colliding on the u64 resolve to their own
+        slots under open addressing rather than reading each other's bytes.
 
         Lock-free. Safe against any concurrent writer. May return None
         for a key that is concurrently being written (ALLOCATING); the
         caller retries or treats it as a miss, which is the behavior
         we want — an incomplete write should not be observable.
+
+        Args:
+            chunk_hash: The u64 index hash to probe for.
+            tenant_digest: The caller's 16-byte tenant discriminator; a
+                slot whose stored digest differs is not a hit.
+
+        Returns:
+            A consistent snapshot of the matching VALID slot, or None.
+
+        Raises:
+            ValueError: If ``tenant_digest`` is not ``GEOM_HASH_SIZE`` bytes.
         """
-        return self._lookup_by_hash(key.chunk_hash)
-
-    def contains(self, key: CacheEngineKey) -> bool:
-        return self.lookup(key) is not None
-
-    # -------- internals --------------------------------------------------
-
-    def _lookup_by_hash(self, chunk_hash: int) -> Optional[SlotView]:
+        if len(tenant_digest) != GEOM_HASH_SIZE:
+            raise ValueError(
+                f"tenant_digest must be {GEOM_HASH_SIZE} bytes, "
+                f"got {len(tenant_digest)}"
+            )
         # Mask into u64 because the stored field is unsigned.
         needle = chunk_hash & 0xFFFFFFFFFFFFFFFF
         start = needle % self._slot_count
         for i in range(self._max_probe):
             slot_idx = (start + i) % self._slot_count
-            view = self._read_slot_consistent(slot_idx, needle)
+            view = self._read_slot_consistent(slot_idx, needle, tenant_digest)
             if view is _PROBE_TERMINATE:
                 # Open-addressing invariant: first EMPTY ends the probe.
                 return None
@@ -152,7 +169,7 @@ class CXLIndex:
         return None
 
     def _read_slot_consistent(
-        self, slot_idx: int, needle: int
+        self, slot_idx: int, needle: int, tenant_digest: bytes
     ) -> "Optional[SlotView] | object":
         """Seqlock-style consistent read of a slot's line0.
 
@@ -205,10 +222,12 @@ class CXLIndex:
                 # a non-match that lets us keep probing.
                 continue
 
-            # Defensive checks against stale-generation / geom drift.
+            # Stale generation (controller restart) — skip.
             if snap_gen != self._header_generation:
                 return _PROBE_CONTINUE
-            if snap_geom != self._header_geom_hash:
+            # Different tenant that collided on the u64 — keep probing;
+            # our own slot may be further along this chain.
+            if snap_geom != tenant_digest:
                 return _PROBE_CONTINUE
 
             return SlotView(
@@ -241,9 +260,7 @@ class CXLIndex:
         slot_addr = self._slots_base_addr + slot_idx * self._slot_struct_size
         self._fence.flush_before_read(slot_addr, self._line0_size)
         snap = SlotLine0()
-        ctypes.memmove(
-            ctypes.addressof(snap), slot_addr, self._line0_size
-        )
+        ctypes.memmove(ctypes.addressof(snap), slot_addr, self._line0_size)
         return snap
 
 

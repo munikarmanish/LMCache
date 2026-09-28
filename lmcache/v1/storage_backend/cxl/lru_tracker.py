@@ -7,7 +7,7 @@ cost the eviction design avoids. Instead each node keeps a purely DRAM view
 of the recency of the slots *it* touches. A slot hot on another node reads as
 cold here; that is an accepted approximation of the goal, which is only to
 give a node a sensible victim order when it must evict its own chunks to make
-room after the global pool is exhausted (see ``CXLBackend`` eviction ladder).
+room after the global pool is exhausted (see ``CXLStore`` eviction ladder).
 
 The tracker holds only this node's owned slot indices. It is consulted when a
 store fails to claim a new region: :meth:`coldest` yields victims oldest-first,
@@ -72,7 +72,7 @@ class NodeLRUTracker:
             self._order.pop(slot_idx, None)
 
     def clear(self) -> None:
-        """Forget every tracked slot (used by ``CXLBackend.clear``)."""
+        """Forget every tracked slot (used by ``CXLStore.clear``)."""
         with self._lock:
             self._order.clear()
 

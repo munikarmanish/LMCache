@@ -1,55 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CXLBackend: AllocatorBackendInterface over a CXL shared-memory pool.
+"""CXLStore: the synchronous object store over a CXL shared-memory pool.
 
-Single-process skeleton for step 5. This wires together:
+Wires together the pool primitives:
 
 - bootstrap.py (pool mmap + header + cudaHostRegister)
-- locks.py + lock_manager.py (two-tier lock + arbiter thread)
+- locks.py + lock_manager.py (two-tier lock + arbiter)
 - regions.py + heap.py (region and chunk allocators)
 - index.py + index_writer.py (lock-free reads, lock-protected writes)
-- allocator.py (MemoryAllocatorInterface wrapper)
 
-Not yet wired: MP mode IPC (step 6), P2P PushKVToCXL (step 6), cache
-controller notifications for local tiers. The backend deliberately
-does NOT emit KVAdmitMsg/KVEvictMsg — CXL state is discovered via
-CXL_LOOKUP.
+**Keyed on `ObjectKey`.** The store is an L2 tier only -- it is driven
+exclusively by `CXLL2Adapter` and is not a `StorageBackendInterface`.
+It therefore speaks the L2 key type directly rather than bridging
+through `CacheEngineKey`, which previously discarded the `kv_rank` and
+`cache_salt` that distinguish TP shards and tenants.
+
+The shared CXL index addresses slots by a single u64
+(``index.py``: ``line0.chunk_hash != needle`` -> keep probing), so the
+full ObjectKey identity is folded into that u64 by
+:func:`object_key_to_chunk_hash`. Anything folded out aliases in the
+shared pool.
+
+The store deliberately does NOT emit KVAdmitMsg/KVEvictMsg -- CXL state
+is discovered via CXL_LOOKUP.
 """
 
 # Standard
 import threading
 import time
-from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from hashlib import blake2b
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
-    MemoryAllocatorInterface,
-    MemoryFormat,
     MemoryObj,
 )
-from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
-from lmcache.v1.storage_backend.cxl.allocator import CXLMemoryAllocator
 from lmcache.v1.storage_backend.cxl.bootstrap import (
     CXLBootstrapConfig,
     PoolHandle,
     bootstrap_pool,
 )
-from lmcache.v1.storage_backend.cxl.heap import NodeHeap, OutOfChunks
-from lmcache.v1.storage_backend.cxl.index import CXLIndex, SlotView
+from lmcache.v1.storage_backend.cxl.heap import OutOfChunks
+from lmcache.v1.storage_backend.cxl.heap_set import HeapSet
+from lmcache.v1.storage_backend.cxl.index import CXLIndex
 from lmcache.v1.storage_backend.cxl.index_writer import (
     CXLIndexWriter,
     ReserveOutcome,
     ReserveResult,
 )
-from lmcache.v1.storage_backend.cxl.layout import OWNER_FREE
+from lmcache.v1.storage_backend.cxl.layout import GEOM_HASH_SIZE, OWNER_FREE
 from lmcache.v1.storage_backend.cxl.lock_manager import LockManager
 from lmcache.v1.storage_backend.cxl.lock_manager_proc import (
     ProcessLockManager,
@@ -65,26 +69,137 @@ from lmcache.v1.storage_backend.cxl.regions import (
 logger = init_logger(__name__)
 
 
-@dataclass
-class CXLBackendConfig:
-    """Construction-time config for CXLBackend.
+def object_key_to_chunk_hash(key: ObjectKey) -> int:
+    """Derive the u64 CXL index hash from an ObjectKey's full identity.
 
-    In the real deployment these come from LMCacheEngineConfig's
-    `cxl_*` fields; the dataclass here is what the backend actually
+    The CXL index addresses slots by a single u64. That u64 must
+    distinguish every key that maps to a *different* KV payload,
+    because the index probe compares only this value
+    (``index.py``: ``line0.chunk_hash != needle`` -> keep probing).
+    Anything folded out here aliases in the shared pool.
+
+    Three ObjectKey fields beyond the content hash are therefore
+    mixed in:
+
+    - ``kv_rank``: under TP>1 the serving engine emits one ObjectKey
+      per rank that differ *only* in this field -- the token hash
+      carries no rank (see ``ipc_key_to_object_keys``). Folding it
+      out would alias every rank's shard onto one slot, so a rank-1
+      retrieve could be served rank-0's bytes.
+    - ``model_name``: distinct models must not share a slot.
+    - ``cache_salt``: per-user isolation (different users, same
+      content, different keys).
+
+    ``\\x00`` separators frame the variable-length fields.
+    ``ObjectKey.__post_init__`` forbids ``@`` in ``model_name`` and
+    ``@/\\`` plus NUL in ``cache_salt``, so NUL is an unambiguous
+    delimiter that cannot appear inside a field.
+
+    Args:
+        key: The L2 object key to hash.
+
+    Returns:
+        A 64-bit unsigned index hash.
+    """
+    return int.from_bytes(_tenant_digest(key, digest_size=8), "little")
+
+
+def object_key_to_tenant_digest(key: ObjectKey, geometry_salt: bytes = b"") -> bytes:
+    """Derive the 16-byte tenant discriminator stored in a slot.
+
+    The u64 index hash alone cannot safely identify a slot: two distinct
+    tenants that collide on it would produce a false hit, because the
+    probe compares only that value. This wider digest is stamped into
+    ``line0.geom_hash`` at insert and compared on every probe, so a
+    collision falls through to the next slot instead of returning
+    another tenant's bytes.
+
+    It covers the same identity as :func:`object_key_to_chunk_hash` --
+    ``chunk_hash``, ``model_name``, ``kv_rank``, ``cache_salt`` -- at 16
+    bytes rather than 8. At 2**20 resident chunks the residual
+    false-hit probability across both fields is ~2**-88.
+
+    ``geometry_salt``, when supplied, folds the KV geometry the bytes
+    were written under into the digest. Two nodes running the same
+    model under *different* geometry (e.g. a dtype mismatch) then
+    produce different digests for the same key, so neither reads the
+    other's chunks -- they miss instead of misinterpreting. The caller
+    supplies it because geometry is known to the adapter (from KV-cache
+    registration), not to the key.
+
+    It defaults to empty so a caller with no geometry to declare still
+    gets a well-defined digest; identity separation does not depend on
+    it.
+
+    Args:
+        key: The L2 object key to digest.
+        geometry_salt: Optional digest of the KV geometry these bytes
+            were written under.
+
+    Returns:
+        A 16-byte tenant discriminator.
+    """
+    return _tenant_digest(key, digest_size=GEOM_HASH_SIZE, geometry_salt=geometry_salt)
+
+
+def _tenant_digest(
+    key: ObjectKey, digest_size: int, geometry_salt: bytes = b""
+) -> bytes:
+    """Digest an ObjectKey's tenant identity at the requested width.
+
+    ``\\x00`` separators frame the variable-length fields.
+    ``ObjectKey.__post_init__`` forbids ``@`` in ``model_name`` and
+    ``@/\\`` plus NUL in ``cache_salt``, so NUL is an unambiguous
+    delimiter that cannot appear inside a field.
+
+    Args:
+        key: The L2 object key to digest.
+        digest_size: Output width in bytes.
+        geometry_salt: Optional trailing field; see
+            :func:`object_key_to_tenant_digest`.
+
+    Returns:
+        The digest bytes.
+    """
+    h = blake2b(digest_size=digest_size)
+    h.update(key.chunk_hash)
+    h.update(b"\x00")
+    h.update(key.model_name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(key.kv_rank.to_bytes(8, "little"))
+    h.update(b"\x00")
+    h.update(key.cache_salt.encode("utf-8"))
+    if geometry_salt:
+        h.update(b"\x00")
+        h.update(geometry_salt)
+    return h.digest()
+
+
+@dataclass
+class CXLStoreConfig:
+    """Construction-time config for CXLStore.
+
+    In the real deployment these come from the ``--l2-adapter`` JSON via
+    ``CXLL2AdapterConfig``; the dataclass here is what the store actually
     needs and keeps tests decoupled from the full config surface.
     """
 
     dev_path: str
     node_id: int
-    chunk_size_bytes: int
     region_size: int = 256 * 1024 * 1024
+    # Optional upper bound on a single chunk, as a guard against a garbled
+    # geometry asking for an absurd slab. Not a size to tune: heap classes
+    # are created from the exact byte size of what is actually stored.
+    # None disables the check (a class larger than region_size still fails
+    # loudly when its heap is created).
+    max_chunk_size_bytes: Optional[int] = None
     initialize: bool = False
     generation: int = 1
     run_lock_manager: bool = True
     pool_size_override: Optional[int] = None
     max_nodes: Optional[int] = None
     num_locks: Optional[int] = None
-    # Node-local LRU eviction (see CXLBackend eviction ladder). When a store
+    # Node-local LRU eviction (see CXLStore eviction ladder). When a store
     # cannot claim a new region because the *global* pool is exhausted, the
     # node evicts its own coldest chunks back into its heap free-list and
     # retries the store from there, capping its footprint instead of dropping
@@ -106,7 +221,7 @@ class CXLBackendConfig:
 
 @dataclass
 class ClearResult:
-    """Outcome of :meth:`CXLBackend.clear`.
+    """Outcome of :meth:`CXLStore.clear`.
 
     Attributes:
         chunks_deleted: Number of this node's VALID chunks tombstoned and
@@ -123,32 +238,33 @@ class ClearResult:
     regions_released: int
 
 
-class CXLBackend(AllocatorBackendInterface):
-    """CXL shared-memory L2 tier.
+class CXLStore:
+    """CXL shared-memory L2 tier: a content-addressed KV object store.
 
-    Single-process for now: one CXLBackend per MP server process
-    (step 6 will add cross-process / cross-node wiring). Implements
-    AllocatorBackendInterface so it plugs into StorageManager.
+    One store per MP server process, driven by :class:`CXLL2Adapter`.
+    It is deliberately **not** a ``StorageBackendInterface``: nothing
+    registers it as an in-process storage backend, and the read path
+    copies into a caller-owned buffer (:meth:`read_into`) or hands the
+    caller a source pointer (:meth:`gpu_src_view`) rather than
+    allocating and owning ``MemoryObj``s.
+
+    The store never interprets chunk bytes. A slot carries a byte
+    length and a format tag; callers reinterpret via a GPUConnector
+    that knows the KV geometry.
 
     Lifecycle:
-      1. __init__ takes a CXLBackendConfig + LMCacheMetadata and runs
-         the full bootstrap. After __init__, the pool is mmap'd,
-         cudaHostRegister'd (best effort), the lock manager is running
-         (if enabled), and the backend is ready to serve put/get.
-      2. close() stops the lock manager, closes the pool. Does NOT
+      1. __init__ takes a CXLStoreConfig and runs the full bootstrap.
+         After it returns, the pool is mmap'd, cudaHostRegister'd (best
+         effort), the lock manager is running (if enabled), and the
+         store is ready to serve put/read.
+      2. close() stops the lock manager and closes the pool. It does NOT
          initialize the pool on close — a restart of the same node
          should re-attach to the existing header.
     """
 
-    def __init__(
-        self,
-        cxl_config: CXLBackendConfig,
-        metadata: LMCacheMetadata,
-        dst_device: str = "cuda",
-    ):
-        super().__init__(dst_device=dst_device)
+    def __init__(self, cxl_config: CXLStoreConfig):
         self._node_id = cxl_config.node_id
-        self._chunk_size_bytes = cxl_config.chunk_size_bytes
+        self._max_chunk_size_bytes = cxl_config.max_chunk_size_bytes
         if not 0.0 < cxl_config.evict_low_watermark <= 1.0:
             raise ValueError(
                 "evict_low_watermark must be in (0.0, 1.0], got "
@@ -173,15 +289,16 @@ class CXLBackend(AllocatorBackendInterface):
             pool_size_override=cxl_config.pool_size_override,
             **bootstrap_kwargs,
         )
-        self._pool: PoolHandle = bootstrap_pool(bootstrap_cfg, metadata)
+        self._pool: PoolHandle = bootstrap_pool(bootstrap_cfg)
         self._fence = None  # default StubFence; explicit None == use module default
 
         # Two-tier lock shared across all subsystems on this node.
         self._lock = TwoTierLock(self._pool, node_id=self._node_id)
 
-        # Lock manager (single-writer arbiter). In multi-node runs this
-        # should run on one elected node only. For the skeleton, every
-        # backend starts one; later steps will add election.
+        # Lock manager (single-writer arbiter). Exactly one node per rack
+        # runs it, selected by config (`run_lock_manager`); there is no
+        # election. A second arbiter on the same pool is a correctness
+        # bug -- both would drive WAITING -> LOCKED transitions.
         #
         # Two implementations:
         #   - ProcessLockManager: runs a small C binary as a sidecar
@@ -203,16 +320,12 @@ class CXLBackend(AllocatorBackendInterface):
                 self._lock_manager = LockManager(self._pool)
                 self._lock_manager.start()
 
-        # Region + heap + allocator.
+        # Region + per-geometry heap classes. A class is created on first
+        # use from the exact byte size of the chunk being stored, so one
+        # pool serves many models/TP degrees without any size declared up
+        # front. ``max_chunk_size_bytes``, when set, is only a guard.
         self._region_allocator = RegionAllocator(self._pool, self._lock)
-        self._heap = NodeHeap(
-            self._region_allocator,
-            node_id=self._node_id,
-            chunk_size=self._chunk_size_bytes,
-        )
-        self._mem_allocator = CXLMemoryAllocator(
-            heap=self._heap, pool_base=self._pool.base
-        )
+        self._heaps = HeapSet(self._region_allocator, node_id=self._node_id)
 
         # Index reader + writer.
         self._index = CXLIndex(self._pool)
@@ -220,76 +333,193 @@ class CXLBackend(AllocatorBackendInterface):
             self._pool, self._index, self._lock, self._node_id
         )
 
-        # Map: chunk_hash -> slot_idx, for quick remove/pin by key.
+        # Map: chunk_hash -> slot_idx, for quick unpin/lookup by key.
         # The index itself is the source of truth; this is an O(1)
         # cache to skip probing when the caller already knows the key.
+        # Keyed on the u64 (not the ObjectKey) because eviction
+        # invalidates entries from the slot's own stored hash, which is
+        # all it can read back from CXL.
         self._key_to_slot: dict[int, int] = {}
         self._key_to_slot_lock = threading.Lock()
+
+        # Per-model KV geometry digests, declared via `set_geometry` when
+        # the serving engine registers its KV caches. Folded into each
+        # chunk's tenant digest so a node running the same model under a
+        # different geometry misses rather than misreads. Empty until
+        # declared, which is the correct default: a pool whose writers
+        # never declare geometry behaves exactly as before.
+        self._geometry: Dict[str, bytes] = {}
+        self._geometry_lock = threading.Lock()
 
         # Node-local LRU recency over the slots this node owns. Touched on every
         # local read/commit (DRAM only, no CXL write) and consulted only when a
         # store must evict to reclaim free-list space after region exhaustion.
         self._lru = NodeLRUTracker()
 
-        # In-flight put futures keyed by chunk_hash — tracked so
-        # `exists_in_put_tasks` can answer correctly.
-        self._inflight_puts: set[int] = set()
-        self._inflight_lock = threading.Lock()
-
         logger.info(
-            "CXLBackend ready: node_id=%d chunk_size=%d pool_size=%d regions=%d",
+            "CXLStore ready: node_id=%d pool_size=%d regions=%d",
             self._node_id,
-            self._chunk_size_bytes,
             self._pool.size,
             self._pool.layout.region_count,
         )
 
+    # -------- accessors --------------------------------------------------
+    #
+    # The cross-node donor/requester machinery (CXLDonor, remote_fetch) is
+    # built on the pool primitives directly rather than on the store, so the
+    # adapter needs to hand them out. These are read-only views of state the
+    # store owns; they exist so callers never reach into private members.
+
+    @property
+    def node_id(self) -> int:
+        """This node's id within the rack-wide ``max_nodes`` space."""
+        return self._node_id
+
+    @property
+    def max_chunk_size_bytes(self) -> Optional[int]:
+        """Optional upper bound on one chunk's size, or None."""
+        return self._max_chunk_size_bytes
+
+    @property
+    def pool(self) -> PoolHandle:
+        """The mmap'd pool handle (header, layout, base address)."""
+        return self._pool
+
+    @property
+    def index_writer(self) -> CXLIndexWriter:
+        """The lock-protected index writer over this pool."""
+        return self._index_writer
+
+    @property
+    def heaps(self) -> HeapSet:
+        """This node's per-geometry chunk free-lists."""
+        return self._heaps
+
+    def set_geometry(self, model_name: str, geometry_salt: bytes) -> None:
+        """Declare the KV geometry `model_name` writes under.
+
+        The salt is folded into the tenant digest of every chunk for that
+        model, so a peer that wrote the same model under a different
+        geometry produces different digests and is simply missed rather
+        than read back misinterpreted.
+
+        Declaring a *different* salt for a model that already has one is
+        a programming error, not a peer disagreement: it would silently
+        orphan every chunk this node already wrote.
+
+        Args:
+            model_name: The model these bytes belong to.
+            geometry_salt: A digest of its KV geometry.
+
+        Raises:
+            ValueError: If a conflicting salt was already declared for
+                this model in this process.
+        """
+        with self._geometry_lock:
+            existing = self._geometry.get(model_name)
+            if existing is not None and existing != geometry_salt:
+                raise ValueError(
+                    f"geometry for model {model_name!r} already declared as "
+                    f"{existing.hex()}; refusing to redeclare as "
+                    f"{geometry_salt.hex()}"
+                )
+            self._geometry[model_name] = geometry_salt
+
+    def tenant_digest_for(self, key: ObjectKey) -> bytes:
+        """Return `key`'s tenant digest, salted by its model's geometry.
+
+        Exposed so the cross-node requester stamps reserved slots with
+        the same digest this store would, rather than the bare identity
+        digest.
+
+        Args:
+            key: The object key to digest.
+
+        Returns:
+            The 16-byte discriminator for this key on this node.
+        """
+        return self._digest_for(key)
+
+    def _digest_for(self, key: ObjectKey) -> bytes:
+        """Return `key`'s tenant digest, salted by its model's geometry."""
+        with self._geometry_lock:
+            salt = self._geometry.get(key.model_name, b"")
+        return object_key_to_tenant_digest(key, salt)
+
+    def slot_index_of(self, key: ObjectKey) -> Optional[int]:
+        """Return the index slot currently holding `key`, or None on miss.
+
+        A read-only probe exposed for diagnostics and tests that need to
+        inspect on-CXL slot state (pin/ref counts) for a key.
+
+        Args:
+            key: The object key to resolve.
+
+        Returns:
+            The slot index of the VALID slot for this key, else None.
+        """
+        view = self._index.lookup_by_hash(
+            object_key_to_chunk_hash(key), self._digest_for(key)
+        )
+        return None if view is None else view.slot_idx
+
+    @property
+    def region_allocator(self) -> RegionAllocator:
+        """The shared region allocator over this pool's bitmap."""
+        return self._region_allocator
+
+    @property
+    def epoch(self) -> int:
+        """The pool's current generation, as stamped in the header."""
+        return int(self._pool.header.gen)
+
     # -------- read path --------------------------------------------------
 
-    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        view = self._index.lookup(key)
+    def contains(self, key: ObjectKey, pin: bool = False) -> bool:
+        """Report whether the pool holds `key`, optionally pinning it.
+
+        Args:
+            key: The object key to look up.
+            pin: When True, take a pin on a hit so the slot cannot be
+                evicted until :meth:`unpin`. A pin that loses a race with
+                a concurrent eviction reports a miss.
+
+        Returns:
+            True if a VALID slot holds this key (and, when ``pin``, the
+            pin was taken).
+        """
+        chunk_hash = object_key_to_chunk_hash(key)
+        view = self._index.lookup_by_hash(chunk_hash, self._digest_for(key))
         if view is None:
             return False
         if pin and not self._index_writer.pin(view.slot_idx):
             # Slot flipped (evicted) between lookup and pin.
             return False
-        self._cache_slot(key, view.slot_idx)
+        self._cache_slot(chunk_hash, view.slot_idx)
         return True
-
-    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
-        with self._inflight_lock:
-            return key.chunk_hash in self._inflight_puts
-
-    def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        view = self._index.lookup(key)
-        if view is None:
-            return None
-        # Bump ref count under the slot lock and re-verify.
-        if not self._index_writer.ref_count_up(view.slot_idx):
-            return None
-        # Re-fetch the slot to capture the canonical post-pin state.
-        post = self._index.lookup(key)
-        if post is None or post.slot_idx != view.slot_idx:
-            # Slot was evicted concurrently; back out the ref_count.
-            self._index_writer.ref_count_down(view.slot_idx)
-            return None
-        self._cache_slot(key, view.slot_idx)
-        return self._materialize(post)
 
     def read_into(
         self,
-        key: CacheEngineKey,
+        key: ObjectKey,
         dst_ptr: int,
         dst_size: int,
         phase_ns: Optional[List[int]] = None,
     ) -> int:
         """Fast hit path: memcpy a chunk directly into `dst_ptr`.
 
-        Returns bytes copied, or 0 on miss. Avoids building a `MemoryObj`
-        wrapper (numpy/torch view + ctypes array) for the source — that
-        wrapping dominates the per-chunk cost in the load path. Callers
-        that don't need a Python-level view of the chunk should use this
-        instead of `get_blocking`.
+        The store never builds a Python-level view of the chunk: the
+        caller owns the destination buffer and reinterprets the bytes
+        via a GPUConnector that knows the KV geometry.
+
+        Args:
+            key: The object key to read.
+            dst_ptr: Destination host address.
+            dst_size: Destination capacity in bytes; the copy is capped
+                at this and at the slot's own ``chunk_len``.
+            phase_ns: Optional 11-slot list accumulating the timings below.
+
+        Returns:
+            Bytes copied, or 0 on miss.
 
         If `phase_ns` is provided (length 11), accumulates per-phase
         nanosecond timings:
@@ -309,8 +539,10 @@ class CXLBackend(AllocatorBackendInterface):
         refup_sub_list = [0, 0, 0] if phase_ns is not None else None
         refdown_sub_list = [0, 0, 0] if phase_ns is not None else None
 
+        chunk_hash = object_key_to_chunk_hash(key)
+        tenant_digest = self._digest_for(key)
         t0 = time.perf_counter_ns()
-        view = self._index.lookup(key)
+        view = self._index.lookup_by_hash(chunk_hash, tenant_digest)
         t1 = time.perf_counter_ns()
         if phase_ns is not None:
             phase_ns[0] += t1 - t0
@@ -328,13 +560,13 @@ class CXLBackend(AllocatorBackendInterface):
             for j in range(3):
                 phase_ns[5 + j] += refup_sub_list[j]
         try:
-            post = self._index.lookup(key)
+            post = self._index.lookup_by_hash(chunk_hash, tenant_digest)
             t3 = time.perf_counter_ns()
             if phase_ns is not None:
                 phase_ns[2] += t3 - t2
             if post is None or post.slot_idx != view.slot_idx:
                 return 0
-            self._cache_slot(key, view.slot_idx)
+            self._cache_slot(chunk_hash, view.slot_idx)
             n = min(post.chunk_len, dst_size)
             ctypes.memmove(dst_ptr, self._pool.base + post.chunk_offset, n)
             t4 = time.perf_counter_ns()
@@ -349,55 +581,30 @@ class CXLBackend(AllocatorBackendInterface):
                 for j in range(3):
                     phase_ns[8 + j] += refdown_sub_list[j]
 
-    def batched_contains(self, keys: List[CacheEngineKey], pin: bool = False) -> int:
-        hit = 0
-        for k in keys:
-            if not self.contains(k, pin=pin):
-                break
-            hit += 1
-        return hit
-
-    async def batched_async_contains(
-        self,
-        lookup_id: str,
-        keys: List[CacheEngineKey],
-        pin: bool = False,
-    ) -> int:
-        return self.batched_contains(keys, pin=pin)
-
-    async def batched_get_non_blocking(
-        self,
-        lookup_id: str,
-        keys: List[CacheEngineKey],
-        transfer_spec: Any = None,
-    ) -> List[MemoryObj]:
-        out: List[MemoryObj] = []
-        for k in keys:
-            obj = self.get_blocking(k)
-            if obj is None:
-                break
-            out.append(obj)
-        return out
-
     # -------- write path -------------------------------------------------
 
-    def batched_submit_put_task(
+    def put_batch(
         self,
-        keys: Sequence[CacheEngineKey],
+        keys: Sequence[ObjectKey],
         objs: List[MemoryObj],
-        transfer_spec: Any = None,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> Optional[List[Future]]:
-        """Synchronous batched put; returns None (completed inline).
+    ) -> None:
+        """Store a batch of chunks into the pool. Completes inline.
 
-        In the skeleton we copy bytes directly from the source obj to
-        CXL. The future-returning async path is a later step when DMA
-        is actually asynchronous.
+        The batch lands whole or not at all: when the pool is exhausted,
+        this evicts the node's cold chunks *once* for the whole batch,
+        and drops the entire batch if that still cannot free room. A
+        per-key failure is logged and skipped, leaving the rest stored.
+
+        Args:
+            keys: Object keys to store, positionally matching ``objs``.
+            objs: Source memory objects. The caller retains ownership;
+                the store copies out of them and never frees them.
+
+        Raises:
+            ValueError: If ``keys`` and ``objs`` differ in length.
         """
         if len(keys) != len(objs):
-            raise ValueError(
-                f"batched_submit_put_task: {len(keys)} keys vs {len(objs)} objs"
-            )
+            raise ValueError(f"put_batch: {len(keys)} keys vs {len(objs)} objs")
         # Batch admission: when the pool is exhausted, evict this node's cold
         # chunks *once* for the whole batch (evict-as-much-as-possible). If
         # eviction still cannot free room for every chunk, drop the entire
@@ -410,87 +617,74 @@ class CXLBackend(AllocatorBackendInterface):
                 self._node_id,
                 len(keys),
             )
-            return None
+            return
         for key, obj in zip(keys, objs, strict=True):
             try:
                 self._put_one(key, obj)
-                if on_complete_callback is not None:
-                    try:
-                        on_complete_callback(key)
-                    except Exception:
-                        logger.exception("on_complete_callback raised for key %s", key)
             except Exception:
                 logger.exception("failed to put key %s; skipping", key)
-        return None
 
-    async def async_batched_submit_put_task(
-        self,
-        keys: Sequence[CacheEngineKey],
-        objs: List[MemoryObj],
-        transfer_spec: Any = None,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> None:
-        self.batched_submit_put_task(keys, objs, transfer_spec, on_complete_callback)
-
-    def _put_one(self, key: CacheEngineKey, src: MemoryObj) -> None:
+    def _put_one(self, key: ObjectKey, src: MemoryObj) -> None:
         """Full INSERT lifecycle for one key.
 
         Steps:
-          1. Mark in-flight for exists_in_put_tasks.
-          2. reserve_slot; if ALREADY_PRESENT, skip; if WAIT, poll.
-          3. Allocate a chunk from the heap.
-          4. Copy bytes from src.raw_data into the chunk.
-          5. commit_slot (publish VALID).
+          1. reserve_slot; if ALREADY_PRESENT, skip; if WAIT, poll.
+          2. Allocate a chunk from the heap.
+          3. Copy bytes from src.raw_data into the chunk.
+          4. commit_slot (publish VALID).
         On any failure, release_slot and free the chunk.
+
+        Args:
+            key: The object key to store under.
+            src: Source memory object; the caller retains ownership.
+
+        Raises:
+            ValueError: If the payload exceeds the pool's chunk size.
         """
-        with self._inflight_lock:
-            self._inflight_puts.add(key.chunk_hash)
+        chunk_hash = object_key_to_chunk_hash(key)
+        result = self._reserve_with_retries(chunk_hash, self._digest_for(key))
+        if result.outcome == ReserveOutcome.ALREADY_PRESENT:
+            if result.slot_idx is not None:
+                self._cache_slot(chunk_hash, result.slot_idx)
+            return
+        if result.outcome == ReserveOutcome.INDEX_FULL:
+            logger.warning("CXL index full; put for key %s dropped", key)
+            return
+        if result.slot_idx is None:
+            return
+        slot_idx = result.slot_idx
+
+        size_bytes = src.get_size()
+        if self._max_chunk_size_bytes and size_bytes > self._max_chunk_size_bytes:
+            self._index_writer.release_slot(slot_idx)
+            raise ValueError(
+                f"payload {size_bytes} bytes exceeds max_chunk_size_bytes "
+                f"{self._max_chunk_size_bytes}"
+            )
+
         try:
-            result = self._reserve_with_retries(key)
-            if result.outcome == ReserveOutcome.ALREADY_PRESENT:
-                if result.slot_idx is not None:
-                    self._cache_slot(key, result.slot_idx)
-                return
-            if result.outcome == ReserveOutcome.INDEX_FULL:
-                logger.warning("CXL index full; put for key %s dropped", key)
-                return
-            if result.slot_idx is None:
-                return
-            slot_idx = result.slot_idx
+            chunk_offset = self._alloc_chunk_with_eviction(size_bytes)
+        except Exception:
+            self._index_writer.release_slot(slot_idx)
+            raise
 
-            size_bytes = src.get_size()
-            if size_bytes > self._chunk_size_bytes:
-                self._index_writer.release_slot(slot_idx)
-                raise ValueError(
-                    f"payload {size_bytes} bytes > chunk size {self._chunk_size_bytes}"
-                )
+        try:
+            self._copy_into_chunk(src, chunk_offset, size_bytes)
+            self._index_writer.commit_slot(
+                slot_idx=slot_idx,
+                chunk_offset=chunk_offset,
+                chunk_len=size_bytes,
+                fmt=src.meta.fmt,
+            )
+            # _cache_slot also refreshes LRU recency, so the freshly
+            # committed slot is most-recently-used.
+            self._cache_slot(chunk_hash, slot_idx)
+        except Exception:
+            self._heaps.free(chunk_offset)
+            self._index_writer.release_slot(slot_idx)
+            raise
 
-            try:
-                chunk_offset = self._alloc_chunk_with_eviction()
-            except Exception:
-                self._index_writer.release_slot(slot_idx)
-                raise
-
-            try:
-                self._copy_into_chunk(src, chunk_offset, size_bytes)
-                self._index_writer.commit_slot(
-                    slot_idx=slot_idx,
-                    chunk_offset=chunk_offset,
-                    chunk_len=size_bytes,
-                    fmt=src.meta.fmt,
-                )
-                # _cache_slot also refreshes LRU recency, so the freshly
-                # committed slot is most-recently-used.
-                self._cache_slot(key, slot_idx)
-            except Exception:
-                self._heap.free(chunk_offset)
-                self._index_writer.release_slot(slot_idx)
-                raise
-        finally:
-            with self._inflight_lock:
-                self._inflight_puts.discard(key.chunk_hash)
-
-    def _alloc_chunk_with_eviction(self) -> int:
+    def _alloc_chunk_with_eviction(self, size_bytes: int) -> int:
         """Allocate one chunk offset, evicting local cold chunks if needed.
 
         The store allocation ladder:
@@ -507,6 +701,9 @@ class CXLBackend(AllocatorBackendInterface):
              method re-raises the original ``NoRegionAvailable`` so the caller
              drops the store.
 
+        Args:
+            size_bytes: Exact chunk size; selects the heap class.
+
         Returns:
             A pool-relative chunk offset.
 
@@ -515,17 +712,19 @@ class CXLBackend(AllocatorBackendInterface):
                 free any local slot.
         """
         try:
-            return self._heap.alloc()
+            return self._heaps.alloc(size_bytes)
         except NoRegionAvailable:
             self._evict_cold_slots(target=1)
             try:
-                return self._heap.alloc_no_claim()
+                return self._heaps.alloc_no_claim(size_bytes)
             except OutOfChunks:
-                # Nothing evictable (all cold slots pinned / in-flight).
+                # Nothing evictable in this class (all cold slots pinned or
+                # in-flight), or eviction freed slots of a different size.
                 logger.warning(
-                    "CXL node %d: pool exhausted and no evictable local chunk; "
-                    "dropping store",
+                    "CXL node %d: pool exhausted and no evictable local chunk "
+                    "for size %d; dropping store",
                     self._node_id,
+                    size_bytes,
                 )
                 raise NoRegionAvailable(
                     "pool exhausted and local eviction freed no chunk"
@@ -556,7 +755,7 @@ class CXLBackend(AllocatorBackendInterface):
         """
         if n <= 0:
             return True
-        occupied, total = self._heap.occupancy()
+        occupied, total = self._heaps.occupancy()
         free_now = total - occupied
         if free_now >= n:
             return True
@@ -568,7 +767,7 @@ class CXLBackend(AllocatorBackendInterface):
         # Pool exhausted: free the shortfall from local cold chunks.
         shortfall = n - free_now
         self._evict_cold_slots(target=shortfall)
-        occupied_after, total_after = self._heap.occupancy()
+        occupied_after, total_after = self._heaps.occupancy()
         return (total_after - occupied_after) >= n
 
     def _pool_has_claimable_region(self) -> bool:
@@ -594,8 +793,18 @@ class CXLBackend(AllocatorBackendInterface):
         :meth:`CXLIndexWriter.evict` and skipped (dropped from the LRU so it is
         not retried this pass); its chunk stays resident.
 
-        Freed chunks return to the node heap's free-list for immediate reuse by
-        the retrying store; regions are never released here.
+        Freed chunks return to their own class's free-list for immediate reuse;
+        regions are never released here.
+
+        **Eviction is class-agnostic**: it drops the globally coldest chunks by
+        LRU, which may belong to a different size class than the store that
+        triggered it. Those freed slots do not help the triggering store — its
+        retry uses ``alloc_no_claim`` on its own class. This is deliberate:
+        evicting by recency across the whole node is the right global policy,
+        and the freed regions become claimable once a class trims them. The
+        consequence is that a store can still fail after a successful eviction
+        pass when the pool is full of *other* classes; the caller drops that
+        store and a later one succeeds once ``trim`` returns the regions.
 
         Args:
             target: Minimum number of slots to free (the store needs this many;
@@ -606,7 +815,7 @@ class CXLBackend(AllocatorBackendInterface):
         Returns:
             The number of chunks actually evicted this pass.
         """
-        occupied, total = self._heap.occupancy()
+        occupied, total = self._heaps.occupancy()
         if total == 0:
             return 0
         floor = int(self._evict_low_watermark * total)
@@ -625,7 +834,7 @@ class CXLBackend(AllocatorBackendInterface):
                 continue
             assert view is not None
             try:
-                self._heap.free(view.chunk_offset)
+                self._heaps.free(view.chunk_offset)
             except Exception:
                 logger.exception(
                     "CXL node %d: heap.free failed evicting slot %d offset %d; "
@@ -650,10 +859,14 @@ class CXLBackend(AllocatorBackendInterface):
         return freed
 
     def _reserve_with_retries(
-        self, key: CacheEngineKey, max_waits: int = 100, wait_sleep_s: float = 0.001
+        self,
+        chunk_hash: int,
+        tenant_digest: bytes,
+        max_waits: int = 100,
+        wait_sleep_s: float = 0.001,
     ) -> ReserveResult:
         for _ in range(max_waits):
-            result = self._index_writer.reserve_slot(key)
+            result = self._index_writer.reserve_slot(chunk_hash, tenant_digest)
             if result.outcome != ReserveOutcome.WAIT_FOR_OTHER:
                 return result
             # Another writer is on this key; poll briefly and try again.
@@ -665,10 +878,14 @@ class CXLBackend(AllocatorBackendInterface):
     ) -> None:
         """Copy `size_bytes` from src.raw_data into the CXL chunk.
 
-        In the real GPU path this will be a DMA; for the single-process
-        skeleton we just memcpy. `src.raw_data` is typically a uint8
-        flat tensor per LocalCPU's allocator, but we handle arbitrary
-        shape/dtype by flattening its byte view.
+        `src.raw_data` is typically a uint8 flat tensor per LocalCPU's
+        allocator, but arbitrary shape/dtype is handled by flattening
+        its byte view.
+
+        Args:
+            src: Source memory object to copy from.
+            chunk_offset: Pool-relative destination offset.
+            size_bytes: Number of bytes to copy.
         """
         dst_addr = self._pool.base + chunk_offset
         # Flatten src to a contiguous uint8 view for a raw memcpy.
@@ -681,53 +898,14 @@ class CXLBackend(AllocatorBackendInterface):
 
         ctypes.memmove(dst_addr, src_ptr, size_bytes)
 
-    def _materialize(self, view: SlotView) -> MemoryObj:
-        """Build a MemoryObj that views the CXL chunk for a HIT."""
-        # Standard
-        import ctypes
-
-        # Third Party
-        import numpy as np
-
-        fmt = MemoryFormat(view.fmt) if view.fmt != 0 else MemoryFormat.UNDEFINED
-        buf_type = ctypes.c_uint8 * self._chunk_size_bytes
-        ctypes_buf = buf_type.from_address(self._pool.base + view.chunk_offset)
-        np_buf = np.frombuffer(ctypes_buf, dtype=np.uint8, count=self._chunk_size_bytes)
-        raw_data = torch.from_numpy(np_buf)
-
-        # We don't know the caller's intended (shape, dtype) at get
-        # time — the slot only carries the format and a byte length.
-        # Return a 1-D uint8 MemoryObj sized to chunk_len; callers
-        # reinterpret via a GPUConnector that knows the KV geometry.
-        shape = torch.Size([view.chunk_len])
-        dtype = torch.uint8
-        # First Party
-        from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
-
-        meta = MemoryObjMetadata(
-            shape=shape,
-            dtype=dtype,
-            address=self._pool.base + view.chunk_offset,
-            phy_size=self._chunk_size_bytes,
-            ref_count=1,  # caller will ref_count_down to release the pin
-            pin_count=0,
-            fmt=fmt,
-        )
-        obj = TensorMemoryObj(
-            raw_data=raw_data,
-            metadata=meta,
-            parent_allocator=_SlotRefcountAdapter(self, view.slot_idx, np_buf),
-        )
-        return obj
-
-    def gpu_src_view(self, key: CacheEngineKey) -> Optional[Tuple[int, int]]:
+    def gpu_src_view(self, key: ObjectKey) -> Optional[Tuple[int, int]]:
         """Resolve a chunk's host source address for a GPU-direct H2D copy.
 
         Returns ``(n_bytes, src_host_ptr)`` where ``src_host_ptr`` points
         into the (``cudaHostRegister``'d) CXL pool, suitable as the source
         of an async ``cudaMemcpyAsync`` H2D. Returns ``None`` on miss.
 
-        Unlike ``read_into`` / ``get_blocking`` this does NOT bump
+        Unlike :meth:`read_into` this does NOT bump
         ``ref_count``: the L2-resident retrieve path relies on the
         ``pin_count`` held since ``lookup_and_lock`` to keep the slot alive
         for the duration of the DMA. The caller MUST hold that pin (i.e.
@@ -735,35 +913,53 @@ class CXLBackend(AllocatorBackendInterface):
         it via ``unpin(key)`` only after the stream confirms the copy.
 
         Args:
-            key: The chunk's cache key.
+            key: The chunk's object key.
 
         Returns:
             ``(n_bytes, src_host_ptr)`` on hit, or ``None`` on miss.
         """
-        view = self._index.lookup(key)
+        chunk_hash = object_key_to_chunk_hash(key)
+        view = self._index.lookup_by_hash(chunk_hash, self._digest_for(key))
         if view is None:
             return None
-        self._cache_slot(key, view.slot_idx)
+        self._cache_slot(chunk_hash, view.slot_idx)
         return view.chunk_len, self._pool.base + view.chunk_offset
 
     # -------- pin / unpin / remove --------------------------------------
 
-    def pin(self, key: CacheEngineKey) -> bool:
-        view = self._index.lookup(key)
+    def pin(self, key: ObjectKey) -> bool:
+        """Pin one key so its slot cannot be evicted until :meth:`unpin`.
+
+        Args:
+            key: The object key to pin.
+
+        Returns:
+            True if a VALID slot was found and pinned.
+        """
+        chunk_hash = object_key_to_chunk_hash(key)
+        view = self._index.lookup_by_hash(chunk_hash, self._digest_for(key))
         if view is None:
             return False
         ok = self._index_writer.pin(view.slot_idx)
         if ok:
-            self._cache_slot(key, view.slot_idx)
+            self._cache_slot(chunk_hash, view.slot_idx)
         return ok
 
-    def unpin(self, key: CacheEngineKey) -> bool:
+    def unpin(self, key: ObjectKey) -> bool:
+        """Release one pin taken by :meth:`pin` or ``contains(pin=True)``.
+
+        Args:
+            key: The object key to unpin.
+
+        Returns:
+            True if a slot was found and its pin released.
+        """
         slot_idx = self._lookup_slot(key)
         if slot_idx is None:
             return False
         return self._index_writer.unpin(slot_idx)
 
-    def pin_batch(self, keys: List[CacheEngineKey]) -> List[bool]:
+    def pin_batch(self, keys: List[ObjectKey]) -> List[bool]:
         """Pin many keys with a single batched lock acquisition.
 
         Resolves each key to its slot, then pins all of them under one
@@ -780,22 +976,27 @@ class CXLBackend(AllocatorBackendInterface):
         # Resolve keys to slots; track which input positions have a slot.
         positions: List[int] = []
         slot_idxs: List[int] = []
+        hashes: List[int] = []
         for i, key in enumerate(keys):
-            view = self._index.lookup(key)
+            chunk_hash = object_key_to_chunk_hash(key)
+            view = self._index.lookup_by_hash(chunk_hash, self._digest_for(key))
             if view is None:
                 continue
             positions.append(i)
             slot_idxs.append(view.slot_idx)
+            hashes.append(chunk_hash)
         if not slot_idxs:
             return results
         pinned = self._index_writer.pin_batch(slot_idxs)
-        for pos, slot_idx, ok in zip(positions, slot_idxs, pinned, strict=True):
+        for pos, chunk_hash, slot_idx, ok in zip(
+            positions, hashes, slot_idxs, pinned, strict=True
+        ):
             if ok:
-                self._cache_slot(keys[pos], slot_idx)
+                self._cache_slot(chunk_hash, slot_idx)
                 results[pos] = True
         return results
 
-    def unpin_batch(self, keys: List[CacheEngineKey]) -> List[bool]:
+    def unpin_batch(self, keys: List[ObjectKey]) -> List[bool]:
         """Unpin many keys with a single batched lock acquisition.
 
         Release counterpart to :meth:`pin_batch`. Keys with no known slot
@@ -823,23 +1024,39 @@ class CXLBackend(AllocatorBackendInterface):
             results[pos] = ok
         return results
 
-    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+    def remove(self, key: ObjectKey) -> bool:
+        """Evict one key's slot and return its chunk to the node heap.
+
+        Refuses a slot that is pinned or has an in-flight read
+        (``ref_count != 0``); the caller sees ``False``.
+
+        Args:
+            key: The object key to evict.
+
+        Returns:
+            True if the slot was tombstoned and its chunk freed.
+        """
+        chunk_hash = object_key_to_chunk_hash(key)
         slot_idx = self._lookup_slot(key)
         if slot_idx is None:
             return False
         ok, view = self._index_writer.evict(slot_idx)
         if not ok:
             return False
-        assert view is not None
+        if view is None:
+            raise RuntimeError(
+                f"index_writer.evict reported success for slot {slot_idx} "
+                "but returned no SlotView"
+            )
         try:
-            self._heap.free(view.chunk_offset)
+            self._heaps.free(view.chunk_offset)
         except Exception:
             logger.exception(
                 "heap.free failed for slot %d offset %d; leaking chunk",
                 slot_idx,
                 view.chunk_offset,
             )
-        self._forget_slot(key)
+        self._forget_slot_by_hash(chunk_hash)
         self._lru.forget(slot_idx)
         return True
 
@@ -867,7 +1084,7 @@ class CXLBackend(AllocatorBackendInterface):
         freed_offsets, skipped_busy = self._index_writer.clear_owned_slots()
         if freed_offsets:
             try:
-                self._heap.free_batch(freed_offsets)
+                self._heaps.free_batch(freed_offsets)
             except Exception:
                 logger.exception(
                     "heap.free_batch failed during clear() for %d offsets; "
@@ -879,9 +1096,9 @@ class CXLBackend(AllocatorBackendInterface):
         with self._key_to_slot_lock:
             self._key_to_slot.clear()
         self._lru.clear()
-        released = self._heap.trim()
+        released = self._heaps.trim()
         logger.info(
-            "CXLBackend.clear (node=%d): deleted %d chunks, skipped %d busy, "
+            "CXLStore.clear (node=%d): deleted %d chunks, skipped %d busy, "
             "released %d regions",
             self._node_id,
             len(freed_offsets),
@@ -894,54 +1111,6 @@ class CXLBackend(AllocatorBackendInterface):
             regions_released=len(released),
         )
 
-    # -------- AllocatorBackendInterface ---------------------------------
-
-    def initialize_allocator(
-        self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
-    ) -> MemoryAllocatorInterface:
-        # Allocator was built in __init__; return the existing one.
-        return self._mem_allocator
-
-    def get_memory_allocator(self) -> MemoryAllocatorInterface:
-        return self._mem_allocator
-
-    def allocate(
-        self,
-        shapes,
-        dtypes,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        eviction: bool = True,
-        busy_loop: bool = True,
-    ) -> Optional[MemoryObj]:
-        obj = self._mem_allocator.allocate(shapes, dtypes, fmt)
-        if obj is not None or not eviction:
-            return obj
-        # Eviction fallback is a step-5-scope simplification: we just
-        # retry with eviction=False after a single LRU pass in later
-        # slices. For now, return None on exhaustion.
-        return None
-
-    def batched_allocate(
-        self,
-        shapes,
-        dtypes,
-        batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        eviction: bool = True,
-        busy_loop: bool = True,
-    ) -> Optional[List[MemoryObj]]:
-        return self._mem_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
-
-    def calculate_chunk_budget(self) -> int:
-        """Max in-flight chunks before we risk OOM on the CXL pool."""
-        return self._heap.slots_per_region * self._pool.layout.region_count
-
-    def get_allocator_backend(self) -> "AllocatorBackendInterface":
-        # Per plan: peers borrow LocalCPUBackend, not us. But the
-        # interface requires returning *something*. Returning self is
-        # correct and peers should not be wired to use it.
-        return self
-
     def close(self) -> None:
         if self._lock_manager is not None:
             self._lock_manager.stop()
@@ -949,84 +1118,45 @@ class CXLBackend(AllocatorBackendInterface):
         if self._proc_lock_manager is not None:
             self._proc_lock_manager.stop()
             self._proc_lock_manager = None
-        self._mem_allocator.close()
         self._pool.close()
 
     # -------- internals --------------------------------------------------
 
-    def _cache_slot(self, key: CacheEngineKey, slot_idx: int) -> None:
+    def _cache_slot(self, chunk_hash: int, slot_idx: int) -> None:
         with self._key_to_slot_lock:
-            self._key_to_slot[key.chunk_hash] = slot_idx
+            self._key_to_slot[chunk_hash & 0xFFFFFFFFFFFFFFFF] = slot_idx
         # Every local resolution (read hit, pin, store) is an access: refresh
         # the slot's recency so warm chunks survive eviction. DRAM-only,
         # keyed by slot_idx so it is stable across key->slot re-caching.
         self._lru.touch(slot_idx)
 
-    def _forget_slot(self, key: CacheEngineKey) -> None:
-        with self._key_to_slot_lock:
-            self._key_to_slot.pop(key.chunk_hash, None)
-
     def _forget_slot_by_hash(self, chunk_hash: int) -> None:
         """Drop the key->slot cache entry for a raw chunk_hash.
 
         Used by the eviction path, which learns the evicted slot's hash from
-        the returned ``SlotView`` rather than a ``CacheEngineKey``. The stored
+        the returned ``SlotView`` rather than an ``ObjectKey``. The stored
         hash is masked to u64 (matching ``_claim``), so mask here too.
         """
         with self._key_to_slot_lock:
             self._key_to_slot.pop(chunk_hash & 0xFFFFFFFFFFFFFFFF, None)
 
-    def _lookup_slot(self, key: CacheEngineKey) -> Optional[int]:
+    def _lookup_slot(self, key: ObjectKey) -> Optional[int]:
+        """Resolve `key` to its slot, via the DRAM cache then a probe.
+
+        Args:
+            key: The object key to resolve.
+
+        Returns:
+            The slot index holding this key, or None on miss.
+        """
+        needle = object_key_to_chunk_hash(key) & 0xFFFFFFFFFFFFFFFF
         with self._key_to_slot_lock:
-            slot_idx = self._key_to_slot.get(key.chunk_hash)
+            slot_idx = self._key_to_slot.get(needle)
         if slot_idx is not None:
             return slot_idx
         # Miss in the cache — fall back to a probe.
-        view = self._index.lookup(key)
+        view = self._index.lookup_by_hash(needle, self._digest_for(key))
         if view is None:
             return None
-        self._cache_slot(key, view.slot_idx)
+        self._cache_slot(needle, view.slot_idx)
         return view.slot_idx
-
-
-class _SlotRefcountAdapter(MemoryAllocatorInterface):
-    """Parent-allocator shim for MemoryObjs returned from `get_blocking`.
-
-    When the MemoryObj's ref_count drops to zero, TensorMemoryObj
-    calls `parent_allocator.free(self)`. For a CXL HIT that means:
-    drop our ref count on the slot, allowing a future EVICT. The
-    numpy buffer is released as `self` is GC'd.
-    """
-
-    def __init__(
-        self,
-        backend: CXLBackend,
-        slot_idx: int,
-        np_buf,
-    ):
-        self._backend = backend
-        self._slot_idx = slot_idx
-        self._np_buf = np_buf  # keep alive
-
-    # MemoryAllocatorInterface shims we don't use ----------------------
-
-    def allocate(self, shapes, dtypes, fmt=MemoryFormat.UNDEFINED, allocator_type=None):
-        raise NotImplementedError
-
-    def batched_allocate(
-        self,
-        shapes,
-        dtypes,
-        batch_size,
-        fmt=MemoryFormat.UNDEFINED,
-        allocator_type=None,
-    ):
-        raise NotImplementedError
-
-    def free(self, memory_obj: MemoryObj, allocator_type=None):
-        memory_obj.invalidate()
-        self._backend._index_writer.ref_count_down(self._slot_idx)
-
-    def batched_free(self, memory_objs, allocator_type=None, update_stats=True):
-        for obj in memory_objs:
-            self.free(obj)

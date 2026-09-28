@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Integration tests for CXLBackend (single-process skeleton).
+"""Integration tests for CXLStore (single-process skeleton).
 
 These exercise the full put → get → evict → pin/unpin lifecycle with
 a tmpfile-backed pool. The backend runs its own lock manager; the
@@ -8,8 +8,6 @@ host anyway).
 """
 
 # Standard
-import asyncio
-import ctypes
 import hashlib
 import os
 import tempfile
@@ -21,15 +19,14 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
-
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -49,14 +46,13 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(h: int) -> CacheEngineKey:
+def _make_key(h: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=h.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=h,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -101,14 +97,14 @@ def backend():
     with tempfile.NamedTemporaryFile(prefix="cxl-backend-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
-    cfg = CXLBackendConfig(
+    cfg = CXLStoreConfig(
         dev_path=path,
         node_id=0,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=True,
     )
-    b = CXLBackend(cfg, _metadata())
+    b = CXLStore(cfg)
     try:
         yield b
     finally:
@@ -122,6 +118,13 @@ def backend():
 # ---------- basic lifecycle ----------
 
 
+def _read(backend, key, size: int = 1024):
+    """Read a chunk into a fresh buffer. Returns None on miss."""
+    buf = torch.empty(size, dtype=torch.uint8)
+    n = backend.read_into(key, buf.data_ptr(), buf.numel())
+    return None if n == 0 else buf[:n]
+
+
 def test_fresh_backend_has_no_entries(backend):
     assert not backend.contains(_make_key(0xDEAD))
 
@@ -129,7 +132,7 @@ def test_fresh_backend_has_no_entries(backend):
 def test_put_then_contains_hits(backend):
     key = _make_key(0x1111)
     src = _make_source_obj(1024, fill_byte=0x55)
-    backend.batched_submit_put_task([key], [src])
+    backend.put_batch([key], [src])
     assert backend.contains(key)
 
 
@@ -149,23 +152,20 @@ def test_put_then_get_returns_same_bytes(backend):
         ),
         parent_allocator=None,
     )
-    backend.batched_submit_put_task([key], [src])
+    backend.put_batch([key], [src])
 
-    got = backend.get_blocking(key)
+    got = _read(backend, key, 1024)
     assert got is not None
-    # First 1024 bytes of got.raw_data must equal payload.
-    got_bytes = got.raw_data[:1024].numpy()
-    np.testing.assert_array_equal(got_bytes, payload)
-    got.ref_count_down()  # release the pin
+    np.testing.assert_array_equal(got[:1024].numpy(), payload)
 
 
 def test_get_misses_after_remove(backend):
     key = _make_key(0x3333)
-    backend.batched_submit_put_task([key], [_make_source_obj(512)])
+    backend.put_batch([key], [_make_source_obj(512)])
     assert backend.contains(key)
     assert backend.remove(key)
     assert not backend.contains(key)
-    assert backend.get_blocking(key) is None
+    assert _read(backend, key) is None
 
 
 def test_remove_returns_false_for_missing_key(backend):
@@ -175,45 +175,33 @@ def test_remove_returns_false_for_missing_key(backend):
 def test_put_dedupes_same_key(backend):
     """A second put for the same key must not take a new chunk."""
     key = _make_key(0x5555)
-    backend.batched_submit_put_task([key], [_make_source_obj(1024, fill_byte=0x01)])
-    stats_before = backend._heap.stats()
-    backend.batched_submit_put_task([key], [_make_source_obj(1024, fill_byte=0x02)])
-    stats_after = backend._heap.stats()
+    backend.put_batch([key], [_make_source_obj(1024, fill_byte=0x01)])
+    stats_before = backend.heaps.total_stats()
+    backend.put_batch([key], [_make_source_obj(1024, fill_byte=0x02)])
+    stats_after = backend.heaps.total_stats()
     assert stats_before.free_slots == stats_after.free_slots
     # Content is whatever was written first; the second put is ignored.
-    got = backend.get_blocking(key)
+    got = _read(backend, key)
     assert got is not None
-    assert int(got.raw_data[0]) == 0x01
-    got.ref_count_down()
+    assert int(got[0]) == 0x01
 
 
 def test_batched_put_multiple_keys(backend):
     keys = [_make_key(0x6000 + i) for i in range(5)]
     srcs = [_make_source_obj(1024, fill_byte=i) for i in range(5)]
-    backend.batched_submit_put_task(keys, srcs)
+    backend.put_batch(keys, srcs)
     for i, k in enumerate(keys):
-        got = backend.get_blocking(k)
+        got = _read(backend, k)
         assert got is not None
-        assert int(got.raw_data[0]) == i
-        got.ref_count_down()
+        assert int(got[0]) == i
 
 
-def test_batched_contains_returns_prefix_hit_count(backend):
+def test_partial_batch_stores_only_put_keys(backend):
+    """Keys never stored stay misses; stored ones hit."""
     keys = [_make_key(0x7000 + i) for i in range(4)]
     # Put only the first two.
-    backend.batched_submit_put_task(keys[:2], [_make_source_obj(512) for _ in range(2)])
-    hit = backend.batched_contains(keys)
-    assert hit == 2  # stops at first miss
-
-
-def test_on_complete_callback_fires_per_key(backend):
-    keys = [_make_key(0x8000 + i) for i in range(3)]
-    srcs = [_make_source_obj(512) for _ in range(3)]
-    fired = []
-    backend.batched_submit_put_task(
-        keys, srcs, on_complete_callback=lambda k: fired.append(k.chunk_hash)
-    )
-    assert fired == [k.chunk_hash for k in keys]
+    backend.put_batch(keys[:2], [_make_source_obj(512) for _ in range(2)])
+    assert [backend.contains(k) for k in keys] == [True, True, False, False]
 
 
 # ---------- pin / unpin ----------
@@ -221,7 +209,7 @@ def test_on_complete_callback_fires_per_key(backend):
 
 def test_pin_blocks_evict(backend):
     key = _make_key(0x9001)
-    backend.batched_submit_put_task([key], [_make_source_obj(512)])
+    backend.put_batch([key], [_make_source_obj(512)])
     assert backend.pin(key)
     # remove should refuse because pin_count > 0.
     assert not backend.remove(key)
@@ -233,7 +221,7 @@ def test_pin_blocks_evict(backend):
 
 def test_unpin_of_unpinned_key_returns_false(backend):
     key = _make_key(0x9002)
-    backend.batched_submit_put_task([key], [_make_source_obj(512)])
+    backend.put_batch([key], [_make_source_obj(512)])
     assert not backend.unpin(key)
 
 
@@ -241,65 +229,22 @@ def test_pin_on_missing_key_returns_false(backend):
     assert not backend.pin(_make_key(0x9003))
 
 
-def test_held_memoryobj_blocks_evict_until_released(backend):
-    """Holding a MemoryObj returned by get_blocking keeps ref_count>0,
-    so concurrent remove must refuse until the obj is dropped."""
-    key = _make_key(0xA001)
-    backend.batched_submit_put_task([key], [_make_source_obj(512)])
-    obj = backend.get_blocking(key)
-    assert obj is not None
+def test_pinned_slot_blocks_evict_until_unpinned(backend):
+    """A pin holds a slot alive: remove must refuse until it is released.
 
-    # While held, remove fails.
+    This is the lookup->retrieve window the L2 adapter relies on — the
+    pin taken at lookup_and_lock keeps the chunk readable for the H2D
+    copy even if another node's store wants to evict it.
+    """
+    key = _make_key(0xA001)
+    backend.put_batch([key], [_make_source_obj(512)])
+    assert backend.pin(key)
+
+    # While pinned, remove fails.
     assert not backend.remove(key)
-    # Release the obj — ref_count hits zero and TensorMemoryObj.free
-    # is invoked via the _SlotRefcountAdapter, dropping our slot ref.
-    obj.ref_count_down()
+    assert backend.unpin(key)
     # Now remove succeeds.
     assert backend.remove(key)
-
-
-# ---------- async surface ----------
-
-
-def test_batched_async_contains_matches_sync(backend):
-    keys = [_make_key(0xB000 + i) for i in range(3)]
-    backend.batched_submit_put_task(keys[:2], [_make_source_obj(512) for _ in range(2)])
-    hit = asyncio.run(backend.batched_async_contains("lookup-1", keys))
-    assert hit == 2
-
-
-def test_batched_get_non_blocking_returns_hit_prefix(backend):
-    keys = [_make_key(0xC000 + i) for i in range(4)]
-    backend.batched_submit_put_task(keys[:3], [_make_source_obj(512) for _ in range(3)])
-    got = asyncio.run(backend.batched_get_non_blocking("lookup-2", keys))
-    assert len(got) == 3
-    for obj in got:
-        obj.ref_count_down()
-
-
-# ---------- allocator surface ----------
-
-
-def test_allocate_returns_memoryobj_within_chunk_size(backend):
-    shapes = torch.Size([1024])
-    obj = backend.allocate(shapes, torch.uint8, fmt=MemoryFormat.KV_2LTD)
-    assert obj is not None
-    assert obj.get_size() == 1024
-    # Address is in the CXL pool.
-    assert obj.meta.address >= backend._pool.base + backend._pool.layout.off_regions
-    assert obj.meta.address + obj.get_size() <= backend._pool.base + backend._pool.size
-    obj.ref_count_down()
-
-
-def test_allocate_rejects_oversize_request(backend):
-    with pytest.raises(ValueError):
-        backend.allocate(torch.Size([CHUNK_SIZE + 1]), torch.uint8)
-
-
-def test_calculate_chunk_budget_is_positive(backend):
-    n = backend.calculate_chunk_budget()
-    assert n > 0
-    assert n == backend._heap.slots_per_region * backend._pool.layout.region_count
 
 
 # ---------- concurrency ----------
@@ -328,21 +273,18 @@ def test_concurrent_puts_and_gets_do_not_corrupt(backend):
             key = _make_key(h)
             fill = h & 0xFF
             try:
-                backend.batched_submit_put_task(
-                    [key], [_make_source_obj(512, fill_byte=fill)]
-                )
-                got = backend.get_blocking(key)
+                backend.put_batch([key], [_make_source_obj(512, fill_byte=fill)])
+                got = _read(backend, key, 512)
                 if got is None:
                     with failures_lock:
                         failures.append(f"miss after put for h={h:#x}")
                     continue
-                if int(got.raw_data[0]) != fill:
+                if int(got[0]) != fill:
                     with failures_lock:
                         failures.append(
                             f"corrupt payload for h={h:#x}: "
-                            f"got {int(got.raw_data[0])}, want {fill}"
+                            f"got {int(got[0])}, want {fill}"
                         )
-                got.ref_count_down()
             except Exception as e:  # noqa: BLE001 - reported below
                 with failures_lock:
                     failures.append(f"exception for h={h:#x}: {e!r}")
@@ -356,18 +298,20 @@ def test_concurrent_puts_and_gets_do_not_corrupt(backend):
     assert not failures, f"{len(failures)} failure(s): {failures[:10]}"
 
 
-def test_double_get_holds_two_refs(backend):
-    """Two concurrent get_blocking calls both get valid objs; remove
-    blocks until both are released."""
+def test_double_pin_holds_two_refs(backend):
+    """Two pins on one slot both count; remove blocks until both drop.
+
+    Mirrors an MLA / multi-worker retrieve where several consumers each
+    take their own pin on the same chunk.
+    """
     key = _make_key(0xD001)
-    backend.batched_submit_put_task([key], [_make_source_obj(512)])
-    o1 = backend.get_blocking(key)
-    o2 = backend.get_blocking(key)
-    assert o1 is not None and o2 is not None
+    backend.put_batch([key], [_make_source_obj(512)])
+    assert backend.pin(key)
+    assert backend.pin(key)
     assert not backend.remove(key)
-    o1.ref_count_down()
+    backend.unpin(key)
     assert not backend.remove(key)
-    o2.ref_count_down()
+    backend.unpin(key)
     assert backend.remove(key)
 
 
@@ -378,7 +322,7 @@ def test_backend_close_cleans_up(backend):
     # Just running close() via fixture teardown is enough; this
     # placeholder ensures at least one test exercises close() without
     # prior put activity.
-    assert backend._pool is not None
+    assert backend.pool is not None
 
 
 # ---------- batched pin / unpin ----------
@@ -386,17 +330,17 @@ def test_backend_close_cleans_up(backend):
 
 def _pin_count(backend, key):
     """Read the on-CXL pin_count for ``key`` (-1 if no VALID slot)."""
-    view = backend._index.lookup(key)
-    if view is None:
+    slot_idx = backend.slot_index_of(key)
+    if slot_idx is None:
         return -1
-    return int(backend._pool.slots()[view.slot_idx].line1.pin_count)
+    return int(backend.pool.slots()[slot_idx].line1.pin_count)
 
 
 def test_pin_batch_pins_only_present_keys(backend):
     """pin_batch returns per-key success and pins exactly the VALID slots."""
     present = [_make_key(0x6100 + i) for i in range(3)]
     for k in present:
-        backend.batched_submit_put_task([k], [_make_source_obj(512)])
+        backend.put_batch([k], [_make_source_obj(512)])
     missing = _make_key(0x61FF)
 
     # Interleave a missing key in the middle.
@@ -413,7 +357,7 @@ def test_pin_batch_then_unpin_batch_round_trip(backend):
     """unpin_batch reverses pin_batch; the slot is reclaimable afterward."""
     keys = [_make_key(0x6200 + i) for i in range(4)]
     for k in keys:
-        backend.batched_submit_put_task([k], [_make_source_obj(256)])
+        backend.put_batch([k], [_make_source_obj(256)])
 
     backend.pin_batch(keys)
     for k in keys:
@@ -432,7 +376,7 @@ def test_pin_batch_then_unpin_batch_round_trip(backend):
 def test_pin_batch_duplicate_keys_bump_twice(backend):
     """A key appearing twice in pin_batch is pinned twice (one per slot)."""
     key = _make_key(0x6300)
-    backend.batched_submit_put_task([key], [_make_source_obj(256)])
+    backend.put_batch([key], [_make_source_obj(256)])
 
     results = backend.pin_batch([key, key])
     assert results == [True, True]

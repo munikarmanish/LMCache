@@ -24,8 +24,8 @@ Endianness: little-endian throughout (x86 host assumption).
 """
 
 # Standard
-import ctypes
 from dataclasses import dataclass
+import ctypes
 
 # First Party
 from lmcache.logging import init_logger
@@ -36,7 +36,16 @@ logger = init_logger(__name__)
 
 CACHELINE_SIZE = 64
 HEADER_SIZE = 4096
-LAYOUT_VERSION = 1
+# NOTE: `_native/cxl_lock_manager.c` hardcodes this value and refuses to
+# attach to a pool with a different one. Bump both together — a refused
+# arbiter exits while waiters spin forever on an ungranted lock.
+#
+# v2: `line0.geom_hash` changed meaning from a pool-wide geometry hash to
+# a per-slot *tenant* discriminator, and `header.geom_hash` became unused
+# (zeroed). A v1 reader would treat every v2 slot as a geometry mismatch,
+# so the bump makes an old binary fail at attach instead of silently
+# reading nothing.
+LAYOUT_VERSION = 2
 MAGIC = 0x4C4D43584C504F4F  # "LMCXLPOO" little-endian
 
 # Sentinel owner values.
@@ -81,8 +90,13 @@ class Header(ctypes.Structure):
 
     `gen` is bumped on every controller bootstrap; peers compare it to
     their cached generation to detect controller restarts (plan F8).
-    `geom_hash` is a 16-byte digest of the cluster-wide chunk geometry;
-    peers reject attach on mismatch.
+
+    `geom_hash` is **unused as of LAYOUT_VERSION 2** and written as
+    zeroes. The pool carries no model identity: it is a multi-tenant
+    object store, and tenant identity lives per slot in
+    `SlotLine0.geom_hash`. Attach checks only compatibility — magic,
+    layout version, and sizing. The field is retained rather than
+    renumbered to keep the struct layout stable.
     """
 
     _pack_ = 1
@@ -162,6 +176,13 @@ class SlotLine0(ctypes.Structure):
 
     All fields a lookup consults fit in this cacheline, so a writer's
     final `CLFLUSH(&line0); MFENCE` publishes them as a unit.
+
+    `geom_hash` holds this chunk's 16-byte **tenant discriminator** (see
+    `store.object_key_to_tenant_digest`): a digest of the owning
+    ObjectKey's content hash, model_name, kv_rank and cache_salt. A
+    lookup must match both `chunk_hash` and this field, so two tenants
+    whose keys collide on the u64 resolve to separate slots under open
+    addressing instead of reading each other's bytes.
     """
 
     _pack_ = 1
@@ -173,7 +194,7 @@ class SlotLine0(ctypes.Structure):
         ("fmt", ctypes.c_uint16),  # MemoryFormat enum value
         ("owner_node_id", ctypes.c_uint16),
         ("generation", ctypes.c_uint32),  # must equal header.gen
-        ("geom_hash", ctypes.c_uint8 * GEOM_HASH_SIZE),
+        ("geom_hash", ctypes.c_uint8 * GEOM_HASH_SIZE),  # tenant digest
         ("_pad", ctypes.c_uint8 * (CACHELINE_SIZE - 48)),
     ]
 
@@ -306,9 +327,7 @@ class PoolLayout:
                 # little but no longer by orders of magnitude. Callers that
                 # know the chunk size should pass index_slot_count.
                 capacity = region_count * region_size
-                index_slot_count_local = max(
-                    1024, capacity // DEFAULT_MIN_CHUNK_SIZE
-                )
+                index_slot_count_local = max(1024, capacity // DEFAULT_MIN_CHUNK_SIZE)
             else:
                 index_slot_count_local = index_slot_count
 
@@ -335,9 +354,7 @@ class PoolLayout:
                 break
             region_count = int(new_region_count)
         else:
-            raise RuntimeError(
-                "layout planner did not converge; this indicates a bug"
-            )
+            raise RuntimeError("layout planner did not converge; this indicates a bug")
 
         regions_size = region_count * region_size
 
@@ -364,15 +381,23 @@ class PoolLayout:
     def total_used(self) -> int:
         return self.off_regions + self.regions_size
 
-    def write_to_header(self, header: Header, geom_hash: bytes, gen: int) -> None:
-        if len(geom_hash) != GEOM_HASH_SIZE:
-            raise ValueError(
-                f"geom_hash must be {GEOM_HASH_SIZE} bytes, got {len(geom_hash)}"
-            )
+    def write_to_header(self, header: Header, gen: int) -> None:
+        """Stamp this layout into the pool header.
+
+        ``header.geom_hash`` is left zeroed: the pool carries no model
+        identity. Tenant identity is per slot (``line0.geom_hash``), so
+        one pool serves many models and TP degrees. The field is kept
+        rather than renumbered so the struct stays stable across the
+        version bump.
+
+        Args:
+            header: The header struct to write.
+            gen: Generation/epoch to stamp.
+        """
         header.magic = MAGIC
         header.layout_version = LAYOUT_VERSION
         header.gen = gen
-        ctypes.memmove(header.geom_hash, geom_hash, GEOM_HASH_SIZE)
+        ctypes.memset(header.geom_hash, 0, GEOM_HASH_SIZE)
         header.region_size = self.region_size
         header.region_count = self.region_count
         header.index_slot_count = self.index_slot_count

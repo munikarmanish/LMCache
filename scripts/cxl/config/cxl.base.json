@@ -1,17 +1,10 @@
 {
   "type": "cxl",
   "dev_path": "/dev/dax0.0",
-  "chunk_size_bytes": 33554432,
   "region_size": 268435456,
-  "_comment_pool_size": 137438953472,
-  "pool_size_override": 68719476736,
-  "generation": 3,
+  "pool_size_override": 137438953472,
+  "_comment_pool_size_override": 68719476736,
+  "generation": 5,
   "max_nodes": 2,
-  "num_locks": 1024,
-  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
-  "world_size": 1,
-  "kv_dtype_str": "torch.float16",
-  "kv_shape": [32, 2, 256, 8, 128],
-  "use_mla": false,
-  "cluster_chunk_size": 256
+  "num_locks": 1024
 }

@@ -5,15 +5,14 @@ Plan reference: F10 (MP mode is the primary deployment), Integration
 Points (the MP server's StorageManager owns L2 adapters; CXL is one
 of them).
 
-This is a thin async / eventfd shim over the synchronous `CXLBackend`
-from step 5. The adapter's responsibilities:
+This is a thin async / eventfd shim over the synchronous `CXLStore`.
+The adapter's responsibilities:
 
-- Translate ObjectKey ↔ CXL `chunk_hash` (u64).
 - Provide store / lookup-and-lock / load tasks with task-id-keyed
   results and per-tier eventfd notifications (the L1 manager's
   controllers poll these fds).
-- Map `lookup_and_lock` → `CXLBackend.pin`, `submit_unlock` →
-  `CXLBackend.unpin`, and `submit_load` → memcpy from CXL into the
+- Map `lookup_and_lock` → `CXLStore.pin`, `submit_unlock` →
+  `CXLStore.unpin`, and `submit_load` → memcpy from CXL into the
   caller-provided buffer. The caller owns the destination MemoryObj
   lifecycle — the adapter never frees it.
 
@@ -22,9 +21,9 @@ behavior under load is the same shape.
 """
 
 # Standard
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from hashlib import blake2b
 from typing import Optional
 import asyncio
 import concurrent.futures
@@ -37,11 +36,9 @@ import time
 import torch
 
 # First Party
-import lmcache.c_ops as lmc_ops
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -53,9 +50,9 @@ from lmcache.v1.distributed.l2_adapters.factory import (
 )
 from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
 from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mp_observability.profile import PROFILE_ENABLED
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
+import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -64,15 +61,20 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
     """
     Config for a CXL-backed L2 adapter.
 
-    The CXL adapter wraps a `CXLBackend` over a CXL 2.0 shared-memory
+    The CXL adapter wraps a `CXLStore` over a CXL 2.0 shared-memory
     pool exposed as a DAX device (or a regular file for testing).
+
+    The store is keyed on `ObjectKey` directly, so the adapter passes
+    keys straight through — there is no key translation layer.
 
     Fields:
     - dev_path: filesystem path to the CXL device (e.g. /dev/dax0.0).
     - node_id: this node's id within the rack-wide MAX_NODES space.
       Each participating node MUST use a distinct id.
-    - chunk_size_bytes: size of one KV chunk on this CXL pool. Must
-      evenly divide region_size.
+    - max_chunk_size_bytes: optional upper bound on one chunk. Heap
+      classes are created from the exact size of what is stored, so
+      this is only a guard against a garbled geometry, not a value to
+      tune per deployment.
     - region_size: coarse per-node allocation unit. Default 256 MiB
       per the plan's "Global allocator state" sizing.
     - initialize: if True, this adapter writes a fresh header (and
@@ -84,19 +86,19 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
       lock-manager thread. Exactly one adapter per rack should run
       it; the rest pass False.
 
-    Geom-hash inputs (must match across the rack — see plan F1 /
-    geom_hash discussion):
-    - model_name, world_size, kv_dtype_str, kv_shape, use_mla,
-      cluster_chunk_size (the LMCache token-chunk size, distinct
-      from `chunk_size_bytes` which is the byte size on CXL).
+    The config carries **no model identity**. One pool serves many
+    models, TP degrees, and tenants concurrently: a chunk's tenant is
+    recorded per slot from its own ObjectKey (see
+    `store.object_key_to_tenant_digest`), so nothing about the model
+    needs to be declared here or kept in sync across the rack.
     """
 
     def __init__(
         self,
         dev_path: str,
         node_id: int,
-        chunk_size_bytes: int,
         region_size: int = 256 * 1024 * 1024,
+        max_chunk_size_bytes: int | None = None,
         initialize: bool = False,
         generation: int = 1,
         run_lock_manager: bool = False,
@@ -142,31 +144,15 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         # only needs a round-trip, not a multi-second copy.
         peer_probe_interval_ms: int = 5000,
         peer_probe_timeout_ms: int = 1000,
-        # Geom-hash inputs:
-        model_name: str = "",
-        world_size: int = 1,
-        kv_dtype_str: str = "torch.float16",
-        kv_shape: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
-        use_mla: bool = False,
-        cluster_chunk_size: int = 256,
-        # Worker identity (does not feed geom_hash):
-        worker_id: int = 0,
-        local_world_size: int = 1,
-        local_worker_id: int = 0,
     ):
         if not dev_path:
             raise ValueError("dev_path must be a non-empty string")
         if node_id < 0:
             raise ValueError("node_id must be non-negative")
-        if chunk_size_bytes <= 0:
-            raise ValueError("chunk_size_bytes must be positive")
+        if max_chunk_size_bytes is not None and max_chunk_size_bytes <= 0:
+            raise ValueError("max_chunk_size_bytes must be positive when set")
         if region_size <= 0 or region_size & (region_size - 1):
             raise ValueError("region_size must be a positive power of two")
-        if region_size % chunk_size_bytes != 0:
-            raise ValueError(
-                f"region_size {region_size} must be divisible by chunk_size_bytes "
-                f"{chunk_size_bytes}"
-            )
 
         # Validate peers: must be list of {"node_id": int, "url": str}.
         peers_list: list[dict] = []
@@ -195,7 +181,7 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
 
         self.dev_path = dev_path
         self.node_id = node_id
-        self.chunk_size_bytes = chunk_size_bytes
+        self.max_chunk_size_bytes = max_chunk_size_bytes
         self.region_size = region_size
         self.initialize = initialize
         self.generation = generation
@@ -214,15 +200,6 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         self.cxl_p2p_timeout_ms = cxl_p2p_timeout_ms
         self.peer_probe_interval_ms = peer_probe_interval_ms
         self.peer_probe_timeout_ms = peer_probe_timeout_ms
-        self.model_name = model_name
-        self.world_size = world_size
-        self.kv_dtype_str = kv_dtype_str
-        self.kv_shape = tuple(kv_shape)
-        self.use_mla = use_mla
-        self.cluster_chunk_size = cluster_chunk_size
-        self.worker_id = worker_id
-        self.local_world_size = local_world_size
-        self.local_worker_id = local_worker_id
 
     @classmethod
     def from_dict(cls, d: dict) -> "CXLL2AdapterConfig":
@@ -230,14 +207,10 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         for k in required_str:
             if not isinstance(d.get(k), str) or not d[k]:
                 raise ValueError(f"{k!r} (str) is required")
-        required_int = ("node_id", "chunk_size_bytes")
+        required_int = ("node_id",)
         for k in required_int:
             if not isinstance(d.get(k), int):
                 raise ValueError(f"{k!r} (int) is required")
-
-        kv_shape = d.get("kv_shape", (0, 0, 0, 0, 0))
-        if not isinstance(kv_shape, (list, tuple)) or len(kv_shape) != 5:
-            raise ValueError("kv_shape must be a 5-element list/tuple")
 
         pool_size_override = d.get("pool_size_override")
         if pool_size_override is not None:
@@ -251,7 +224,7 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
         return cls(
             dev_path=d["dev_path"],
             node_id=d["node_id"],
-            chunk_size_bytes=d["chunk_size_bytes"],
+            max_chunk_size_bytes=d.get("max_chunk_size_bytes"),
             region_size=d.get("region_size", 256 * 1024 * 1024),
             initialize=bool(d.get("initialize", False)),
             generation=int(d.get("generation", 1)),
@@ -264,15 +237,6 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             cxl_p2p_timeout_ms=int(d.get("cxl_p2p_timeout_ms", 30000)),
             peer_probe_interval_ms=int(d.get("peer_probe_interval_ms", 5000)),
             peer_probe_timeout_ms=int(d.get("peer_probe_timeout_ms", 1000)),
-            model_name=d.get("model_name", ""),
-            world_size=int(d.get("world_size", 1)),
-            kv_dtype_str=d.get("kv_dtype_str", "torch.float16"),
-            kv_shape=tuple(kv_shape),
-            use_mla=bool(d.get("use_mla", False)),
-            cluster_chunk_size=int(d.get("cluster_chunk_size", 256)),
-            worker_id=int(d.get("worker_id", 0)),
-            local_world_size=int(d.get("local_world_size", 1)),
-            local_worker_id=int(d.get("local_worker_id", 0)),
         )
 
     @classmethod
@@ -281,9 +245,9 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             "CXL L2 adapter config fields:\n"
             "- dev_path (str): path to the CXL pool, e.g. /dev/dax0.0 (required)\n"
             "- node_id (int): this node's id; must be distinct per rack (required)\n"
-            "- chunk_size_bytes (int): bytes per KV chunk on CXL (required, >0)\n"
+            "- max_chunk_size_bytes (int): optional cap on one chunk's size\n"
             "- region_size (int): coarse alloc unit; default 256 MiB; "
-            "must be a power of two and a multiple of chunk_size_bytes\n"
+            "must be a power of two\n"
             "- initialize (bool): True iff this node writes a fresh header; "
             "exactly one per rack (default false)\n"
             "- generation (int): bump on controller restart (default 1)\n"
@@ -299,55 +263,49 @@ class CXLL2AdapterConfig(L2AdapterConfigBase):
             "so a lone node never blocks on them.\n"
             "- peer_probe_timeout_ms (int): timeout for a single liveness ping "
             "(default 1000; far shorter than cxl_p2p_timeout_ms)\n"
-            "- model_name, world_size, kv_dtype_str, kv_shape, use_mla, "
-            "cluster_chunk_size: feed the geom_hash; must match across the rack\n"
-            "- worker_id, local_world_size, local_worker_id: worker identity"
+            "\nNo model/TP fields: a chunk's tenant is derived from its "
+            "own ObjectKey, so one pool serves many models concurrently."
         )
 
 
-def _object_key_to_chunk_hash(key: ObjectKey) -> int:
-    """Stable mapping from `ObjectKey.chunk_hash` (bytes) to a u64.
+def _geometry_salt(
+    model_name: str, world_size: int, layout_desc: MemoryLayoutDesc
+) -> bytes:
+    """Digest the KV geometry a model's chunks are written under.
 
-    Uses the first 8 bytes little-endian, zero-padded if shorter.
-    Two ObjectKeys with different `kv_rank`/`model_name` but the same
-    bytes will collide here — that's intentional: this u64 is the
-    *index* hash, not the equality key. The CXL index's geom_hash
-    field guards against geometry mismatches (different model →
-    different geom_hash → no false hit).
+    Covers what determines how a chunk's bytes must be interpreted:
+    the per-group shapes and dtypes, plus the world size the caches
+    were registered under. Two nodes agreeing on all of it can safely
+    read each other's chunks; two that disagree must not.
+
+    ``model_name`` is included so the salt is self-describing in logs,
+    even though the digest it feeds is already per-model.
+
+    Args:
+        model_name: The model these caches belong to.
+        world_size: The world size the caches were registered under.
+        layout_desc: Per-group shapes and dtypes of one chunk.
+
+    Returns:
+        A 16-byte geometry digest.
     """
-    raw = key.chunk_hash
-    if len(raw) >= 8:
-        return int.from_bytes(raw[:8], "little") & 0xFFFFFFFFFFFFFFFF
-    padded = raw + b"\x00" * (8 - len(raw))
-    return int.from_bytes(padded, "little")
-
-
-def _object_key_to_cache_engine_key(
-    key: ObjectKey, metadata: LMCacheMetadata
-) -> CacheEngineKey:
-    """Bridge from L2's ObjectKey to the v1 CacheEngineKey CXLBackend uses.
-
-    The CXL backend was built against `CacheEngineKey`. To avoid
-    changing its surface, we synthesize a CacheEngineKey from the
-    ObjectKey using `_object_key_to_chunk_hash`. The model_name and
-    dtype come from metadata so the synthesized key compares equal
-    across all calls within one cluster.
-    """
-    chunk_hash = _object_key_to_chunk_hash(key)
-    return CacheEngineKey(
-        model_name=metadata.model_name,
-        world_size=metadata.world_size,
-        worker_id=metadata.worker_id,
-        chunk_hash=chunk_hash,
-        dtype=metadata.kv_dtype,
-    )
+    h = blake2b(digest_size=16)
+    h.update(model_name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(str(world_size).encode("utf-8"))
+    for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True):
+        h.update(b"\x00")
+        h.update(str(tuple(shape)).encode("utf-8"))
+        h.update(b"\x00")
+        h.update(str(dtype).encode("utf-8"))
+    return h.digest()
 
 
 @dataclass
 class CXLL2Adapter(L2AdapterInterface):
     """L2 adapter backed by CXL shared memory.
 
-    Constructed with a fully-initialized `CXLBackend` (the caller
+    Constructed with a fully-initialized `CXLStore` (the caller
     handles the bootstrap config, including whether this node is the
     pool initializer or just attaches). The adapter starts a single
     asyncio loop in a daemon thread; all task handlers run there.
@@ -355,7 +313,7 @@ class CXLL2Adapter(L2AdapterInterface):
     Threading model (matches MockL2Adapter):
       - submit_*  → grabs a task_id under self._lock, schedules a
                     coroutine on the bg loop, returns immediately.
-      - bg loop   → does the work synchronously against CXLBackend,
+      - bg loop   → does the work synchronously against CXLStore,
                     stores the result in the appropriate dict,
                     writes 1 to the relevant eventfd.
       - pop / query → drains the dict under self._lock.
@@ -363,8 +321,7 @@ class CXLL2Adapter(L2AdapterInterface):
 
     def __init__(
         self,
-        backend: CXLBackend,
-        metadata: LMCacheMetadata,
+        backend: CXLStore,
         *,
         p2p_server: Optional["object"] = None,
         peer_clients: Optional[list["object"]] = None,
@@ -377,7 +334,6 @@ class CXLL2Adapter(L2AdapterInterface):
         super().__init__()
 
         self._backend = backend
-        self._metadata = metadata
 
         # Cross-node fallback (Alternative A: static peer list, no controller).
         # `p2p_server` is a CXLP2PServer already started in the factory
@@ -413,7 +369,7 @@ class CXLL2Adapter(L2AdapterInterface):
         # L2-resident retrieve: maps an opaque h2d token -> the pinned key,
         # so ``release_after_h2d`` can ``unpin`` the right key. Keyed by a
         # monotonic counter so a token is never reused across in-flight DMAs.
-        self._h2d_token_to_key: dict[int, CacheEngineKey] = {}
+        self._h2d_token_to_key: dict[int, ObjectKey] = {}
         self._next_h2d_token: int = 0
 
         # Bg loop.
@@ -466,8 +422,7 @@ class CXLL2Adapter(L2AdapterInterface):
         success = True
         bytes_transferred = 0
         try:
-            ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
-            self._backend.batched_submit_put_task(ce_keys, list(objects))
+            self._backend.put_batch(keys, list(objects))
             bytes_transferred = sum(obj.get_size() for obj in objects)
         except Exception:
             logger.exception("CXL L2 store task %d failed", task_id)
@@ -535,8 +490,7 @@ class CXLL2Adapter(L2AdapterInterface):
         L2 eviction accounting of the newly resident bytes.
         """
         try:
-            ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
-            self._backend.batched_submit_put_task(ce_keys, objects)
+            self._backend.put_batch(keys, objects)
             sizes = [obj.get_size() for obj in objects]
             self._notify_keys_stored(keys, sizes)
             return L2StoreResult(success=True, bytes_transferred=sum(sizes))
@@ -555,7 +509,6 @@ class CXLL2Adapter(L2AdapterInterface):
         return task_id
 
     def _do_lookup(self, keys: list[ObjectKey], task_id: L2TaskId) -> None:
-        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
         bitmap = Bitmap(len(keys))
 
         prof = PROFILE_ENABLED
@@ -566,7 +519,7 @@ class CXLL2Adapter(L2AdapterInterface):
         # this is the dominant warm-lookup cost at long prompts. A pin
         # succeeds only for a currently-VALID slot, so the True positions are
         # exactly the local CXL hits; the rest are misses to fetch remotely.
-        pinned = self._backend.pin_batch(ce_keys)
+        pinned = self._backend.pin_batch(keys)
         miss_indices: list[int] = []
         for i, ok in enumerate(pinned):
             if ok:
@@ -583,9 +536,7 @@ class CXLL2Adapter(L2AdapterInterface):
         # turn via PushKVToCXL. After a successful donor commit, retry
         # contains(pin=True) so the bitmap reflects the new hits.
         if miss_indices and self._peer_clients:
-            remote_breakdown = self._try_remote_fetch_misses(
-                ce_keys, miss_indices, bitmap
-            )
+            remote_breakdown = self._try_remote_fetch_misses(keys, miss_indices, bitmap)
 
         with self._lock:
             self._completed_lookup[task_id] = bitmap
@@ -611,7 +562,7 @@ class CXLL2Adapter(L2AdapterInterface):
 
     def _try_remote_fetch_misses(
         self,
-        ce_keys: list,
+        keys: list[ObjectKey],
         miss_indices: list[int],
         bitmap: Bitmap,
     ) -> dict[str, float]:
@@ -626,6 +577,11 @@ class CXLL2Adapter(L2AdapterInterface):
         This is intentionally simple: O(peers * misses) in the worst
         case. With 2 nodes it's just "ask the other one once."
 
+        Args:
+            keys: The object keys of this lookup batch.
+            miss_indices: Positions in ``keys`` that missed locally.
+            bitmap: Out-param; satisfied positions are set on it.
+
         Returns:
             A ``{stage: seconds}`` profiling breakdown (``reserve``, ``rpc``,
             ``repin``) when ``LMC_PROFILE`` is set, else an empty dict.
@@ -637,11 +593,10 @@ class CXLL2Adapter(L2AdapterInterface):
         # We only fetch the contiguous prefix of misses — gaps mean the
         # caller already has those keys via CXL hits, so chunk-by-chunk
         # recovery from peers is moot.
-        first_miss_idx = miss_indices[0]
-        miss_keys = [ce_keys[i] for i in miss_indices]
+        miss_keys = [keys[i] for i in miss_indices]
 
-        epoch = int(self._backend._pool.header.gen)
-        sender_id = f"node-{self._backend._node_id}"
+        epoch = self._backend.epoch
+        sender_id = f"node-{self._backend.node_id}"
 
         # Accumulated across all peers tried: remote_fetch fills reserve/rpc;
         # the re-pin loop below adds repin. Empty (and unused) unless profiling.
@@ -660,9 +615,10 @@ class CXLL2Adapter(L2AdapterInterface):
                 continue
             try:
                 result = remote_fetch(
-                    requester_node_id=self._backend._node_id,
+                    requester_node_id=self._backend.node_id,
                     keys=miss_keys,
-                    index_writer=self._backend._index_writer,
+                    tenant_digest_fn=self._backend.tenant_digest_for,
+                    index_writer=self._backend.index_writer,
                     donor_node_id=donor_node_id,
                     donor=client,
                     sender_id=sender_id,
@@ -748,13 +704,50 @@ class CXLL2Adapter(L2AdapterInterface):
     def _do_unlock(self, keys: list[ObjectKey]) -> None:
         # Unpin all keys in one batched lock acquisition (≈ one arbiter
         # sweep) instead of one sweep per key.
-        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
         try:
-            self._backend.unpin_batch(ce_keys)
+            self._backend.unpin_batch(keys)
         except Exception:
-            logger.exception("CXL L2 batched unpin failed for %d keys", len(ce_keys))
+            logger.exception("CXL L2 batched unpin failed for %d keys", len(keys))
 
     # ---------------- l2-resident retrieve (GPU-direct) ----------------
+
+    def register_layout(
+        self,
+        model_name: str,
+        world_size: int,
+        layout_desc: MemoryLayoutDesc,
+    ) -> None:
+        """Fold this model's KV geometry into its chunks' tenant digests.
+
+        The CXL pool is shared with other nodes, and a chunk is raw
+        bytes: nothing in it records how to interpret them. Two nodes
+        running the same model under different geometry (a dtype or
+        head-count mismatch) would otherwise read each other's chunks
+        and misinterpret them.
+
+        Salting the digest makes that case a **miss** instead: the
+        mismatched node computes a different discriminator, so it never
+        matches the other's slots. Each node still serves its own
+        traffic correctly; they simply stop sharing.
+
+        Args:
+            model_name: The model these caches belong to.
+            world_size: The world size the caches were registered under.
+            layout_desc: Per-group shapes and dtypes of one chunk.
+
+        Raises:
+            ValueError: If this process already declared a different
+                geometry for the same model, which would orphan the
+                chunks it has already written.
+        """
+        salt = _geometry_salt(model_name, world_size, layout_desc)
+        self._backend.set_geometry(model_name, salt)
+        logger.info(
+            "CXL: model %s (world_size=%d) geometry salt %s",
+            model_name,
+            world_size,
+            salt.hex(),
+        )
 
     def supports_l2_resident_retrieve(self) -> bool:
         """CXL serves hits straight to GPU from the registered pool."""
@@ -777,11 +770,10 @@ class CXLL2Adapter(L2AdapterInterface):
             An opaque token for ``release_after_h2d`` on hit, or ``-1`` on
             miss / error.
         """
-        ce_key = _object_key_to_cache_engine_key(key, self._metadata)
         try:
-            res = self._backend.gpu_src_view(ce_key)
+            res = self._backend.gpu_src_view(key)
         except Exception:
-            logger.exception("CXL gpu_src_view failed for %s", ce_key)
+            logger.exception("CXL gpu_src_view failed for %s", key)
             return -1
         if res is None:
             return -1
@@ -790,7 +782,9 @@ class CXLL2Adapter(L2AdapterInterface):
         # The whole CXL pool is one contiguous host-registered region, so
         # there are no internal pin-chunk boundaries to respect; passing
         # offset=0 and an alignment >= n makes the native helper issue a
-        # single full-size cudaMemcpyAsync on the current stream.
+        # single full-size cudaMemcpyAsync on the current stream. ``n`` is
+        # this chunk's own length, so it satisfies that without needing a
+        # pool-wide chunk size.
         try:
             lmc_ops.lmcache_memcpy_async(
                 gpu_ptr,
@@ -798,15 +792,15 @@ class CXLL2Adapter(L2AdapterInterface):
                 n,
                 lmc_ops.TransferDirection.H2D,
                 0,
-                self._backend._chunk_size_bytes,
+                n,
             )
         except Exception:
-            logger.exception("CXL H2D memcpy failed for %s", ce_key)
+            logger.exception("CXL H2D memcpy failed for %s", key)
             return -1
         with self._lock:
             token = self._next_h2d_token
             self._next_h2d_token += 1
-            self._h2d_token_to_key[token] = ce_key
+            self._h2d_token_to_key[token] = key
         return token
 
     def submit_h2d_batch(
@@ -848,15 +842,14 @@ class CXLL2Adapter(L2AdapterInterface):
         # Phase 1 (lock-free): resolve each chunk's host source view and
         # enqueue its copy. Defer token assignment so the lock is taken
         # once for the whole batch, not once per chunk.
-        ce_keys = [_object_key_to_cache_engine_key(k, self._metadata) for k in keys]
-        copied_ce_keys: list[CacheEngineKey] = []
-        result_slots: list[int] = []  # index into copied_ce_keys, or -1 (miss)
+        copied_keys: list[ObjectKey] = []
+        result_slots: list[int] = []  # index into copied_keys, or -1 (miss)
 
-        for ce_key, gpu_ptr, dst_size in zip(ce_keys, gpu_ptrs, dst_sizes, strict=True):
+        for key, gpu_ptr, dst_size in zip(keys, gpu_ptrs, dst_sizes, strict=True):
             try:
-                res = self._backend.gpu_src_view(ce_key)
+                res = self._backend.gpu_src_view(key)
             except Exception:
-                logger.exception("CXL gpu_src_view failed for %s", ce_key)
+                logger.exception("CXL gpu_src_view failed for %s", key)
                 res = None
             if res is None:
                 result_slots.append(-1)
@@ -870,23 +863,23 @@ class CXLL2Adapter(L2AdapterInterface):
                     n,
                     lmc_ops.TransferDirection.H2D,
                     0,
-                    self._backend._chunk_size_bytes,
+                    n,
                 )
             except Exception:
-                logger.exception("CXL H2D memcpy failed for %s", ce_key)
+                logger.exception("CXL H2D memcpy failed for %s", key)
                 result_slots.append(-1)
                 continue
-            result_slots.append(len(copied_ce_keys))
-            copied_ce_keys.append(ce_key)
+            result_slots.append(len(copied_keys))
+            copied_keys.append(key)
 
         # Phase 2: assign tokens for the copied chunks under one lock.
         tokens: list[int] = [-1] * len(keys)
-        if copied_ce_keys:
+        if copied_keys:
             with self._lock:
                 base_token = self._next_h2d_token
-                self._next_h2d_token += len(copied_ce_keys)
-                for offset, ce_key in enumerate(copied_ce_keys):
-                    self._h2d_token_to_key[base_token + offset] = ce_key
+                self._next_h2d_token += len(copied_keys)
+                for offset, key in enumerate(copied_keys):
+                    self._h2d_token_to_key[base_token + offset] = key
             for i, slot in enumerate(result_slots):
                 if slot >= 0:
                     tokens[i] = base_token + slot
@@ -905,14 +898,14 @@ class CXLL2Adapter(L2AdapterInterface):
         if token < 0:
             return
         with self._lock:
-            ce_key = self._h2d_token_to_key.pop(token, None)
-        if ce_key is None:
+            key = self._h2d_token_to_key.pop(token, None)
+        if key is None:
             logger.warning("CXL release_after_h2d: unknown token %d", token)
             return
         try:
-            self._backend.unpin(ce_key)
+            self._backend.unpin(key)
         except Exception:
-            logger.exception("CXL release_after_h2d unpin failed for %s", ce_key)
+            logger.exception("CXL release_after_h2d unpin failed for %s", key)
 
     def release_after_h2d_batch(self, tokens: list[int]) -> None:
         """Unpin a whole batch of ``submit_h2d`` chunks in one lock pass.
@@ -927,20 +920,20 @@ class CXLL2Adapter(L2AdapterInterface):
             tokens: Tokens returned by ``submit_h2d_batch`` (``-1`` ignored).
         """
         with self._lock:
-            ce_keys = [
-                ce_key
+            keys = [
+                key
                 for token in tokens
                 if token >= 0
-                and (ce_key := self._h2d_token_to_key.pop(token, None)) is not None
+                and (key := self._h2d_token_to_key.pop(token, None)) is not None
             ]
-        if not ce_keys:
+        if not keys:
             return
         try:
-            self._backend.unpin_batch(ce_keys)
+            self._backend.unpin_batch(keys)
         except Exception:
             logger.exception(
                 "CXL release_after_h2d batched unpin failed for %d keys",
-                len(ce_keys),
+                len(keys),
             )
 
     # ---------------- load ----------------
@@ -986,12 +979,11 @@ class CXLL2Adapter(L2AdapterInterface):
             """
             local_phase = [0] * 11
             try:
-                ce_key = _object_key_to_cache_engine_key(key, self._metadata)
                 dst_t = dst.raw_data
                 if dst_t.dtype != torch.uint8:
                     dst_t = dst_t.view(torch.uint8)
                 n = self._backend.read_into(
-                    ce_key, dst_t.data_ptr(), dst.get_size(), phase_ns=local_phase
+                    key, dst_t.data_ptr(), dst.get_size(), phase_ns=local_phase
                 )
                 return idx, n, local_phase
             except Exception:
@@ -1072,7 +1064,7 @@ class CXLL2Adapter(L2AdapterInterface):
     def clear(self) -> int:
         """Delete all of this node's CXL chunks and trim its empty regions.
 
-        Delegates to :meth:`CXLBackend.clear`, which tombstones every VALID
+        Delegates to :meth:`CXLStore.clear`, which tombstones every VALID
         slot this node owns, frees their chunks back to the node heap, and
         releases the now-empty regions to the global pool. Busy chunks
         (pinned or mid-read) are skipped, so a concurrent read is never
@@ -1135,7 +1127,7 @@ class CXLL2Adapter(L2AdapterInterface):
         try:
             self._backend.close()
         except Exception:
-            logger.exception("CXLBackend close failed during adapter shutdown")
+            logger.exception("CXLStore close failed during adapter shutdown")
 
     # ---------------- internals ----------------
 
@@ -1154,8 +1146,8 @@ class CXLL2Adapter(L2AdapterInterface):
 
     # ---------------- debug ----------------
 
-    def debug_get_backend(self) -> CXLBackend:
-        """Test-only: peek at the backing CXLBackend."""
+    def debug_get_backend(self) -> CXLStore:
+        """Test-only: peek at the backing CXLStore."""
         return self._backend
 
 
@@ -1177,15 +1169,6 @@ _TORCH_DTYPE_FROM_STR = {
 }
 
 
-def _resolve_dtype(name: str) -> torch.dtype:
-    if name not in _TORCH_DTYPE_FROM_STR:
-        raise ValueError(
-            f"unsupported kv_dtype_str {name!r}; expected one of "
-            f"{sorted(_TORCH_DTYPE_FROM_STR)}"
-        )
-    return _TORCH_DTYPE_FROM_STR[name]
-
-
 def build_cxl_adapter_from_config(
     config: CXLL2AdapterConfig,
     *,
@@ -1193,7 +1176,7 @@ def build_cxl_adapter_from_config(
 ) -> CXLL2Adapter:
     """Construct a CXLL2Adapter from a parsed CXLL2AdapterConfig.
 
-    Bootstraps the CXLBackend (which mmap's the pool, optionally
+    Bootstraps the CXLStore (which mmap's the pool, optionally
     cudaHostRegister's it, and starts the lock manager), wraps it in
     the eventfd-based adapter shim.
 
@@ -1202,10 +1185,10 @@ def build_cxl_adapter_from_config(
     per peer for the requester side. Both sides are required for the
     static-peer remote-fetch path (Alternative A).
     """
-    backend_config = CXLBackendConfig(
+    backend_config = CXLStoreConfig(
         dev_path=config.dev_path,
         node_id=config.node_id,
-        chunk_size_bytes=config.chunk_size_bytes,
+        max_chunk_size_bytes=config.max_chunk_size_bytes,
         region_size=config.region_size,
         initialize=config.initialize,
         generation=config.generation,
@@ -1214,18 +1197,7 @@ def build_cxl_adapter_from_config(
         max_nodes=config.max_nodes,
         num_locks=config.num_locks,
     )
-    metadata = LMCacheMetadata(
-        model_name=config.model_name,
-        world_size=config.world_size,
-        local_world_size=config.local_world_size,
-        worker_id=config.worker_id,
-        local_worker_id=config.local_worker_id,
-        kv_dtype=_resolve_dtype(config.kv_dtype_str),
-        kv_shape=config.kv_shape,
-        use_mla=config.use_mla,
-        chunk_size=config.cluster_chunk_size,
-    )
-    backend = CXLBackend(backend_config, metadata)
+    backend = CXLStore(backend_config)
 
     # Optional: cross-node fallback (donor server + peer clients).
     p2p_server = None
@@ -1243,12 +1215,12 @@ def build_cxl_adapter_from_config(
             CXLP2PServer,
         )
 
-        local_copy = L1LocalCopyProvider(l1_manager=l1_manager, metadata=metadata)
+        local_copy = L1LocalCopyProvider(l1_manager=l1_manager)
         donor = CXLDonor(
-            handle=backend._pool,
-            index_writer=backend._index_writer,
-            heap=backend._heap,
-            node_id=backend._node_id,
+            handle=backend.pool,
+            index_writer=backend.index_writer,
+            heaps=backend.heaps,
+            node_id=backend.node_id,
             local_copy_provider=local_copy,
         )
         p2p_server = CXLP2PServer(donor=donor, bind_url=config.cxl_p2p_bind_url)
@@ -1283,7 +1255,7 @@ def build_cxl_adapter_from_config(
     # probe is a short-timeout ZMQ ping against the peer's CXLP2PServer.
     health_monitor: PeerHealthMonitor | None = None
     if peer_clients:
-        sender_id = f"node-{backend._node_id}"
+        sender_id = f"node-{backend.node_id}"
         probe_timeout_ms = config.peer_probe_timeout_ms
 
         def _probe_peer(peer_index: int) -> bool:
@@ -1302,7 +1274,6 @@ def build_cxl_adapter_from_config(
 
     return CXLL2Adapter(
         backend=backend,
-        metadata=metadata,
         p2p_server=p2p_server,
         peer_clients=peer_clients,
         health_monitor=health_monitor,

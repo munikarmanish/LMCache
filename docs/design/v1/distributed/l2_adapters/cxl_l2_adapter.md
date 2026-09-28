@@ -13,7 +13,7 @@ The adapter lives at
 is wired into the MP-mode `StorageManager` as a `--l2-adapter` type (`cxl`)
 alongside `nixl_peer`, `nixl_store`, and `mock`. It is a thin async/eventfd
 shim over the synchronous
-[`CXLBackend`](lmcache/v1/storage_backend/cxl_backend.py); the real machinery
+[`CXLStore`](lmcache/v1/storage_backend/cxl/store.py); the real machinery
 (pool layout, index, heap, locks, cross-node protocol) lives under
 [`lmcache/v1/storage_backend/cxl/`](lmcache/v1/storage_backend/cxl/).
 
@@ -59,9 +59,12 @@ CPU-side wait the stream-ordered CXL copy does not need (see
 - No cluster controller / dynamic membership: peers are a static list from
   config (Alternative A). Liveness for GC is injected, not discovered here.
 - No cross-rack coherence: one pool = one rack sharing one `/dev/dax`.
-- No authentication / untrusted peers / multi-tenancy on the pool itself.
-- No automatic pool sizing across heterogeneous devices — `dev_path`,
-  `region_size`, `chunk_size_bytes` are operator-set and must agree per rack.
+- No authentication / untrusted peers. (Tenant *separation* — many models, TP
+  degrees, and cache salts in one pool — is supported; see
+  [`cxl_multi_tenant.md`](cxl_multi_tenant.md). It is not an isolation boundary
+  against a hostile node.)
+- No automatic pool sizing across heterogeneous devices — `dev_path` and
+  `region_size` are operator-set and must agree per rack.
 
 ---
 
@@ -73,7 +76,7 @@ CPU-side wait the stream-ordered CXL copy does not need (see
  | StorageManager               |          | StorageManager               |
  |   L1Manager (DRAM)           |          |   L1Manager (DRAM)           |
  |   CXLL2Adapter               |          |   CXLL2Adapter               |
- |     CXLBackend               |          |     CXLBackend               |
+ |     CXLStore                 |          |     CXLStore                 |
  |     CXLDonor  <--PushKVToCXL-|--RPC-----|--- CXLP2PClient (requester)  |
  |     CXLP2PClient ----RPC-----|--------->|--- CXLDonor                  |
  +------------------------------+          +------------------------------+
@@ -89,7 +92,7 @@ CPU-side wait the stream-ordered CXL copy does not need (see
         cxl_lock_manager (C sidecar, run on exactly ONE node)
 ```
 
-Every node runs a `CXLBackend` over the same pool. Two roles for the cross-node
+Every node runs a `CXLStore` over the same pool. Two roles for the cross-node
 push (symmetric, like the NIXL peer adapter): a **donor** server
 ([`CXLDonor`](lmcache/v1/storage_backend/cxl/cross_node.py)) so peers can ask it
 to push its local DRAM copies into the pool, and per configured peer a
@@ -111,8 +114,8 @@ Header (4 KiB) | Global locks | Region bitmap | Region descriptors | Hash index 
 
 **Header** ([`Header`](lmcache/v1/storage_backend/cxl/layout.py), 4 KiB at
 offset 0): `magic`, `layout_version`, `gen` (the **generation / epoch**, bumped
-each bootstrap), `geom_hash` (16-byte blake2b of the model geometry), and the
-sizing/offset fields (`region_size`, `region_count`, `index_slot_count`,
+each bootstrap), `geom_hash` (unused and zeroed since layout version 2 — the
+pool carries no model identity), and the sizing/offset fields (`region_size`, `region_count`, `index_slot_count`,
 `num_locks`, `max_nodes`).
 
 **Hash index** — an open-addressed table of fixed slots. Each
@@ -121,7 +124,7 @@ deliberately split to avoid false sharing:
 
 | Line | Role | Key fields |
 |---|---|---|
-| `line0` (read-mostly, 64 B) | published identity of the chunk | `chunk_hash`, `chunk_offset` (bytes from pool base), `chunk_len`, `state`, `fmt`, `owner_node_id`, `generation`, `geom_hash` |
+| `line0` (read-mostly, 64 B) | published identity of the chunk | `chunk_hash`, `chunk_offset` (bytes from pool base), `chunk_len`, `state`, `fmt`, `owner_node_id`, `generation`, `geom_hash` (the chunk's 16-byte **tenant digest**: blake2b over the `ObjectKey` identity plus the model's geometry salt) |
 | `line1` (hot-mutable, 64 B) | liveness counters + LRU | `ref_count`, `pin_count`, `lru_prev/next`, `lock_id` |
 
 Everything a lookup reads lives in `line0`, so a writer's final fenced store of
@@ -185,7 +188,7 @@ held.
 ### 4.2 LOAD (`submit_load_task` → `_do_load`)
 
 For each key the controller asks us to load into a caller-provided L1 buffer,
-`CXLBackend.read_into` runs the fast hit path: index lookup → `ref_count_up`
+`CXLStore.read_into` runs the fast hit path: index lookup → `ref_count_up`
 (keep alive during DMA) → re-verify the slot → `ctypes.memmove` from
 `pool.base + chunk_offset` into the destination → `ref_count_down` in `finally`.
 Per-chunk copies fan out over a `ThreadPoolExecutor`
@@ -211,7 +214,7 @@ the **only synchronous, blocking** store entry point on the adapter:
 Unlike the async `submit_store_task`/`pop_completed_store_tasks` pair (used by
 `StoreController`), `spill_store`:
 
-- Runs the *same* backend write — `batched_submit_put_task` on the adapter's
+- Runs the *same* store write — `CXLStore.put_batch` on the adapter's
   asyncio loop — but blocks on its own `concurrent.futures.Future` and returns the
   `L2StoreResult` directly.
 - **Never** allocates a shared `L2TaskId`, **never** writes `_completed_store`,
@@ -219,13 +222,13 @@ Unlike the async `submit_store_task`/`pop_completed_store_tasks` pair (used by
   controller and the synchronous eviction loop both run against this adapter, and
   `pop_completed_store_tasks()` drains *all* completions — sharing the channel
   would let one thread steal the other's results and leak read locks. The two
-  paths share only `CXLBackend`, never the completion bookkeeping.
+  paths share only `CXLStore`, never the completion bookkeeping.
 - Fires `_notify_keys_stored(keys, sizes)` so the adapter's own L2 eviction
   accounting tracks the newly resident bytes (these bytes never went through the
   normal `StoreController` write path). This is why `__init__` now calls
   `super().__init__()` — to initialize the base listener list and byte counters.
 - **Timeout caveat:** on `timeout_s` expiry `spill_store` cancels the future and
-  reports failure, but a `batched_submit_put_task` already in flight is not
+  reports failure, but a `put_batch` already in flight is not
   cancellable mid-C-call and may still land. Because the controller
   discards-on-failure, the key is deleted from L1 while the copy may still be
   landing in CXL — the net effect is simply that the "failed" spill actually
@@ -355,7 +358,7 @@ immediately and the copy overlaps. An RDMA READ carries no ordering against a
 CUDA stream, so that adapter must block on CPU-side completion instead. See
 [`nixl_peer_gpudirect.md`](docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md) §2.
 
-- **`gpu_src_view(key)`** ([`cxl_backend.py`](lmcache/v1/storage_backend/cxl_backend.py))
+- **`gpu_src_view(key)`** ([`cxl/store.py`](lmcache/v1/storage_backend/cxl/store.py))
   resolves `(n_bytes, pool.base + chunk_offset)`. It does **not** bump
   `ref_count` — the resident path relies on the `pin_count` already held since
   `lookup_and_lock` to keep the slot alive for the DMA.
@@ -400,11 +403,12 @@ class from the registry.
 {
   "type": "cxl",
   "dev_path": "/dev/dax0.0",          // the shared CXL DAX device (or a file for tests)
-  "node_id": 0,                        // distinct per rack
-  "chunk_size_bytes": 33554432,        // 32 MiB; must divide region_size
-  "region_size": 268435456,            // 256 MiB; power-of-two, >= chunk_size_bytes
+  "node_id": 0,                        // distinct per rack, 1:1 with a physical node
+  "region_size": 268435456,            // 256 MiB; power-of-two, >= the largest chunk
   "pool_size_override": 137438953472,  // 128 GiB cap on the mapping (optional)
   "max_nodes": 2,                      // shrinks the arbiter's lock-table sweep vs the 64 default
+  "num_locks": 1024,                   // rows in the shared lock table (optional)
+  "max_chunk_size_bytes": 67108864,    // optional guard against a garbled geometry; not a tuning knob
 
   // Bootstrap — exactly ONE node per rack sets each of these:
   "initialize": true,                  // node 0 only: writes a fresh header, zeroes the pool
@@ -416,17 +420,17 @@ class from the registry.
   "cxl_p2p_bind_url": "tcp://0.0.0.0:8447",  // our donor server bind
   "cxl_p2p_timeout_ms": 30000,               // requester ZMQ timeout (donor push can take seconds)
   "peer_probe_interval_ms": 5000,            // background liveness-ping interval for DEAD peers
-  "peer_probe_timeout_ms": 1000,             // single-ping timeout (far shorter than cxl_p2p_timeout_ms)
-
-  // geom_hash inputs — MUST match across the rack:
-  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
-  "world_size": 1, "kv_dtype_str": "torch.float16",
-  "kv_shape": [32, 2, 256, 8, 128], "use_mla": false,
-  "cluster_chunk_size": 256           // LMCache token-chunk size (distinct from chunk_size_bytes)
+  "peer_probe_timeout_ms": 1000              // single-ping timeout (far shorter than cxl_p2p_timeout_ms)
 }
 ```
 
-`build_cxl_adapter_from_config` builds the `CXLBackend`, and — only if `peers`
+The config declares **no model, TP degree, dtype, or chunk size**. Chunk sizes
+are taken from what is stored (one heap class per distinct byte size), tenant
+identity from each chunk's `ObjectKey`, and geometry from the live model via
+`register_layout`. Switching models or TP changes nothing here, and one pool
+serves several models concurrently.
+
+`build_cxl_adapter_from_config` builds the `CXLStore`, and — only if `peers`
 *and* an `l1_manager` are present — an `L1LocalCopyProvider`, a `CXLDonor`, a
 `CXLP2PServer` at `cxl_p2p_bind_url`, and one `CXLP2PClient` per peer. When any
 peer clients exist it also builds a `PeerHealthMonitor` that pings dead peers
@@ -452,8 +456,8 @@ fetch.
 
 ## 11. Reused / related components
 
-- [`CXLBackend`](docs/design/v1/storage_backend/cxl_backend.md)
-  ([source](lmcache/v1/storage_backend/cxl_backend.py)) — the synchronous pool
+- [`CXLStore`](docs/design/v1/storage_backend/cxl/store.md)
+  ([source](lmcache/v1/storage_backend/cxl/store.py)) — the synchronous pool
   backend (bootstrap, index reader/writer, heap, lock) this adapter shims.
 - [`cross_node.py`](lmcache/v1/storage_backend/cxl/cross_node.py) /
   [`p2p_transport.py`](lmcache/v1/storage_backend/cxl/p2p_transport.py) — the

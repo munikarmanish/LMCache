@@ -887,17 +887,11 @@ class TestStorageManagerSpillWiring:
         return CXLL2AdapterConfig(
             dev_path=path,
             node_id=0,
-            chunk_size_bytes=64 * 1024,
+            max_chunk_size_bytes=64 * 1024,
             region_size=2 * (1 << 20),
             initialize=True,
             generation=1,
             run_lock_manager=True,
-            model_name="cxl-spill-test",
-            world_size=1,
-            kv_dtype_str="torch.float16",
-            kv_shape=(4, 2, 16, 4, 64),
-            use_mla=False,
-            cluster_chunk_size=16,
         )
 
     def test_cxl_selected_as_spill_target(self, basic_l1_config, tmp_path):

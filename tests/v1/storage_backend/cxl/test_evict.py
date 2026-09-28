@@ -25,7 +25,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
@@ -33,8 +33,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.lru_tracker import NodeLRUTracker
-from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
-
+from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
 # A deliberately tiny pool so the store path reaches region exhaustion within a
 # handful of chunks. With region_size == chunk_size, each region holds exactly
@@ -63,14 +62,13 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(h: int) -> CacheEngineKey:
+def _make_key(h: int) -> ObjectKey:
     md = _metadata()
-    return CacheEngineKey(
+    return ObjectKey(
+        chunk_hash=h.to_bytes(8, "little"),
         model_name=md.model_name,
-        world_size=md.world_size,
-        worker_id=md.worker_id,
-        chunk_hash=h,
-        dtype=md.kv_dtype,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -88,29 +86,37 @@ def _make_source_obj(size_bytes: int, fill_byte: int = 0xAB) -> TensorMemoryObj:
     return TensorMemoryObj(raw_data=data, metadata=meta, parent_allocator=None)
 
 
-def _put(backend: CXLBackend, key_hash: int) -> CacheEngineKey:
+# Heap classes are exact-fit, so the payload size *is* the slab size.
+# Storing a full region's worth per chunk keeps this file's "1 chunk per
+# region, 4 regions" premise, which the eviction ladder is exercised
+# against; a smaller payload would carve hundreds of slots per region and
+# the pool would never exhaust.
+PAYLOAD = REGION_SIZE
+
+
+def _put(backend: CXLStore, key_hash: int) -> ObjectKey:
     key = _make_key(key_hash)
-    backend.batched_submit_put_task([key], [_make_source_obj(4096)])
+    backend.put_batch([key], [_make_source_obj(PAYLOAD)])
     return key
 
 
 @pytest.fixture
 def backend():
-    """A CXLBackend over a 4-region pool (1 chunk per region)."""
+    """A CXLStore over a 4-region pool (1 chunk per region)."""
     with tempfile.NamedTemporaryFile(prefix="cxl-evict-", delete=False) as f:
         f.truncate(POOL_SIZE)
         path = f.name
-    cfg = CXLBackendConfig(
+    cfg = CXLStoreConfig(
         dev_path=path,
         node_id=0,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=True,
         pool_size_override=POOL_OVERRIDE,
         max_nodes=POOL_MAX_NODES,
         evict_low_watermark=0.5,
     )
-    b = CXLBackend(cfg, _metadata())
+    b = CXLStore(cfg)
     try:
         yield b
     finally:
@@ -229,7 +235,7 @@ def test_batch_dropped_when_all_pinned(backend):
 
     # Pool full, every chunk pinned -> eviction frees nothing -> batch dropped.
     dropped_key = _make_key(0x5FF)
-    backend.batched_submit_put_task([dropped_key], [_make_source_obj(4096)])
+    backend.put_batch([dropped_key], [_make_source_obj(PAYLOAD)])
 
     assert not backend.contains(dropped_key), "batch must be dropped, not stored"
     # All original (pinned) chunks are intact.
@@ -245,5 +251,5 @@ def test_evicted_key_can_be_restored(backend):
     assert not backend.contains(keys[0])
 
     # Re-store the evicted key; it should land by evicting the next-coldest.
-    backend.batched_submit_put_task([keys[0]], [_make_source_obj(4096)])
+    backend.put_batch([keys[0]], [_make_source_obj(PAYLOAD)])
     assert backend.contains(keys[0])

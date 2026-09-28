@@ -2,22 +2,19 @@
 """Tests for the periodic GC thread."""
 
 # Standard
+from typing import FrozenSet
 import os
 import tempfile
-import threading
 import time
-from typing import FrozenSet
 
 # Third Party
 import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
-    MemoryObjMetadata,
-    TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.bootstrap import (
@@ -44,7 +41,10 @@ from lmcache.v1.storage_backend.cxl.layout import (
 from lmcache.v1.storage_backend.cxl.lock_manager import LockManager
 from lmcache.v1.storage_backend.cxl.locks import TwoTierLock
 from lmcache.v1.storage_backend.cxl.regions import RegionAllocator
-
+from lmcache.v1.storage_backend.cxl.store import (
+    object_key_to_chunk_hash,
+    object_key_to_tenant_digest,
+)
 
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
@@ -63,13 +63,23 @@ def _metadata() -> LMCacheMetadata:
     )
 
 
-def _make_key(h: int) -> CacheEngineKey:
-    return CacheEngineKey(
-        model_name="cxl-gc-test",
-        world_size=1,
-        worker_id=0,
-        chunk_hash=h,
-        dtype=torch.float16,
+def _make_digest(h: int) -> bytes:
+    """The 16-byte tenant digest the store stamps for `_make_key(h)`."""
+    return object_key_to_tenant_digest(_make_key(h))
+
+
+def _make_hash(h: int) -> int:
+    """The u64 index hash the store derives for `_make_key(h)`."""
+    return object_key_to_chunk_hash(_make_key(h))
+
+
+def _make_key(h: int) -> ObjectKey:
+    md = _metadata()
+    return ObjectKey(
+        chunk_hash=h.to_bytes(8, "little"),
+        model_name=md.model_name,
+        kv_rank=0,
+        cache_salt="",
     )
 
 
@@ -84,7 +94,7 @@ def ctx():
         f.truncate(POOL_SIZE)
         path = f.name
     cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
-    handle = bootstrap_pool(cfg, _metadata())
+    handle = bootstrap_pool(cfg)
     lock = TwoTierLock(handle, node_id=0)
     mgr = LockManager(handle)
     mgr.start()
@@ -174,7 +184,7 @@ def test_orphaned_regions_are_not_re_orphaned_next_sweep(ctx):
     layout = handle.layout
     region_lo = layout.off_regions + region_id * layout.region_size
     iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=4), node_id=4)
-    r = iw_dead.reserve_slot(_make_key(0xEE01))
+    r = iw_dead.reserve_slot(_make_hash(0xEE01), _make_digest(0xEE01))
     iw_dead.commit_slot(
         r.slot_idx,
         chunk_offset=region_lo + 256,
@@ -202,8 +212,8 @@ def test_sweep_flips_dead_owner_allocating_to_tomb(ctx):
     # one owned by an alive node. Scan should affect only the dead one.
     iw_alive = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=2), node_id=2)
     iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=9), node_id=9)
-    r_alive = iw_alive.reserve_slot(_make_key(0xAA01))
-    r_dead = iw_dead.reserve_slot(_make_key(0xAA02))
+    r_alive = iw_alive.reserve_slot(_make_hash(0xAA01), _make_digest(0xAA01))
+    r_dead = iw_dead.reserve_slot(_make_hash(0xAA02), _make_digest(0xAA02))
     assert r_alive.outcome == ReserveOutcome.RESERVED
     assert r_dead.outcome == ReserveOutcome.RESERVED
 
@@ -233,7 +243,7 @@ def test_sweep_does_not_touch_valid_slots(ctx):
     iw_dead = CXLIndexWriter(
         handle, index, TwoTierLock(handle, node_id=dead_node_id), node_id=dead_node_id
     )
-    r = iw_dead.reserve_slot(_make_key(0xBB10))
+    r = iw_dead.reserve_slot(_make_hash(0xBB10), _make_digest(0xBB10))
     assert r.outcome == ReserveOutcome.RESERVED
     iw_dead.commit_slot(
         r.slot_idx, chunk_offset=4096, chunk_len=512, fmt=MemoryFormat.KV_2LTD
@@ -268,7 +278,7 @@ def test_orphan_kept_until_valid_slot_drains(ctx):
 
     # Stamp a VALID slot pointing into this region.
     iw_dead = CXLIndexWriter(handle, index, TwoTierLock(handle, node_id=13), node_id=13)
-    r = iw_dead.reserve_slot(_make_key(0xCC10))
+    r = iw_dead.reserve_slot(_make_hash(0xCC10), _make_digest(0xCC10))
     iw_dead.commit_slot(
         r.slot_idx,
         chunk_offset=region_lo + 1024,
@@ -382,7 +392,7 @@ def test_region_has_no_live_slots_returns_false_when_valid_slot_inside(ctx):
     lo = layout.off_regions + region_id * layout.region_size
     hi = lo + layout.region_size
 
-    r = iw.reserve_slot(_make_key(0xDD01))
+    r = iw.reserve_slot(_make_hash(0xDD01), _make_digest(0xDD01))
     iw.commit_slot(
         r.slot_idx, chunk_offset=lo + 256, chunk_len=128, fmt=MemoryFormat.KV_2LTD
     )
@@ -400,7 +410,10 @@ def test_commit_slot_batch_commits_all_born_pinned(ctx):
     lo = layout.off_regions + region_id * layout.region_size
 
     n = 8
-    reserved = [iw.reserve_slot(_make_key(0xE100 + i)) for i in range(n)]
+    reserved = [
+        iw.reserve_slot(_make_hash(0xE100 + i), _make_digest(0xE100 + i))
+        for i in range(n)
+    ]
     slot_idxs = [r.slot_idx for r in reserved]
     results = iw.commit_slot_batch(
         slot_idxs=slot_idxs,
@@ -422,7 +435,10 @@ def test_commit_slot_batch_unpinned_default(ctx):
     region_id = region_alloc.claim(node_id=0)
     lo = handle.layout.off_regions + region_id * handle.layout.region_size
 
-    reserved = [iw.reserve_slot(_make_key(0xE200 + i)) for i in range(3)]
+    reserved = [
+        iw.reserve_slot(_make_hash(0xE200 + i), _make_digest(0xE200 + i))
+        for i in range(3)
+    ]
     slot_idxs = [r.slot_idx for r in reserved]
     results = iw.commit_slot_batch(
         slot_idxs=slot_idxs,
@@ -443,7 +459,10 @@ def test_commit_slot_batch_skips_non_allocating(ctx):
     region_id = region_alloc.claim(node_id=0)
     lo = handle.layout.off_regions + region_id * handle.layout.region_size
 
-    reserved = [iw.reserve_slot(_make_key(0xE300 + i)) for i in range(3)]
+    reserved = [
+        iw.reserve_slot(_make_hash(0xE300 + i), _make_digest(0xE300 + i))
+        for i in range(3)
+    ]
     slot_idxs = [r.slot_idx for r in reserved]
     # Pre-commit the middle slot so it is VALID (not ALLOCATING) when the
     # batch runs.

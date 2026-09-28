@@ -28,10 +28,10 @@ These are what the index's `chunk_offset` field wants.
 """
 
 # Standard
-import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List
+import threading
 
 # First Party
 from lmcache.logging import init_logger
@@ -57,6 +57,19 @@ class HeapStats:
 class NodeHeap:
     """DRAM free-list over one node's claimed regions, one chunk size.
 
+    One heap serves exactly one chunk size. A pool serving several
+    geometries owns several heaps, multiplexed by
+    :class:`~lmcache.v1.storage_backend.cxl.heap_set.HeapSet`; a claimed
+    region belongs to exactly one heap for its lifetime, so an offset
+    identifies its chunk size unambiguously.
+
+    ``chunk_size`` need not divide ``region_size``: the region is carved
+    into ``region_size // chunk_size`` slots and the remainder is left
+    unused. That tail is bounded by one slot per region (~1.6% for a
+    6 MiB chunk in a 256 MiB region). Rounding the chunk size up to
+    divide evenly would instead waste space in *every* chunk, which is
+    strictly worse for the exact-fit sizes this heap is given.
+
     Thread-safe: all methods take an internal mutex. Contention is
     expected to be low because there is one heap per node per chunk
     size, and the critical sections are O(1).
@@ -71,9 +84,10 @@ class NodeHeap:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         rsize = region_allocator.region_size()
-        if rsize % chunk_size != 0:
+        if chunk_size > rsize:
             raise ValueError(
-                f"chunk_size {chunk_size} does not evenly divide region_size {rsize}"
+                f"chunk_size {chunk_size} exceeds region_size {rsize}; a chunk "
+                "cannot span regions. Increase cxl_region_size."
             )
 
         self._regions = region_allocator
@@ -305,10 +319,10 @@ class NodeHeap:
     # -------- internals --------------------------------------------------
 
     def _pool_base(self) -> int:
-        return self._regions._handle.base  # acceptable friend access
+        return self._regions.handle.base
 
     def _region_for_offset(self, offset: int) -> int:
-        off_regions = self._regions._handle.layout.off_regions
+        off_regions = self._regions.handle.layout.off_regions
         region_size = self._regions.region_size()
         if offset < off_regions:
             raise ValueError(
@@ -320,7 +334,7 @@ class NodeHeap:
         """Caller must hold self._lock."""
         region_id = self._regions.claim(self._node_id)
         self._owned.append(region_id)
-        off_regions = self._regions._handle.layout.off_regions
+        off_regions = self._regions.handle.layout.off_regions
         region_offset = off_regions + region_id * self._regions.region_size()
         for slot_idx in range(self._slots_per_region):
             self._free.append(region_offset + slot_idx * self._chunk_size)

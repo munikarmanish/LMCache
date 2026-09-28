@@ -304,6 +304,12 @@ class GPUTransferModule:
         layout_desc = get_layout_desc(cache_context, self._ctx.chunk_size)
         self._ctx.layout_desc_registry.register(model_name, world_size, layout_desc)
 
+        # Declare the geometry to the L2 adapters. This is the first point
+        # it is known from the live model rather than from config, and it is
+        # the only place a shared-storage adapter can learn what a *read*
+        # should expect — the lookup path is handed keys alone.
+        self._ctx.storage_manager.register_layout(model_name, world_size, layout_desc)
+
         # Offer the retrieve staging buffer to any L2 adapter that can pull
         # remote chunks straight into it (GPUDirect). This is the earliest
         # point the buffer exists — it belongs to the GPU context created

@@ -15,14 +15,12 @@ import select
 import tempfile
 import threading
 import time
-from typing import Optional
 
 # Third Party
 import pytest
 import torch
 
 # First Party
-from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.cxl_l2_adapter import (
@@ -36,7 +34,6 @@ from lmcache.v1.memory_management import (
     TensorMemoryObj,
 )
 
-
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
 CHUNK_SIZE = 64 * 1024
@@ -48,17 +45,11 @@ def _make_config(
     return CXLL2AdapterConfig(
         dev_path=path,
         node_id=0,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=initialize,
         generation=1,
         run_lock_manager=run_lock_manager,
-        model_name="cxl-l2-test",
-        world_size=1,
-        kv_dtype_str="torch.float16",
-        kv_shape=(4, 2, 16, 4, 64),
-        use_mla=False,
-        cluster_chunk_size=16,
     )
 
 
@@ -155,8 +146,12 @@ def test_config_from_dict_parses_required_fields(tmp_path):
         "type": "cxl",
         "dev_path": pool_path,
         "node_id": 3,
-        "chunk_size_bytes": 64 * 1024,
+        "max_chunk_size_bytes": 64 * 1024,
         "region_size": 2 * (1 << 20),
+        # Legacy model/TP fields: the pool is multi-tenant and derives a
+        # chunk's tenant from its own ObjectKey, so these are no longer
+        # part of the config and are ignored rather than rejected — an
+        # old config file still starts.
         "model_name": "m",
         "world_size": 2,
         "kv_dtype_str": "torch.float16",
@@ -166,10 +161,11 @@ def test_config_from_dict_parses_required_fields(tmp_path):
     cfg = CXLL2AdapterConfig.from_dict(spec)
     assert cfg.dev_path == pool_path
     assert cfg.node_id == 3
-    assert cfg.kv_shape == (4, 2, 16, 4, 64)
+    assert cfg.max_chunk_size_bytes == 64 * 1024
     # Optional fields defaulted.
-    assert cfg.use_mla is False
     assert cfg.run_lock_manager is False
+    assert not hasattr(cfg, "model_name")
+    assert not hasattr(cfg, "kv_shape")
 
 
 def test_config_from_dict_rejects_missing_fields():
@@ -181,7 +177,7 @@ def test_config_help_string_mentions_required_fields():
     h = CXLL2AdapterConfig.help()
     assert "dev_path" in h
     assert "node_id" in h
-    assert "chunk_size_bytes" in h
+    assert "max_chunk_size_bytes" in h
 
 
 # ---------- store / lookup / load round-trip ----------
@@ -287,21 +283,14 @@ def test_unlock_releases_pin_so_eviction_can_proceed(adapter):
     assert bitmap is not None and bitmap.test(0)
 
     backend = adapter.debug_get_backend()
-    # First Party
-    from lmcache.utils import CacheEngineKey
-    from lmcache.v1.distributed.l2_adapters.cxl_l2_adapter import (
-        _object_key_to_cache_engine_key,
-    )
-
-    ce_key = _object_key_to_cache_engine_key(keys[0], adapter._metadata)
     # Pinned: remove must refuse.
-    assert not backend.remove(ce_key)
+    assert not backend.remove(keys[0])
 
     # Unlock and wait for the bg loop to process.
     adapter.submit_unlock(keys)
     deadline = time.time() + 1.0
     while time.time() < deadline:
-        if backend.remove(ce_key):
+        if backend.remove(keys[0]):
             break
         time.sleep(0.01)
     else:
@@ -601,12 +590,12 @@ def _make_adapter_with_fake_peer(path, control, *, probe_interval_s=0.05):
     # First Party
     from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
     from lmcache.v1.metadata import LMCacheMetadata
-    from lmcache.v1.storage_backend.cxl_backend import CXLBackend, CXLBackendConfig
+    from lmcache.v1.storage_backend.cxl.store import CXLStore, CXLStoreConfig
 
-    backend_config = CXLBackendConfig(
+    backend_config = CXLStoreConfig(
         dev_path=path,
         node_id=0,
-        chunk_size_bytes=CHUNK_SIZE,
+        max_chunk_size_bytes=CHUNK_SIZE,
         region_size=REGION_SIZE,
         initialize=True,
         generation=1,
@@ -623,7 +612,7 @@ def _make_adapter_with_fake_peer(path, control, *, probe_interval_s=0.05):
         use_mla=False,
         chunk_size=16,
     )
-    backend = CXLBackend(backend_config, metadata)
+    backend = CXLStore(backend_config)
 
     peer_clients = [(1, control)]
     monitor = PeerHealthMonitor(
@@ -634,7 +623,6 @@ def _make_adapter_with_fake_peer(path, control, *, probe_interval_s=0.05):
     )
     adapter = CXLL2Adapter(
         backend=backend,
-        metadata=metadata,
         p2p_server=None,
         peer_clients=peer_clients,
         health_monitor=monitor,

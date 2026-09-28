@@ -15,8 +15,8 @@ Modeled on `BatchedLookupAndPutMsg` in p2p_backend.py.
 """
 
 # Standard
-import enum
 from typing import Union
+import enum
 
 # Third Party
 import msgspec
@@ -46,12 +46,22 @@ class PushKVToCXLMsg(CXLP2PMsgBase):
     # Requester's identity, for logging / response routing.
     sender_id: str
 
-    # Contiguous prefix of CacheEngineKeys, in `to_string()` form.
-    keys: list[str]
-
     # CXL slot ids, one per key, all pre-reserved with owner=donor and
     # state=ALLOCATING. The donor commits them to VALID after DMA.
     slot_idxs: list[int]
+
+    # The requester's ObjectKey identity, decomposed into parallel
+    # arrays (one entry per slot_idx). The donor rebuilds each
+    # ObjectKey from these to look up its own local tier, which is
+    # keyed on the full ObjectKey.
+    #
+    # `chunk_hashes` are the raw ObjectKey.chunk_hash bytes at any
+    # length -- blake3/sha256 digests are carried intact, not
+    # truncated to the pool's u64 index hash.
+    chunk_hashes: list[bytes]
+    model_names: list[str]
+    kv_ranks: list[int]
+    cache_salts: list[str]
 
     # Generation observed at the time of reservation. The donor
     # rejects the whole batch if its current header.gen differs

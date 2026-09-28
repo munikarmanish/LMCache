@@ -7,11 +7,11 @@ simulate two hosts contending for a CXL-resident lock row.
 """
 
 # Standard
+from contextlib import contextmanager
 import os
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
 
 # Third Party
 import pytest
@@ -38,7 +38,6 @@ from lmcache.v1.storage_backend.cxl.locks import (
     TwoTierLock,
 )
 
-
 POOL_SIZE = 64 * (1 << 20)
 REGION_SIZE = 2 * (1 << 20)
 
@@ -62,7 +61,7 @@ def handle():
         f.truncate(POOL_SIZE)
         path = f.name
     cfg = CXLBootstrapConfig(dev_path=path, region_size=REGION_SIZE, initialize=True)
-    h = bootstrap_pool(cfg, _metadata())
+    h = bootstrap_pool(cfg)
     try:
         yield h
     finally:

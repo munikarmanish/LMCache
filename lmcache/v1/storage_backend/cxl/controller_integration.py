@@ -29,15 +29,14 @@ Threading model:
 """
 
 # Standard
-import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional
 import asyncio
+import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_controller.message import (
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
@@ -45,13 +44,8 @@ from lmcache.v1.cache_controller.message import (
     QueryWorkerInfoRetMsg,
     WorkerInfo,
 )
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.storage_backend.cxl.cross_node import DonorEndpoint
-from lmcache.v1.storage_backend.cxl.gc import LivenessProvider
-from lmcache.v1.storage_backend.cxl.p2p_messages import (
-    PushKVToCXLMsg,
-    PushKVToCXLRetMsg,
-    PushStatus,
-)
 from lmcache.v1.storage_backend.cxl.p2p_transport import CXLP2PClient
 
 logger = init_logger(__name__)
@@ -65,8 +59,7 @@ class _ControllerClient:
 
     loop: asyncio.AbstractEventLoop
 
-    async def async_put_and_wait_msg(self, msg):
-        ...
+    async def async_put_and_wait_msg(self, msg): ...
 
 
 # -------- liveness ---------------------------------------------------
@@ -136,9 +129,7 @@ class ControllerLivenessProvider:
         seen_node_ids: set[int] = set()
         for row in mapping:
             if row.cxl_node_id in seen_node_ids:
-                raise ValueError(
-                    f"duplicate cxl_node_id {row.cxl_node_id} in mapping"
-                )
+                raise ValueError(f"duplicate cxl_node_id {row.cxl_node_id} in mapping")
             seen_node_ids.add(row.cxl_node_id)
             self._instance_to_node[row.instance_id] = row.cxl_node_id
         self._known_node_ids: FrozenSet[int] = frozenset(seen_node_ids)
@@ -178,9 +169,7 @@ class ControllerLivenessProvider:
 
         return self._distill_alive_node_ids(reply.worker_infos)
 
-    def _distill_alive_node_ids(
-        self, worker_infos: List[WorkerInfo]
-    ) -> FrozenSet[int]:
+    def _distill_alive_node_ids(self, worker_infos: List[WorkerInfo]) -> FrozenSet[int]:
         """An instance is "alive" if it has at least one fresh worker.
 
         "Fresh" = `last_heartbeat_time >= now - stale_after_s`.
@@ -283,7 +272,7 @@ class ControllerDonorRouter:
 
     def lookup(
         self,
-        keys: List[CacheEngineKey],
+        keys: List[ObjectKey],
         *,
         requester_instance_id: str,
         requester_worker_id: int,
@@ -373,14 +362,22 @@ class ControllerBackedFetch:
 
     router: ControllerDonorRouter
     index_writer: object  # CXLIndexWriter — kept loose to avoid a cycle
+    tenant_digest_fn: Callable[[ObjectKey], bytes]
     requester_node_id: int
     requester_instance_id: str
     requester_worker_id: int
     epoch_provider: Callable[[], int]
     sender_id: str
 
-    def fetch(self, keys: List[CacheEngineKey]):
-        """Look up a donor and run remote_fetch. None on no-donor."""
+    def fetch(self, keys: List[ObjectKey]):
+        """Look up a donor and run remote_fetch. None on no-donor.
+
+        Args:
+            keys: Object keys to reserve slots for and fetch.
+
+        Returns:
+            A RemoteFetchResult, or None when no donor was routed.
+        """
         # First Party
         from lmcache.v1.storage_backend.cxl.cross_node import remote_fetch
 
@@ -400,6 +397,7 @@ class ControllerBackedFetch:
         return remote_fetch(
             requester_node_id=self.requester_node_id,
             keys=push_keys,
+            tenant_digest_fn=self.tenant_digest_fn,
             index_writer=self.index_writer,
             donor_node_id=route.donor_node_id,
             donor=endpoint,

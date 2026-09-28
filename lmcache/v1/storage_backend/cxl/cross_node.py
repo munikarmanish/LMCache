@@ -25,18 +25,18 @@ be a ZMQ-wrapped RPC against the donor's worker process.
 """
 
 # Standard
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Protocol, Tuple
+import os
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.cxl.bootstrap import PoolHandle
 from lmcache.v1.storage_backend.cxl.fast_copy import fast_copy_to_cxl
-from lmcache.v1.storage_backend.cxl.heap import NodeHeap
+from lmcache.v1.storage_backend.cxl.heap_set import HeapSet
 from lmcache.v1.storage_backend.cxl.index_writer import (
     CommitPin,
     CXLIndexWriter,
@@ -47,6 +47,7 @@ from lmcache.v1.storage_backend.cxl.p2p_messages import (
     PushKVToCXLRetMsg,
     PushStatus,
 )
+from lmcache.v1.storage_backend.cxl.store import object_key_to_chunk_hash
 
 logger = init_logger(__name__)
 
@@ -54,32 +55,43 @@ logger = init_logger(__name__)
 class LocalCopyProvider(Protocol):
     """Donor-side callback to fetch the local copy of a key.
 
-    The donor's CXLBackend is a peer of the L0/L1 tiers, not their
+    The donor's CXLStore is a peer of the L0/L1 tiers, not their
     owner. We inject this callable so the cross-node module doesn't
     have a hard dependency on LocalCPUBackend or any specific
     local-tier implementation.
+
+    Called with the requester's ObjectKey identity: the donor's local
+    tier is keyed on the full ObjectKey, and the pool's u64 index hash
+    is one-way, so identity travels on the wire rather than being
+    reconstructed (see `PushKVToCXLMsg`).
 
     Returns None if the donor no longer has a local copy (it was
     evicted between the directory's KVAdmitMsg and the push request —
     the directory is best-effort).
     """
 
-    def __call__(self, key_str: str) -> Optional[MemoryObj]: ...
+    def __call__(
+        self,
+        chunk_hash: bytes,
+        model_name: str,
+        kv_rank: int,
+        cache_salt: str,
+    ) -> Optional[MemoryObj]: ...
 
 
 @dataclass
 class _ReservedKey:
     """Bookkeeping for one reserved slot on the requester side."""
 
-    key: CacheEngineKey
+    key: ObjectKey
     slot_idx: int
     outcome: ReserveOutcome
 
 
 class CXLDonor:
-    """Donor-side handler. Owns a backend's index_writer + heap.
+    """Donor-side handler. Owns a store's index_writer + heap classes.
 
-    Instantiated alongside CXLBackend on the donor node. Tests
+    Instantiated alongside CXLStore on the donor node. Tests
     construct one directly per backend.
     """
 
@@ -87,13 +99,13 @@ class CXLDonor:
         self,
         handle: PoolHandle,
         index_writer: CXLIndexWriter,
-        heap: NodeHeap,
+        heaps: HeapSet,
         node_id: int,
         local_copy_provider: LocalCopyProvider,
     ):
         self._handle = handle
         self._iw = index_writer
-        self._heap = heap
+        self._heaps = heaps
         self._node_id = node_id
         self._local = local_copy_provider
 
@@ -116,43 +128,74 @@ class CXLDonor:
             # Mark closed so a second close is a no-op.
             self._executor = None  # type: ignore[assignment]
 
-    def _alloc_chunks(self, n: int) -> List[Optional[int]]:
-        """Allocate up to ``n`` chunks, preferring one batched lock hold.
+    def _alloc_chunks(self, sizes: List[int]) -> List[Optional[int]]:
+        """Allocate one chunk per entry of ``sizes``, batching per class.
 
-        Fast path: ``heap.alloc_batch(n)`` grabs all ``n`` chunks under a
-        single lock acquisition. If the heap is out of regions mid-batch
-        (``alloc_batch`` raises and may leak the chunks it already took), fall
-        back to per-chunk ``alloc()`` and stop at the first failure, returning
-        the contiguous prefix actually obtained. Callers cap the batch to the
-        returned length.
+        A push batch may span heap classes (different models, or different
+        TP shards of one). Chunks are grouped by exact size so each class
+        takes a single ``alloc_batch`` — one lock hold per distinct size
+        rather than one per chunk. A class that runs out of regions falls
+        back to per-chunk ``alloc`` for its own group.
+
+        The result preserves input order, and is truncated at the first
+        position that could not be satisfied: the caller treats the
+        contiguous prefix as the effective batch, so a gap in the middle
+        would silently mis-pair chunks with keys.
 
         Args:
-            n: Desired chunk count.
+            sizes: Exact byte size of each chunk to allocate, in order.
 
         Returns:
-            A list of pool-relative offsets, length ``<= n`` (shorter only
-            when the heap ran out of regions).
+            Pool-relative offsets in input order, length ``<= len(sizes)``
+            (shorter only when the pool ran out of regions).
         """
-        if n <= 0:
+        if not sizes:
             return []
-        try:
-            return list(self._heap.alloc_batch(n))
-        except Exception:
-            logger.warning(
-                "CXL donor: alloc_batch(%d) failed (heap full?); "
-                "falling back to per-chunk alloc for the available prefix",
-                n,
-            )
-        offsets: List[Optional[int]] = []
-        for _ in range(n):
+        # Group positions by size so each class allocates once.
+        by_size: dict[int, List[int]] = {}
+        for i, size in enumerate(sizes):
+            by_size.setdefault(size, []).append(i)
+
+        placed: List[Optional[int]] = [None] * len(sizes)
+        for size, positions in by_size.items():
+            got: List[int] = []
             try:
-                offsets.append(self._heap.alloc())
+                got = list(self._heaps.alloc_batch(size, len(positions)))
             except Exception:
-                break
-        return offsets
+                logger.warning(
+                    "CXL donor: alloc_batch(size=%d, n=%d) failed (pool full?); "
+                    "falling back to per-chunk alloc for that group",
+                    size,
+                    len(positions),
+                )
+                for _ in positions:
+                    try:
+                        got.append(self._heaps.alloc(size))
+                    except Exception:
+                        break
+            for pos, off in zip(positions, got, strict=False):
+                placed[pos] = off
+
+        # Truncate at the first hole so the caller's prefix contract holds.
+        for i, off in enumerate(placed):
+            if off is None:
+                # Give back anything allocated past the hole.
+                for later in placed[i + 1 :]:
+                    if later is not None:
+                        try:
+                            self._heaps.free(later)
+                        except Exception:
+                            logger.exception(
+                                "CXL donor: failed to free chunk %d past a "
+                                "short-batch hole; leaking it",
+                                later,
+                            )
+                return placed[:i]
+        return placed
 
     def handle_push(self, msg: PushKVToCXLMsg) -> PushKVToCXLRetMsg:
         """Donor-side processing of a PushKVToCXLMsg."""
+        # Standard
         import time as _time
 
         t_start = _time.perf_counter_ns()
@@ -168,13 +211,22 @@ class CXLDonor:
         if msg.epoch != int(self._handle.header.gen):
             return PushKVToCXLRetMsg(num_committed=0, status=PushStatus.EPOCH_STALE)
 
-        if len(msg.keys) != len(msg.slot_idxs):
+        n_keys = len(msg.slot_idxs)
+        if (
+            len(msg.chunk_hashes) != n_keys
+            or len(msg.model_names) != n_keys
+            or len(msg.kv_ranks) != n_keys
+            or len(msg.cache_salts) != n_keys
+        ):
             raise ValueError(
-                f"PushKVToCXLMsg shape mismatch: {len(msg.keys)} keys vs "
-                f"{len(msg.slot_idxs)} slot_idxs"
+                f"PushKVToCXLMsg shape mismatch: {n_keys} slot_idxs vs "
+                f"{len(msg.chunk_hashes)} chunk_hashes, "
+                f"{len(msg.model_names)} model_names, "
+                f"{len(msg.kv_ranks)} kv_ranks, "
+                f"{len(msg.cache_salts)} cache_salts"
             )
 
-        if not msg.keys:
+        if not msg.slot_idxs:
             return PushKVToCXLRetMsg(num_committed=0, status=PushStatus.OK)
 
         # Pre-pin local copies in order; the contiguous prefix of
@@ -182,8 +234,13 @@ class CXLDonor:
         # effective prefix.
         t0 = _time.perf_counter_ns()
         locals_: List[Optional[MemoryObj]] = []
-        for key_str in msg.keys:
-            obj = self._local(key_str)
+        for i in range(n_keys):
+            obj = self._local(
+                msg.chunk_hashes[i],
+                msg.model_names[i],
+                msg.kv_ranks[i],
+                msg.cache_salts[i],
+            )
             locals_.append(obj)
             if obj is None:
                 break
@@ -198,6 +255,7 @@ class CXLDonor:
         t0 = _time.perf_counter_ns()
         for i in range(effective):
             slot = self._handle.slots()[msg.slot_idxs[i]]
+            # First Party
             from lmcache.v1.storage_backend.cxl.layout import SLOT_STATE_ALLOCATING
 
             if (
@@ -215,7 +273,7 @@ class CXLDonor:
                     o.ref_count_down()
             return PushKVToCXLRetMsg(num_committed=0, status=PushStatus.ALL_NACK)
 
-        # Allocate ALL chunks up front in a single heap lock acquisition.
+        # Allocate ALL chunks up front, one lock hold per distinct size.
         # The previous per-chunk ``heap.alloc()`` inside each parallel worker
         # serialized the 8 GIL-bound workers on the heap's global lock and
         # crossed the rack-wide region lock once per region boundary mid-batch
@@ -225,7 +283,7 @@ class CXLDonor:
         # the allocator, is the bandwidth limiter).
         sizes: List[int] = [obj.get_size() for obj in locals_[:effective]]  # type: ignore[union-attr]
         t_a0 = _time.perf_counter_ns()
-        chunk_offsets: List[Optional[int]] = self._alloc_chunks(effective)
+        chunk_offsets: List[Optional[int]] = self._alloc_chunks(sizes)
         t_alloc_ns = _time.perf_counter_ns() - t_a0
         # The heap could not satisfy the whole batch (out of regions). Cap the
         # batch to what we got so the rest of the pipeline (copy/commit) only
@@ -273,7 +331,7 @@ class CXLDonor:
                 if off is None:
                     continue
                 try:
-                    self._heap.free(off)
+                    self._heaps.free(off)
                 except Exception:
                     pass
             for o in locals_:
@@ -347,7 +405,7 @@ class CXLDonor:
                         msg.slot_idxs[j],
                     )
             try:
-                self._heap.free(off)
+                self._heaps.free(off)
             except Exception:
                 pass
 
@@ -358,7 +416,7 @@ class CXLDonor:
 
         if num_committed == 0:
             status = PushStatus.ALL_NACK
-        elif num_committed == len(msg.keys):
+        elif num_committed == n_keys:
             status = PushStatus.OK
         else:
             status = PushStatus.PARTIAL
@@ -384,7 +442,7 @@ class CXLDonor:
             "bytes=%d total_ms=%.3f local_ms=%.3f state_ms=%.3f "
             "alloc_ms=%.3f memcpy_ms=%.3f memcpy_wall_ms=%.3f "
             "memcpy_gbps=%.3f agg_gbps=%.3f commit_ms=%.3f",
-            len(msg.keys),
+            n_keys,
             effective,
             num_committed,
             bytes_copied,
@@ -433,7 +491,8 @@ class RemoteFetchResult:
 
 def remote_fetch(
     requester_node_id: int,
-    keys: List[CacheEngineKey],
+    keys: List[ObjectKey],
+    tenant_digest_fn: Callable[[ObjectKey], bytes],
     index_writer: CXLIndexWriter,
     donor_node_id: int,
     donor: DonorEndpoint,
@@ -447,21 +506,50 @@ def remote_fetch(
     any slots beyond `num_committed`.
 
     Args:
+        requester_node_id: This node's id (for logging).
+        keys: Object keys to reserve slots for and fetch. Sent to the
+            donor so it can find its own local copy: its local tier is
+            keyed on the full ObjectKey.
+        tenant_digest_fn: Maps a key to the tenant digest to stamp on
+            its slot. Comes from the requesting store so the digest
+            carries *this* node's declared geometry — reserving under
+            the bare identity digest would let a geometry-mismatched
+            peer's chunks be read back.
+        index_writer: Writer used to reserve and release slots.
+        donor_node_id: The donor's node id; stamped as slot owner.
+        donor: Endpoint to issue the push RPC against.
+        sender_id: This node's wire identity, for the donor's logs.
+        epoch: Generation observed at reservation time.
         timings: Optional out-dict; when provided, the seconds spent in the
             per-key slot ``reserve`` phase and the donor ``rpc`` round-trip
             are accumulated under those keys (for profiling). Left untouched
             when None.
+
+    Returns:
+        A RemoteFetchResult describing the satisfied contiguous prefix.
     """
     if not keys:
         return RemoteFetchResult(num_satisfied=0, status=PushStatus.OK)
 
+    # Standard
     import time as _time
 
     t_reserve0 = _time.perf_counter()
-    # Reserve slots, owning each on behalf of the donor.
+    # Reserve slots, owning each on behalf of the donor. One batched lock
+    # acquisition (~one arbiter sweep) for the whole set rather than one
+    # acquisition per key — at long prompts the per-key form dominated the
+    # cold cross-node fetch (117 chunks ≈ 117 sweeps ≈ 92 ms).
+    #
+    # The batch reserves EVERY key, so any slot claimed past the terminal
+    # key below must be released or it leaks as a stranded ALLOCATING slot.
+    chunk_hashes = [object_key_to_chunk_hash(k) for k in keys]
+    tenant_digests = [tenant_digest_fn(k) for k in keys]
+    batch = index_writer.reserve_slot_for_donor_batch(
+        chunk_hashes, tenant_digests, donor_node_id
+    )
+
     reserved: List[_ReservedKey] = []
-    for key in keys:
-        result = index_writer.reserve_slot_for_donor(key, donor_node_id)
+    for key, result in zip(keys, batch, strict=True):
         if result.outcome == ReserveOutcome.INDEX_FULL:
             break
         if result.slot_idx is None:
@@ -469,8 +557,19 @@ def remote_fetch(
             # treat as terminal.
             break
         reserved.append(
-            _ReservedKey(key=key, slot_idx=result.slot_idx, outcome=result.outcome)
+            _ReservedKey(
+                key=key,
+                slot_idx=result.slot_idx,
+                outcome=result.outcome,
+            )
         )
+
+    # Give back anything the batch claimed beyond the contiguous prefix.
+    # Only RESERVED outcomes took ownership of a slot; ALREADY_PRESENT and
+    # WAIT_FOR_OTHER point at slots owned by someone else.
+    for result in batch[len(reserved) :]:
+        if result.outcome == ReserveOutcome.RESERVED and result.slot_idx is not None:
+            index_writer.release_slot_for_donor(result.slot_idx, donor_node_id)
 
     if timings is not None:
         timings["reserve"] = timings.get("reserve", 0.0) + (
@@ -503,8 +602,11 @@ def remote_fetch(
 
     msg = PushKVToCXLMsg(
         sender_id=sender_id,
-        keys=[k.to_string() for k in push_keys],
         slot_idxs=push_slots,
+        chunk_hashes=[k.chunk_hash for k in push_keys],
+        model_names=[k.model_name for k in push_keys],
+        kv_ranks=[k.kv_rank for k in push_keys],
+        cache_salts=[k.cache_salt for k in push_keys],
         epoch=epoch,
     )
 
