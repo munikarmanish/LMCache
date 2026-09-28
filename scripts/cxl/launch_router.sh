@@ -36,7 +36,9 @@ NODE0_HOST=192.168.128.75
 NODE1_HOST=192.168.128.76
 VLLM_PORT=8010     # vLLM OpenAI API (serve + /metrics)
 LMC_HTTP_PORT=8090 # LMCache MP HTTP (/lookup_hits)
-MODEL="meta-llama/Llama-3.1-8B-Instruct"
+# Must match what launch_node.sh serves; override alongside it:
+#   MODEL=Qwen/Qwen3-32B ./launch_router.sh
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 ROUTER_PORT=8000   # the router's public OpenAI endpoint
 
 STRATEGY="${1:-round_robin}"
@@ -49,8 +51,13 @@ WEIGHTS="${4:-}"  # random strategy: name=weight,... (empty => uniform)
 [ "$W_PREFIX" = "-" ] && W_PREFIX=0.7
 [ "$W_LOAD" = "-" ] && W_LOAD=0.3
 
-NODES="g5=http://${NODE0_HOST}:${VLLM_PORT},g6=http://${NODE1_HOST}:${VLLM_PORT}"
-LOOKUP="g5=http://${NODE0_HOST}:${LMC_HTTP_PORT},g6=http://${NODE1_HOST}:${LMC_HTTP_PORT}"
+# Override NODES to front more than one instance per host, e.g. with a
+# second vLLM on :8011 of each node:
+#   NODES="g5a=http://IP0:8010,g5b=http://IP0:8011,g6a=http://IP1:8010,..."
+NODES="${NODES:-g5=http://${NODE0_HOST}:${VLLM_PORT},g6=http://${NODE1_HOST}:${VLLM_PORT}}"
+# One MP server per node owns the pool, so co-located instances share a
+# lookup endpoint; name them to match the NODES keys.
+LOOKUP="${LOOKUP:-g5=http://${NODE0_HOST}:${LMC_HTTP_PORT},g6=http://${NODE1_HOST}:${LMC_HTTP_PORT}}"
 
 LOG_LEVEL=debug  # debug | info | warning | error
 LOG_DIR="$HERE/logs"

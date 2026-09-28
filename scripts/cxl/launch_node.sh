@@ -21,6 +21,24 @@
 #   ./launch_node.sh 0 cxl      # node0, CXL adapter
 #   ./launch_node.sh 1 nixl     # node1, NIXL-peer (RDMA) adapter
 #
+#   # A different model, tensor-parallel over both GPUs:
+#   MODEL=Qwen/Qwen3-32B TP=2 ./launch_node.sh 0 cxl
+#
+#   # Two single-GPU instances on one node, sharing one MP server and
+#   # therefore one CXL pool. Start the first normally, then:
+#   GPUS=0 ./launch_node.sh 0 cxl
+#   GPUS=1 VLLM_PORT=8011 SKIP_MP_SERVER=1 ./launch_node.sh 0 cxl
+#
+# Model / parallelism env: MODEL, TP, DTYPE, GPUS, GPU_MEM_UTIL.
+# L1_SIZE_GB sets the MP server's L1 (DRAM) capacity (default 64).
+# Ports (override to co-locate instances): VLLM_PORT, LMC_ZMQ_PORT,
+# LMC_HTTP_PORT. SKIP_MP_SERVER=1 attaches to an already-running MP
+# server instead of starting one.
+#
+# NOTE: node_id indexes a row in the shared CXL lock table, so it stays
+# 1:1 with the physical node. Co-located instances share one MP server
+# rather than taking separate node_ids.
+#
 # Env toggles:
 #   GPUDIRECT=1   (nixl only) pull remote hits straight into the GPU staging
 #                 buffer, skipping the L1/DRAM landing and the H2D bounce.
@@ -28,6 +46,13 @@
 #                 GPUDirect-capable RDMA; see
 #                 docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect.md
 #     GPUDIRECT=1 ./launch_node.sh 0 nixl
+#
+#   LMC_PROFILE=1 emit the per-request stage breakdown (PROFILE /
+#                 PROFILE-L2LK log lines: l2lk, l1rsv, l2load, pf_wait,
+#                 ret_h2d, ret_scat ...). Off by default — it adds a CUDA
+#                 stream sync per retrieve, so it perturbs the TTFT it
+#                 measures. Use it to attribute a change, not to benchmark.
+#     LMC_PROFILE=1 ./launch_node.sh 1 nixl
 #
 # Peers are NOT taken from the CLI: the two-node topology is hard-coded
 # from the known IPs of node0 (192.168.128.75) and node1 (192.168.128.76).
@@ -56,11 +81,33 @@ NODE1_HOST=192.168.128.76
 # ---------------------------------------------------------------------------
 # Ports / model (same on both nodes — each binds its own).
 # ---------------------------------------------------------------------------
-LMC_ZMQ_PORT=5555          # MP server ZMQ (vLLM connector talks here)
-LMC_HTTP_PORT=8090         # MP server HTTP (healthcheck + /lookup_hits + metrics)
-VLLM_PORT=8010             # vLLM OpenAI API (/health, /v1/..., /metrics)
-NIXL_GPU_INIT_PORT=8502    # NIXL GPU-side handshake (nixl mode + GPUDIRECT=1)
-MODEL="meta-llama/Llama-3.1-8B-Instruct"
+LMC_ZMQ_PORT="${LMC_ZMQ_PORT:-5555}"    # MP server ZMQ (vLLM connector talks here)
+LMC_HTTP_PORT="${LMC_HTTP_PORT:-8090}"  # MP server HTTP (healthcheck, /lookup_hits)
+VLLM_PORT="${VLLM_PORT:-8010}"          # vLLM OpenAI API (/health, /v1/..., /metrics)
+NIXL_GPU_INIT_PORT="${NIXL_GPU_INIT_PORT:-8502}"  # NIXL GPU handshake (GPUDIRECT=1)
+
+# ---------------------------------------------------------------------------
+# Model / parallelism. Override from the environment; nothing here needs to
+# be kept in sync with the CXL adapter config, which no longer declares any
+# model or TP fields (one pool serves many models concurrently).
+#
+#   MODEL=Qwen/Qwen3-32B TP=2 ./launch_node.sh 0 cxl
+#
+# GPUS pins which devices this instance sees. Leave unset to use the first
+# TP devices; set it to run two instances on one node, e.g.
+#   GPUS=0 VLLM_PORT=8010 ./launch_node.sh 0 cxl
+#   GPUS=1 VLLM_PORT=8011 ./launch_node.sh 0 cxl
+# Both attach to the SAME MP server: node_id must stay 1:1 with the node,
+# because it indexes a row in the shared CXL lock table. So the second
+# instance also sets SKIP_MP_SERVER=1 and reuses the first's LMC_ZMQ_PORT.
+# ---------------------------------------------------------------------------
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+TP="${TP:-1}"
+DTYPE="${DTYPE:-auto}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+L1_SIZE_GB="${L1_SIZE_GB:-64}"          # MP server L1 (DRAM) capacity
+# Default to the first TP devices (0, 0-1, 0-1-2-3, ...).
+GPUS="${GPUS:-$(seq -s, 0 $((TP - 1)))}"
 
 # ---------------------------------------------------------------------------
 # CLI args.
@@ -117,8 +164,11 @@ esac
 # All logs go under ./logs as node<N>-<mode>.log and node<N>-vllm.log.
 LOG_DIR="$HERE/logs"
 mkdir -p "$LOG_DIR"
+# INSTANCE distinguishes co-located vLLM instances in the log names; it
+# defaults to the vLLM port so two instances never clobber each other.
+INSTANCE="${INSTANCE:-$VLLM_PORT}"
 LMC_LOG="$LOG_DIR/node${NODE_ID}-${MODE}.log"
-VLLM_LOG="$LOG_DIR/node${NODE_ID}-vllm.log"
+VLLM_LOG="$LOG_DIR/node${NODE_ID}-vllm-${INSTANCE}.log"
 
 # vLLM-side LMCache engine config (chunk size etc.).
 export LMCACHE_CONFIG_FILE="$CONFIG_DIR/lmcache.yaml"
@@ -157,7 +207,11 @@ wait_for_http() {
 # ---------------------------------------------------------------------------
 # 1. MP server -> terminal AND log file.
 # ---------------------------------------------------------------------------
-export LMC_PROFILE=0
+# Per-request stage breakdown (the PROFILE / PROFILE-L2LK log lines).
+# Off by default — it adds a CUDA stream sync per retrieve, so it is
+# measurement overhead on the TTFT path. Override from the terminal:
+#   LMC_PROFILE=1 ./launch_node.sh 1 nixl
+export LMC_PROFILE="${LMC_PROFILE:-0}"
 
 L2_JSON="$(jq -c -s '.[0] * .[1]' "$BASE" "$OVERRIDE" \
     | sed -e "s/NODE0_HOST/${NODE0_HOST}/g" -e "s/NODE1_HOST/${NODE1_HOST}/g")"
@@ -197,11 +251,19 @@ L2_PREFETCH_POLICY="default"
 # EVICTION_DESTINATION="${EVICTION_DESTINATION:-DISCARD}"
 EVICTION_DESTINATION="${EVICTION_DESTINATION:-L2_CACHE}"
 
+# SKIP_MP_SERVER=1 attaches this vLLM instance to an MP server another
+# invocation already started on this node. That is how you run two vLLM
+# instances per node: one MP server owns the pool (node_id is 1:1 with the
+# node), and both instances talk to it over the same ZMQ port.
+if [[ "${SKIP_MP_SERVER:-0}" == "1" ]]; then
+    echo "SKIP_MP_SERVER=1: reusing the MP server on :${LMC_ZMQ_PORT}"
+    wait_for_http "http://localhost:${LMC_HTTP_PORT}/healthcheck" 60
+else
 lmcache server \
     --host localhost --port "$LMC_ZMQ_PORT" \
     --http-host 0.0.0.0 --http-port "$LMC_HTTP_PORT" \
     --hash-algorithm builtin \
-    --l1-size-gb 32 \
+    --l1-size-gb "$L1_SIZE_GB" \
     --eviction-policy LRU \
     --eviction-destination "$EVICTION_DESTINATION" \
     --l2-store-policy "$L2_STORE_POLICY" \
@@ -211,6 +273,7 @@ lmcache server \
 PIDS+=($!)
 
 wait_for_http "http://localhost:${LMC_HTTP_PORT}/healthcheck"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. vLLM -> log file only.
@@ -228,14 +291,15 @@ KV_CFG="{
   }
 }"
 
-CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
+CUDA_VISIBLE_DEVICES="$GPUS" vllm serve "$MODEL" \
     --port "$VLLM_PORT" \
     --host 0.0.0.0 \
+    --tensor-parallel-size "$TP" \
     --kv-transfer-config "$KV_CFG" \
     --no-enable-prefix-caching \
     --enforce-eager \
-    --gpu-memory-utilization 0.85 \
-    --dtype float16 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --dtype "$DTYPE" \
     > "$VLLM_LOG" 2>&1 &
 PIDS+=($!)
 
@@ -251,10 +315,14 @@ echo "
   MY_IP          : $MY_IP
   PEER           : node${PEER_ID} at $PEER_IP
   MODEL          : $MODEL
+  TP / GPUs      : TP=$TP on CUDA_VISIBLE_DEVICES=$GPUS (dtype=$DTYPE)
   GPUDirect      : $([[ "$GPUDIRECT" == "1" ]] \
                        && echo "ENABLED (gpu handshake :${NIXL_GPU_INIT_PORT})" \
                        || echo "disabled (DRAM path)")
-  MP server ZMQ  : tcp://localhost:${LMC_ZMQ_PORT}
+  LMC_PROFILE    : $([[ "$LMC_PROFILE" == "0" ]] \
+                       && echo "off" \
+                       || echo "ON (stage breakdown; adds a sync per retrieve)")
+  MP server ZMQ  : tcp://localhost:${LMC_ZMQ_PORT}$([[ "${SKIP_MP_SERVER:-0}" == "1" ]] && echo "  (reused)" || echo "")
   MP server HTTP : http://${MY_IP}:${LMC_HTTP_PORT}  (/healthcheck, /lookup_hits)
   vLLM API       : http://${MY_IP}:${VLLM_PORT}      (/health, /v1/..., /metrics)
   MP server log  : $LMC_LOG

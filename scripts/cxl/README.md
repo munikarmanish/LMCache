@@ -29,8 +29,9 @@ Design docs for the adapters:
 
 To use your own hosts, edit `NODE0_HOST=` / `NODE1_HOST=` at the top of
 `launch_node.sh`, `launch_router.sh`, `clear_cache.sh`, and `run_bench.sh` (they
-each hardcode the pair). Each node needs **one GPU** (the launcher pins
-`CUDA_VISIBLE_DEVICES=0`).
+each hardcode the pair). Each node needs **at least one GPU**: the launcher
+uses the first `TP` devices (`TP=1` by default, so GPU 0), or the ones named
+in `GPUS=`.
 
 - **CXL arm:** a DAX device at `/dev/dax0.0` visible to *both* nodes as the same
   shared pool. Change via `dev_path` in `config/cxl.base.json`.
@@ -134,18 +135,32 @@ Each invocation:
    substitutes the two host IPs, producing the `--l2-adapter` JSON;
 2. starts the MP server (`lmcache server`, teed to terminal **and**
    `logs/node<N>-<mode>.log`), waits for `:8090/healthcheck`;
-3. starts vLLM (`vllm serve`, logged to `logs/node<N>-vllm.log`), waits for
-   `:8010/health`;
+3. starts vLLM (`vllm serve`, logged to `logs/node<N>-vllm-<port>.log`), waits
+   for `:8010/health`;
 4. prints a `nodeN READY` banner.
 
 **"Up"** = both terminals show the READY banner. Leave them running; Ctrl-C in a
 terminal tears that node's MP server + vLLM down.
 
-Key flags the launcher sets (edit `launch_node.sh` to change): the MP server runs
-`--l1-size-gb 92 --eviction-policy LRU`, and vLLM runs
-`--no-enable-prefix-caching` (so the *only* cache is LMCache) `--enforce-eager
---dtype float16`. `PYTHONHASHSEED=0` is exported so token→chunk hashing is
-byte-identical across nodes (required for cross-node hits).
+Key flags the launcher sets: the MP server runs
+`--l1-size-gb 64 --eviction-policy LRU` (override with `L1_SIZE_GB=`), and vLLM
+runs `--no-enable-prefix-caching` (so the *only* cache is LMCache)
+`--enforce-eager --tensor-parallel-size $TP --dtype $DTYPE`.
+`PYTHONHASHSEED=0` is exported so token→chunk hashing is byte-identical across
+nodes (required for cross-node hits).
+
+Model and parallelism come from the environment, not from the adapter configs:
+
+```bash
+MODEL=Qwen/Qwen3-32B TP=2 ./launch_node.sh 0 cxl      # TP over both GPUs
+GPUS=0 ./launch_node.sh 0 cxl                         # two instances, one node:
+GPUS=1 VLLM_PORT=8011 SKIP_MP_SERVER=1 ./launch_node.sh 0 cxl
+```
+
+Co-located instances share **one** MP server (`SKIP_MP_SERVER=1`): a CXL
+`node_id` must stay 1:1 with the physical node. See the `launch_node.sh` header
+for the full list (`MODEL`, `TP`, `DTYPE`, `GPUS`, `GPU_MEM_UTIL`, `L1_SIZE_GB`,
+and the port overrides).
 
 > **Store policy.** As shipped, `launch_node.sh` uses
 > `--l2-store-policy default` (the `lazy` line is commented out). With `default`,
@@ -282,10 +297,10 @@ the `multi-round-chat` set (`SHARED_PROMPT_LENGTH`, `CHAT_HISTORY_LENGTH`,
 aggregate p50/p90/p99 TTFT, throughput, token totals).
 
 **Ideas for labmates extending this:** add new `--strategy` values in
-`router.py`; sweep `chunk_size_bytes` / `region_size` in `config/cxl.base.json`;
-vary `--l1-size-gb` (nixl arm: keep it a multiple of 2 MiB); enable
-`LMC_PROFILE=1` in `launch_node.sh` to get the per-request `PROFILE` stage
-breakdown in the MP server log.
+`router.py`; sweep `region_size` in `config/cxl.base.json`;
+vary `L1_SIZE_GB` (nixl arm: keep it a multiple of 2 MiB); run with
+`LMC_PROFILE=1` to get the per-request `PROFILE` stage breakdown in the MP
+server log.
 
 ---
 
@@ -294,32 +309,37 @@ breakdown in the MP server log.
 All under `config/`. `launch_node.sh` deep-merges `<mode>.base.json` with the
 per-node override and substitutes `NODE0_HOST`/`NODE1_HOST`.
 
-**`cxl.base.json`** (shared): `dev_path` (`/dev/dax0.0`), `chunk_size_bytes`
-(32 MiB), `region_size` (256 MiB), `pool_size_override` (128 GiB),
-`generation`, `max_nodes: 2`, and the geometry (`model_name`, `world_size`,
-`kv_dtype_str`, `kv_shape`, `use_mla`, `cluster_chunk_size`).
+**`cxl.base.json`** (shared): `dev_path` (`/dev/dax0.0`), `region_size`
+(256 MiB), `pool_size_override` (128 GiB), `generation`, `max_nodes: 2`, and
+`num_locks`. These are device facts only — the pool carries no model identity,
+so nothing here changes when you switch models or TP degree, and one pool can
+serve several models at once. `dev_path` may also be `/dev/interleave_dax` (the
+interleave_dax kernel module); every node sharing the pool must then use the
+same device and module `config`, and the pool must be re-initialized (bump
+`generation`) when switching between the two.
 `cxl.node0.json` sets `initialize: true` + `run_lock_manager: true` (node 0 is
 the sole initializer and arbiter host); `cxl.node1.json` sets both `false`.
 Both list the peer's `PushKVToCXL` URL on `:8447`.
 
 **`nixl.base.json`** (shared): `type: nixl_peer`, `device: cpu`,
-`nixl_backends: ["UCX"]`, `control_timeout_ms`, `lease_ms`, plus the same
-geometry block. `nixl.node{0,1}.json` set the control/init bind URLs (`:8500` /
+`nixl_backends: ["UCX"]`, `control_timeout_ms`, `lease_ms`. Like the CXL
+config, it declares no model or geometry. `nixl.node{0,1}.json` set the control/init bind URLs (`:8500` /
 `:8501`) and the peer's control/init URLs.
 
 **`lmcache.yaml`**: the vLLM-side engine config — one line, `chunk_size: 256`
-(the **token** chunk size; matches `cluster_chunk_size` in the specs).
+(the **token** chunk size).
 
 **To adapt to your setup**, edit:
 - host IPs → the `NODE0_HOST`/`NODE1_HOST` vars in the shell scripts;
-- `model_name` (and matching `kv_shape`/`kv_dtype_str`/`use_mla`) in both
-  `*.base.json`, plus `MODEL=` in `launch_node.sh` / `launch_router.sh`;
+- the model → `MODEL=` (and `TP=`, `DTYPE=`) in the environment of
+  `launch_node.sh` / `launch_router.sh`; no config file needs to change;
 - `dev_path` in `cxl.base.json` for a different DAX device;
-- pool sizing (`pool_size_override`, `region_size`, `chunk_size_bytes`) in
-  `cxl.base.json`.
+- pool sizing (`pool_size_override`, `region_size`) in `cxl.base.json`.
 
-The geometry fields feed the CXL `geom_hash` / NIXL page contract and **must
-match across both nodes**, or cross-node hits silently fail.
+Both nodes must serve a model with the **same geometry** (dtype, shapes, token
+chunk size) to share its KV cache. The geometry is learned from the live model
+and folded into each chunk's key, so a mismatched node simply misses instead of
+reading bytes it would misinterpret.
 
 ---
 
