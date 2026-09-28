@@ -2,7 +2,7 @@
 """CXL pool bootstrap: mmap, header init/verify, cudaHostRegister.
 
 Responsibilities:
-- Open /dev/dax0.0 (or /dev/interleave_dax, or any file) and mmap it.
+- Open /dev/dax0.0 (or /dev/interleaved_dax, or any file) and mmap it.
 - If the pool is uninitialized (or the caller is the bootstrap node),
   write the header; otherwise, validate the existing header and reject
   on a magic, layout-version, or sizing mismatch. The pool carries no
@@ -49,10 +49,10 @@ from lmcache.v1.storage_backend.cxl.layout import (
 
 logger = init_logger(__name__)
 
-# Name of the misc device registered by the interleave_dax kernel module
+# Name of the misc device registered by the interleaved_dax kernel module
 # (page-granular weighted interleave over several CXL ranges).
-INTERLEAVE_DAX_DEVICE_NAME = "interleave_dax"
-_INTERLEAVE_DAX_CONFIG_PARAM = "/sys/module/interleave_dax/parameters/config"
+INTERLEAVED_DAX_DEVICE_NAME = "interleaved_dax"
+_INTERLEAVED_DAX_CONFIG_PARAM = "/sys/module/interleaved_dax/parameters/config"
 
 # madvise(2) advice value; Linux >= 5.14. Not exposed by the ``mmap`` module
 # before Python 3.13, so it is spelled out here.
@@ -70,18 +70,18 @@ class PagePopulatePolicy(enum.Enum):
     before it is pinned, which installs every PTE already marked accessed and
     dirty.
 
-    This matters on ``/dev/interleave_dax``. That device can only map 4 KiB
+    This matters on ``/dev/interleaved_dax``. That device can only map 4 KiB
     pages, and ``cudaHostRegister`` pins them without marking the PTEs
     accessed/dirty, so the first CPU write to each page costs ~0.9 us with no
     page fault. A cross-node donor push always writes never-touched chunks, so
     it ran at ~9 GB/s instead of ~41 GB/s. DAX devices map 2 MiB pages and do
     not show the effect.
 
-    Populating is startup-neutral on interleave_dax: the populate pass costs
+    Populating is startup-neutral on interleaved_dax: the populate pass costs
     about what ``cudaHostRegister`` then saves by finding the PTEs present.
     """
 
-    # Populate only devices that need it (currently /dev/interleave_dax).
+    # Populate only devices that need it (currently /dev/interleaved_dax).
     AUTO = "auto"
     # Populate every pool. On a sparse regular file this allocates all of it.
     ALWAYS = "always"
@@ -198,7 +198,7 @@ def bootstrap_pool(cfg: CXLBootstrapConfig) -> PoolHandle:
             ``cfg.populate_policy`` controls whether the mapping's page-table
             entries are pre-populated before it is pinned (see
             :class:`PagePopulatePolicy`); by default only
-            ``/dev/interleave_dax`` pools are.
+            ``/dev/interleaved_dax`` pools are.
 
     Returns:
         A live PoolHandle over the mapped pool.
@@ -292,10 +292,10 @@ def _open_pool(path: str) -> tuple[int, int]:
        (they are not seekable in the file-position sense).
     3. ``daxctl list -d <name> -j``: fallback if sysfs isn't readable
        (e.g. unusual setups). Parses the JSON ``size`` field.
-    4. ``/dev/interleave_dax`` (the interleave_dax kernel module's misc
+    4. ``/dev/interleaved_dax`` (the interleaved_dax kernel module's misc
        device): it is not on the DAX bus, so rules 2-3 do not apply. Its
        capacity is derived from the module's ``config`` parameter, see
-       :func:`interleave_dax_capacity_bytes`.
+       :func:`interleaved_dax_capacity_bytes`.
 
     Raises RuntimeError with a diagnostic message if none of these
     work — this previously masked the DAX case as "stat reported 0,
@@ -307,8 +307,8 @@ def _open_pool(path: str) -> tuple[int, int]:
         size = st.st_size
 
         if size <= 0 and stat.S_ISCHR(st.st_mode):
-            if os.path.basename(path) == INTERLEAVE_DAX_DEVICE_NAME:
-                size = _interleave_dax_device_size()
+            if os.path.basename(path) == INTERLEAVED_DAX_DEVICE_NAME:
+                size = _interleaved_dax_device_size()
             else:
                 size = _dax_device_size(path)
 
@@ -319,8 +319,8 @@ def _open_pool(path: str) -> tuple[int, int]:
                 "If this is a DAX device, verify it is enabled "
                 "(`daxctl list`) and that "
                 "/sys/bus/dax/devices/<name>/size is readable. If this is "
-                f"/dev/{INTERLEAVE_DAX_DEVICE_NAME}, verify the module is "
-                f"loaded and {_INTERLEAVE_DAX_CONFIG_PARAM} is readable."
+                f"/dev/{INTERLEAVED_DAX_DEVICE_NAME}, verify the module is "
+                f"loaded and {_INTERLEAVED_DAX_CONFIG_PARAM} is readable."
             )
         return fd, size
     except Exception:
@@ -374,10 +374,10 @@ def _dax_device_size(path: str) -> int:
     return 0
 
 
-def interleave_dax_capacity_bytes(config: str, page_size: int) -> int:
-    """Compute the usable size of an interleave_dax device from its config.
+def interleaved_dax_capacity_bytes(config: str, page_size: int) -> int:
+    """Compute the usable size of an interleaved_dax device from its config.
 
-    Mirrors ``il_capacity_pages()`` in the interleave_dax kernel module. The
+    Mirrors ``il_capacity_pages()`` in the interleaved_dax kernel module. The
     device round-robins pages over its ranges by weight and runs out as soon
     as the first range is exhausted, so::
 
@@ -410,7 +410,7 @@ def interleave_dax_capacity_bytes(config: str, page_size: int) -> int:
         start_str, dash, end_str = span.partition("-")
         if not sep or not dash:
             raise ValueError(
-                f"malformed interleave_dax range {entry!r}; "
+                f"malformed interleaved_dax range {entry!r}; "
                 "expected <start_gib>-<end_gib>:<weight>"
             )
         try:
@@ -418,9 +418,9 @@ def interleave_dax_capacity_bytes(config: str, page_size: int) -> int:
             end_gib = _parse_c_ulong(end_str)
             weight = _parse_c_ulong(weight_str)
         except ValueError as exc:
-            raise ValueError(f"malformed interleave_dax range {entry!r}") from exc
+            raise ValueError(f"malformed interleaved_dax range {entry!r}") from exc
         if end_gib <= start_gib or weight == 0:
-            raise ValueError(f"invalid interleave_dax range {entry!r}")
+            raise ValueError(f"invalid interleaved_dax range {entry!r}")
 
         len_pages = ((end_gib - start_gib) << 30) // page_size
         rounds = len_pages // weight
@@ -428,7 +428,7 @@ def interleave_dax_capacity_bytes(config: str, page_size: int) -> int:
         total_weight += weight
 
     if min_rounds < 0:
-        raise ValueError(f"no ranges in interleave_dax config {config!r}")
+        raise ValueError(f"no ranges in interleaved_dax config {config!r}")
     return min_rounds * total_weight * page_size
 
 
@@ -447,23 +447,23 @@ def _parse_c_ulong(text: str) -> int:
     return value
 
 
-def _interleave_dax_device_size() -> int:
-    """Return the size in bytes of ``/dev/interleave_dax``.
+def _interleaved_dax_device_size() -> int:
+    """Return the size in bytes of ``/dev/interleaved_dax``.
 
-    The interleave_dax misc device exposes no size attribute; the only
+    The interleaved_dax misc device exposes no size attribute; the only
     userspace-visible source is the module's read-only ``config``
     parameter. Returns 0 if the module is not loaded or its config cannot
     be parsed; the caller turns that into a useful error.
     """
     try:
-        with open(_INTERLEAVE_DAX_CONFIG_PARAM, "r") as f:
+        with open(_INTERLEAVED_DAX_CONFIG_PARAM, "r") as f:
             config = f.read()
     except OSError:
         return 0
     try:
-        return interleave_dax_capacity_bytes(config, os.sysconf("SC_PAGE_SIZE"))
+        return interleaved_dax_capacity_bytes(config, os.sysconf("SC_PAGE_SIZE"))
     except ValueError as exc:
-        logger.warning("could not parse %s: %s", _INTERLEAVE_DAX_CONFIG_PARAM, exc)
+        logger.warning("could not parse %s: %s", _INTERLEAVED_DAX_CONFIG_PARAM, exc)
         return 0
 
 
@@ -535,7 +535,7 @@ def _should_populate(cfg: CXLBootstrapConfig) -> bool:
         return True
     if cfg.populate_policy is PagePopulatePolicy.NEVER:
         return False
-    return os.path.basename(cfg.dev_path) == INTERLEAVE_DAX_DEVICE_NAME
+    return os.path.basename(cfg.dev_path) == INTERLEAVED_DAX_DEVICE_NAME
 
 
 def _populate_pages_if_needed(handle: PoolHandle) -> None:

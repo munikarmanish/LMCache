@@ -313,8 +313,8 @@ per-node override and substitutes `NODE0_HOST`/`NODE1_HOST`.
 (256 MiB), `pool_size_override` (128 GiB), `generation`, `max_nodes: 2`, and
 `num_locks`. These are device facts only — the pool carries no model identity,
 so nothing here changes when you switch models or TP degree, and one pool can
-serve several models at once. `dev_path` may also be `/dev/interleave_dax` (the
-interleave_dax kernel module); every node sharing the pool must then use the
+serve several models at once. `dev_path` may also be `/dev/interleaved_dax` (the
+interleaved_dax kernel module); every node sharing the pool must then use the
 same device and module `config`, and the pool must be re-initialized (bump
 `generation`) when switching between the two.
 `cxl.node0.json` sets `initialize: true` + `run_lock_manager: true` (node 0 is

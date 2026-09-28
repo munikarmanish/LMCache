@@ -236,21 +236,21 @@ static uint64_t daxctl_dax_size(const char *dev_path) {
     return (uint64_t)v;
 }
 
-/* Size of /dev/interleave_dax, the interleave_dax kernel module's misc
+/* Size of /dev/interleaved_dax, the interleaved_dax kernel module's misc
  * device. It is not on the DAX bus and exposes no size attribute, so the
  * capacity is derived from the module's read-only `config` parameter:
  * comma-separated "<start_gib>-<end_gib>:<weight>" entries. Mirrors
- * il_capacity_pages() in the module and interleave_dax_capacity_bytes()
+ * il_capacity_pages() in the module and interleaved_dax_capacity_bytes()
  * in bootstrap.py:
  *
  *   capacity_pages = min_i(len_pages[i] / weight[i]) * sum_i(weight[i])
  *
  * Returns 0 on failure (module not loaded, malformed config). */
-#define INTERLEAVE_DAX_NAME "interleave_dax"
-#define INTERLEAVE_DAX_CONFIG "/sys/module/interleave_dax/parameters/config"
+#define INTERLEAVED_DAX_NAME "interleaved_dax"
+#define INTERLEAVED_DAX_CONFIG "/sys/module/interleaved_dax/parameters/config"
 
-static uint64_t interleave_dax_size(void) {
-    FILE *f = fopen(INTERLEAVE_DAX_CONFIG, "r");
+static uint64_t interleaved_dax_size(void) {
+    FILE *f = fopen(INTERLEAVED_DAX_CONFIG, "r");
     if (!f) return 0;
     char cfg[1024];
     cfg[0] = '\0';
@@ -291,8 +291,8 @@ static uint64_t interleave_dax_size(void) {
 
 /* Combined probe for a char device. */
 static uint64_t dax_device_size(const char *dev_path) {
-    if (strcmp(path_basename(dev_path), INTERLEAVE_DAX_NAME) == 0)
-        return interleave_dax_size();
+    if (strcmp(path_basename(dev_path), INTERLEAVED_DAX_NAME) == 0)
+        return interleaved_dax_size();
     uint64_t s = sysfs_dax_size(dev_path);
     if (s != 0) return s;
     return daxctl_dax_size(dev_path);
@@ -374,8 +374,8 @@ int main(int argc, char **argv) {
      *   1. fstat — works for regular files (tests use tmpfiles).
      *   2. /sys/bus/dax/devices/<name>/size — sysfs, no root needed.
      *   3. daxctl list -d <name> -j — JSON fallback.
-     *   4. /dev/interleave_dax — derived from the module's `config`
-     *      parameter (see interleave_dax_size()); replaces 2-3.
+     *   4. /dev/interleaved_dax — derived from the module's `config`
+     *      parameter (see interleaved_dax_size()); replaces 2-3.
      *
      * pool_size_override, if given, caps the discovered size (matches
      * Python's behavior where pool_size_override is a cap on the
@@ -395,8 +395,8 @@ int main(int argc, char **argv) {
             "could not determine size of %s; sysfs and daxctl probes "
             "failed. If this is a DAX device, verify it is enabled "
             "(`daxctl list`) and that /sys/bus/dax/devices/<name>/size "
-            "is readable. If this is /dev/" INTERLEAVE_DAX_NAME ", verify "
-            "the module is loaded and " INTERLEAVE_DAX_CONFIG " is "
+            "is readable. If this is /dev/" INTERLEAVED_DAX_NAME ", verify "
+            "the module is loaded and " INTERLEAVED_DAX_CONFIG " is "
             "readable.\n",
             args.dev_path);
         close(fd);

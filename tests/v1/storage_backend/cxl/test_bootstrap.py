@@ -19,11 +19,11 @@ import torch
 # First Party
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.bootstrap import (
-    INTERLEAVE_DAX_DEVICE_NAME,
+    INTERLEAVED_DAX_DEVICE_NAME,
     CXLBootstrapConfig,
     PagePopulatePolicy,
     bootstrap_pool,
-    interleave_dax_capacity_bytes,
+    interleaved_dax_capacity_bytes,
 )
 from lmcache.v1.storage_backend.cxl.layout import (
     MAGIC,
@@ -238,7 +238,7 @@ def test_two_handles_share_same_mapping(pool_path):
         h_writer.close()
 
 
-# -------- interleave_dax capacity ----------------------------------------
+# -------- interleaved_dax capacity ----------------------------------------
 
 _GIB = 1 << 30
 _PAGE = 4096
@@ -246,27 +246,29 @@ _PAGE = 4096
 
 def test_interleave_capacity_equal_weights_uses_both_ranges():
     # Two 128 GiB modules at 1:1 -> the full 256 GiB is addressable.
-    assert interleave_dax_capacity_bytes("0-128:1,128-256:1", _PAGE) == 256 * _GIB
+    assert interleaved_dax_capacity_bytes("0-128:1,128-256:1", _PAGE) == 256 * _GIB
 
 
 def test_interleave_capacity_tolerates_sysfs_trailing_newline():
-    assert interleave_dax_capacity_bytes("0-128:1,128-256:1\n", _PAGE) == 256 * _GIB
+    assert interleaved_dax_capacity_bytes("0-128:1,128-256:1\n", _PAGE) == 256 * _GIB
 
 
 def test_interleave_capacity_bounded_by_first_exhausted_range():
     # 1:1 over a 64 GiB and a 128 GiB range stops when the small one runs out.
-    assert interleave_dax_capacity_bytes("0-64:1,128-256:1", _PAGE) == 128 * _GIB
+    assert interleaved_dax_capacity_bytes("0-64:1,128-256:1", _PAGE) == 128 * _GIB
 
 
 def test_interleave_capacity_honours_weights():
     # 2:1 over equal 128 GiB ranges: the weight-2 range drains first after
     # 64 GiB-worth of rounds, each round covering 3 pages.
     expected = (128 * _GIB // _PAGE // 2) * 3 * _PAGE
-    assert interleave_dax_capacity_bytes("0-128:2,128-256:1", _PAGE) == expected
+    assert interleaved_dax_capacity_bytes("0-128:2,128-256:1", _PAGE) == expected
 
 
 def test_interleave_capacity_accepts_hex_like_the_kernel_parser():
-    assert interleave_dax_capacity_bytes("0x0-0x80:1,0x80-0x100:1", _PAGE) == 256 * _GIB
+    assert (
+        interleaved_dax_capacity_bytes("0x0-0x80:1,0x80-0x100:1", _PAGE) == 256 * _GIB
+    )
 
 
 @pytest.mark.parametrize(
@@ -282,12 +284,12 @@ def test_interleave_capacity_accepts_hex_like_the_kernel_parser():
 )
 def test_interleave_capacity_rejects_malformed_config(config):
     with pytest.raises(ValueError):
-        interleave_dax_capacity_bytes(config, _PAGE)
+        interleaved_dax_capacity_bytes(config, _PAGE)
 
 
 def test_interleave_capacity_rejects_nonpositive_page_size():
     with pytest.raises(ValueError):
-        interleave_dax_capacity_bytes("0-128:1", 0)
+        interleaved_dax_capacity_bytes("0-128:1", 0)
 
 
 # -------- page-table pre-population --------------------------------------
@@ -351,10 +353,10 @@ def test_populate_auto_skips_ordinary_pools(pool_path, no_cuda):
         handle.close()
 
 
-def test_populate_auto_covers_interleave_dax(tmp_path, no_cuda):
+def test_populate_auto_covers_interleaved_dax(tmp_path, no_cuda):
     # AUTO keys on the device name; a regular file with that name stands in
     # for the misc device, whose 4 KiB-only mappings are what need populating.
-    path = tmp_path / INTERLEAVE_DAX_DEVICE_NAME
+    path = tmp_path / INTERLEAVED_DAX_DEVICE_NAME
     with open(path, "wb") as f:
         f.truncate(POOL_SIZE)
     handle = _bootstrap(str(path), PagePopulatePolicy.AUTO)
