@@ -9,6 +9,7 @@ is unavailable, so tests can run anywhere.
 
 # Standard
 import os
+import struct
 import tempfile
 
 # Third Party
@@ -18,8 +19,11 @@ import torch
 # First Party
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.cxl.bootstrap import (
+    INTERLEAVE_DAX_DEVICE_NAME,
     CXLBootstrapConfig,
+    PagePopulatePolicy,
     bootstrap_pool,
+    interleave_dax_capacity_bytes,
 )
 from lmcache.v1.storage_backend.cxl.layout import (
     MAGIC,
@@ -232,3 +236,153 @@ def test_two_handles_share_same_mapping(pool_path):
     finally:
         h_reader.close()
         h_writer.close()
+
+
+# -------- interleave_dax capacity ----------------------------------------
+
+_GIB = 1 << 30
+_PAGE = 4096
+
+
+def test_interleave_capacity_equal_weights_uses_both_ranges():
+    # Two 128 GiB modules at 1:1 -> the full 256 GiB is addressable.
+    assert interleave_dax_capacity_bytes("0-128:1,128-256:1", _PAGE) == 256 * _GIB
+
+
+def test_interleave_capacity_tolerates_sysfs_trailing_newline():
+    assert interleave_dax_capacity_bytes("0-128:1,128-256:1\n", _PAGE) == 256 * _GIB
+
+
+def test_interleave_capacity_bounded_by_first_exhausted_range():
+    # 1:1 over a 64 GiB and a 128 GiB range stops when the small one runs out.
+    assert interleave_dax_capacity_bytes("0-64:1,128-256:1", _PAGE) == 128 * _GIB
+
+
+def test_interleave_capacity_honours_weights():
+    # 2:1 over equal 128 GiB ranges: the weight-2 range drains first after
+    # 64 GiB-worth of rounds, each round covering 3 pages.
+    expected = (128 * _GIB // _PAGE // 2) * 3 * _PAGE
+    assert interleave_dax_capacity_bytes("0-128:2,128-256:1", _PAGE) == expected
+
+
+def test_interleave_capacity_accepts_hex_like_the_kernel_parser():
+    assert interleave_dax_capacity_bytes("0x0-0x80:1,0x80-0x100:1", _PAGE) == 256 * _GIB
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "",  # nothing to parse
+        "0-128",  # missing weight
+        "128:1",  # missing end
+        "128-0:1",  # empty range
+        "0-128:0",  # zero weight
+        "a-b:c",  # not numbers
+    ],
+)
+def test_interleave_capacity_rejects_malformed_config(config):
+    with pytest.raises(ValueError):
+        interleave_dax_capacity_bytes(config, _PAGE)
+
+
+def test_interleave_capacity_rejects_nonpositive_page_size():
+    with pytest.raises(ValueError):
+        interleave_dax_capacity_bytes("0-128:1", 0)
+
+
+# -------- page-table pre-population --------------------------------------
+
+
+def _present_page_fraction(base: int, size: int) -> float:
+    """Fraction of the mapping's pages that have a present PTE.
+
+    Reads bit 63 of each ``/proc/self/pagemap`` entry, which is readable
+    without privileges (only the PFN bits are hidden).
+    """
+    page = os.sysconf("SC_PAGE_SIZE")
+    n_pages = size // page
+    with open("/proc/self/pagemap", "rb") as f:
+        f.seek((base // page) * 8)
+        raw = f.read(n_pages * 8)
+    entries = struct.unpack(f"<{n_pages}Q", raw)
+    return sum(1 for e in entries if e >> 63) / n_pages
+
+
+@pytest.fixture
+def no_cuda(monkeypatch):
+    # cudaHostRegister faults pages in by itself, which would hide whether
+    # the populate step ran. Take it out of the picture.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+
+def _bootstrap(path: str, policy: PagePopulatePolicy):
+    return bootstrap_pool(
+        CXLBootstrapConfig(
+            dev_path=path,
+            region_size=REGION_SIZE,
+            initialize=True,
+            populate_policy=policy,
+        )
+    )
+
+
+def test_populate_always_maps_every_page(pool_path, no_cuda):
+    handle = _bootstrap(pool_path, PagePopulatePolicy.ALWAYS)
+    try:
+        assert _present_page_fraction(handle.base, handle.size) == 1.0
+    finally:
+        handle.close()
+
+
+def test_populate_never_leaves_payload_pages_unmapped(pool_path, no_cuda):
+    handle = _bootstrap(pool_path, PagePopulatePolicy.NEVER)
+    try:
+        # Initialization touches only the metadata at the head of the pool.
+        assert _present_page_fraction(handle.base, handle.size) < 0.5
+    finally:
+        handle.close()
+
+
+def test_populate_auto_skips_ordinary_pools(pool_path, no_cuda):
+    handle = _bootstrap(pool_path, PagePopulatePolicy.AUTO)
+    try:
+        assert _present_page_fraction(handle.base, handle.size) < 0.5
+    finally:
+        handle.close()
+
+
+def test_populate_auto_covers_interleave_dax(tmp_path, no_cuda):
+    # AUTO keys on the device name; a regular file with that name stands in
+    # for the misc device, whose 4 KiB-only mappings are what need populating.
+    path = tmp_path / INTERLEAVE_DAX_DEVICE_NAME
+    with open(path, "wb") as f:
+        f.truncate(POOL_SIZE)
+    handle = _bootstrap(str(path), PagePopulatePolicy.AUTO)
+    try:
+        assert _present_page_fraction(handle.base, handle.size) == 1.0
+    finally:
+        handle.close()
+
+
+def test_populate_preserves_pool_contents(pool_path, no_cuda):
+    # MADV_POPULATE_WRITE write-faults pages without storing to them, so
+    # attaching with ALWAYS must not disturb an initialized pool.
+    first = _bootstrap(pool_path, PagePopulatePolicy.NEVER)
+    try:
+        first.region_descs()[3].owner_node_id = 7
+    finally:
+        first.close()
+
+    second = bootstrap_pool(
+        CXLBootstrapConfig(
+            dev_path=pool_path,
+            region_size=REGION_SIZE,
+            initialize=False,
+            populate_policy=PagePopulatePolicy.ALWAYS,
+        )
+    )
+    try:
+        assert second.header.magic == MAGIC
+        assert second.region_descs()[3].owner_node_id == 7
+    finally:
+        second.close()

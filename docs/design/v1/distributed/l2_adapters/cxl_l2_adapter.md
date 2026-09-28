@@ -428,7 +428,9 @@ The config declares **no model, TP degree, dtype, or chunk size**. Chunk sizes
 are taken from what is stored (one heap class per distinct byte size), tenant
 identity from each chunk's `ObjectKey`, and geometry from the live model via
 `register_layout`. Switching models or TP changes nothing here, and one pool
-serves several models concurrently.
+serves several models concurrently. `dev_path` may also be
+`/dev/interleave_dax`; see
+[`store.md`](../../storage_backend/cxl/store.md) §1 for its constraints.
 
 `build_cxl_adapter_from_config` builds the `CXLStore`, and — only if `peers`
 *and* an `l1_manager` are present — an `L1LocalCopyProvider`, a `CXLDonor`, a

@@ -236,8 +236,63 @@ static uint64_t daxctl_dax_size(const char *dev_path) {
     return (uint64_t)v;
 }
 
-/* Combined probe. */
+/* Size of /dev/interleave_dax, the interleave_dax kernel module's misc
+ * device. It is not on the DAX bus and exposes no size attribute, so the
+ * capacity is derived from the module's read-only `config` parameter:
+ * comma-separated "<start_gib>-<end_gib>:<weight>" entries. Mirrors
+ * il_capacity_pages() in the module and interleave_dax_capacity_bytes()
+ * in bootstrap.py:
+ *
+ *   capacity_pages = min_i(len_pages[i] / weight[i]) * sum_i(weight[i])
+ *
+ * Returns 0 on failure (module not loaded, malformed config). */
+#define INTERLEAVE_DAX_NAME "interleave_dax"
+#define INTERLEAVE_DAX_CONFIG "/sys/module/interleave_dax/parameters/config"
+
+static uint64_t interleave_dax_size(void) {
+    FILE *f = fopen(INTERLEAVE_DAX_CONFIG, "r");
+    if (!f) return 0;
+    char cfg[1024];
+    cfg[0] = '\0';
+    if (!fgets(cfg, sizeof(cfg), f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+
+    uint64_t min_rounds = UINT64_MAX;
+    uint64_t total_weight = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(cfg, ",\n", &save); tok;
+         tok = strtok_r(NULL, ",\n", &save)) {
+        char *end = NULL;
+        unsigned long long start_gib = strtoull(tok, &end, 0);
+        if (end == tok || *end != '-') return 0;
+        char *p = end + 1;
+        unsigned long long end_gib = strtoull(p, &end, 0);
+        if (end == p || *end != ':') return 0;
+        p = end + 1;
+        unsigned long long weight = strtoull(p, &end, 0);
+        if (end == p) return 0;
+        if (end_gib <= start_gib || weight == 0) return 0;
+
+        uint64_t len_pages =
+            ((uint64_t)(end_gib - start_gib) << 30) / (uint64_t)page_size;
+        uint64_t rounds = len_pages / weight;
+        if (rounds < min_rounds) min_rounds = rounds;
+        total_weight += weight;
+    }
+    if (min_rounds == UINT64_MAX) return 0;
+    return min_rounds * total_weight * (uint64_t)page_size;
+}
+
+/* Combined probe for a char device. */
 static uint64_t dax_device_size(const char *dev_path) {
+    if (strcmp(path_basename(dev_path), INTERLEAVE_DAX_NAME) == 0)
+        return interleave_dax_size();
     uint64_t s = sysfs_dax_size(dev_path);
     if (s != 0) return s;
     return daxctl_dax_size(dev_path);
@@ -319,6 +374,8 @@ int main(int argc, char **argv) {
      *   1. fstat — works for regular files (tests use tmpfiles).
      *   2. /sys/bus/dax/devices/<name>/size — sysfs, no root needed.
      *   3. daxctl list -d <name> -j — JSON fallback.
+     *   4. /dev/interleave_dax — derived from the module's `config`
+     *      parameter (see interleave_dax_size()); replaces 2-3.
      *
      * pool_size_override, if given, caps the discovered size (matches
      * Python's behavior where pool_size_override is a cap on the
@@ -338,7 +395,9 @@ int main(int argc, char **argv) {
             "could not determine size of %s; sysfs and daxctl probes "
             "failed. If this is a DAX device, verify it is enabled "
             "(`daxctl list`) and that /sys/bus/dax/devices/<name>/size "
-            "is readable.\n",
+            "is readable. If this is /dev/" INTERLEAVE_DAX_NAME ", verify "
+            "the module is loaded and " INTERLEAVE_DAX_CONFIG " is "
+            "readable.\n",
             args.dev_path);
         close(fd);
         return 1;

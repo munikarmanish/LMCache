@@ -39,6 +39,23 @@ composes live under
 
 - **Bootstraps** the pool: mmap the `/dev/dax` device, read or write the header,
   and `cudaHostRegister` the whole mapping so chunks can DMA to GPU.
+  `dev_path` may also be `/dev/interleave_dax` (the interleave_dax kernel
+  module, which stripes pages across the CXL modules for ~1.7x bandwidth). That
+  device is not on the DAX bus, so its size is derived from the module's
+  `config` parameter (`interleave_dax_capacity_bytes` in `bootstrap.py`, mirrored
+  in `cxl_lock_manager.c`). The interleave changes the logical-to-physical page
+  mapping, so **every node sharing a pool must use the same device type and the
+  same module `config`**, and a pool written through one mapping must be
+  re-initialized (bump `generation`) before use through the other.
+  For `/dev/interleave_dax` the bootstrap also runs
+  `madvise(MADV_POPULATE_WRITE)` over the mapping **before** `cudaHostRegister`
+  (`PagePopulatePolicy.AUTO`). The device can only map 4 KiB pages, and
+  `cudaHostRegister` pins them without marking the PTEs accessed/dirty, so the
+  first CPU write to each page otherwise costs ~0.9 µs with no page fault. A
+  cross-node donor push always writes never-touched chunks, so it ran at
+  ~9 GB/s instead of ~40 GB/s. Populating is startup-neutral: the pass costs
+  about what registration then saves by finding the PTEs present (~27 s total
+  for 128 GiB either way). It is best-effort; failure only logs a warning.
 - **Wires the subsystems** that operate on the pool (§3) and hands them a single
   shared distributed lock.
 - **Runs the store path** (`put_batch` → `_put_one`): reserve a
