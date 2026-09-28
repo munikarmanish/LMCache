@@ -394,6 +394,14 @@ class L2AdapterInterface(ABC):
         prefetch copies every hit into an L1 buffer via
         ``submit_load_task`` before retrieve.
 
+        **This is a whole-adapter answer, not a per-GPU-context one**, and
+        deliberately so: it is consulted by the prefetch controller, which
+        runs on the vLLM *scheduler* path and has no worker identity — the
+        rank that will consume the keys is not known when the plan is
+        built. An adapter holding per-context resources must therefore
+        answer ``True`` only when *every* registered context can serve
+        GPU-direct, and fall back uniformly otherwise.
+
         **May change over the adapter's lifetime.** An adapter whose
         GPU-direct path needs a resource that does not exist at
         construction (e.g. the NIXL peer adapter, which must register the
@@ -410,30 +418,60 @@ class L2AdapterInterface(ABC):
         """
         return False
 
-    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
-        """Offer the GPU retrieve staging buffer to this adapter.
+    def register_gpu_staging_buffer(
+        self, instance_id: int, gpu_ptr: int, size: int, device: str
+    ) -> None:
+        """Offer one GPU context's retrieve staging buffer to this adapter.
 
-        Called once, when the GPU context creates the buffer — which happens
-        after the adapters are built. An adapter whose GPU-direct path needs
-        the destination registered up front (e.g. with an RDMA NIC) does so
-        here, and may only then report ``supports_l2_resident_retrieve() ==
-        True``.
+        Called when a GPU context creates its buffer — after the adapters
+        are built. An adapter whose GPU-direct path needs the destination
+        registered up front (e.g. with an RDMA NIC) does so here, and may
+        only then report ``supports_l2_resident_retrieve() == True``.
+
+        **Called once per registered GPU context, not once per process.**
+        Each vLLM worker registers its own buffer, so a TP=N instance
+        produces N calls, and co-located instances add more. ``instance_id``
+        is the only identifier that names them apart — it is the worker's
+        PID, unique per rank and per instance, and it is also what the
+        retrieve path carries.
 
         The default is a no-op: an adapter that needs no registration (CXL,
-        which registers its own pool at bootstrap) or that has no GPU-direct
+        which registers its own pool at bootstrap and whose device-portable
+        pinning covers every GPU in the process) or that has no GPU-direct
         path simply ignores it.
 
-        The buffer is allocated once and never moved, so implementations may
-        retain the pointer for the process lifetime.
+        Each buffer is allocated once and never moved, so implementations
+        may retain the pointer for as long as that instance is registered.
 
         Args:
+            instance_id: Identifies the registering GPU context.
             gpu_ptr: Device pointer of the staging buffer's base.
             size: Byte size of the staging buffer.
+            device: The CUDA device the buffer lives on, e.g. ``"cuda:1"``.
+                Transports that must name the device (an RDMA memory
+                descriptor does) need this; the pointer alone is ambiguous
+                across devices.
 
         Raises:
             ValueError: If the adapter requires GPU-direct but the buffer is
                 unusable (e.g. wrong alignment for its transport). The caller
                 logs and continues with this adapter on its non-GPU path.
+        """
+        return None
+
+    def unregister_gpu_staging_buffer(self, instance_id: int) -> None:
+        """Release whatever :meth:`register_gpu_staging_buffer` set up.
+
+        Called when a GPU context goes away. Without it an adapter that
+        holds a per-instance transport resource (an RDMA agent and its
+        registered region) would leak one per worker restart.
+
+        The default is a no-op, and calling it for an instance that never
+        registered must be harmless — the caller does not track which
+        adapters accepted which buffers.
+
+        Args:
+            instance_id: The GPU context being released.
         """
         return None
 
@@ -474,7 +512,9 @@ class L2AdapterInterface(ABC):
         """
         return None
 
-    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+    def submit_h2d(
+        self, instance_id: int, key: ObjectKey, gpu_ptr: int, dst_size: int
+    ) -> int:
         """Queue an async H2D copy of ``key``'s chunk straight into GPU memory.
 
         The copy is enqueued on the caller's CURRENT CUDA stream (the
@@ -499,6 +539,9 @@ class L2AdapterInterface(ABC):
             - The caller is positioned on the desired CUDA stream.
 
         Args:
+            instance_id: The GPU context whose staging buffer ``gpu_ptr``
+                points into. A pointer alone is ambiguous once more than
+                one context is registered.
             key: The object key whose chunk to copy.
             gpu_ptr: Destination device pointer (the retrieve staging
                 buffer).
@@ -521,6 +564,7 @@ class L2AdapterInterface(ABC):
 
     def submit_h2d_batch(
         self,
+        instance_id: int,
         keys: list[ObjectKey],
         gpu_ptrs: list[int],
         dst_sizes: list[int],
@@ -540,6 +584,9 @@ class L2AdapterInterface(ABC):
         one.
 
         Args:
+            instance_id: The GPU context whose staging buffer every
+                ``gpu_ptrs`` entry points into. One batch never spans
+                contexts — the retrieve handler serves one at a time.
             keys: The object keys whose chunks to copy.
             gpu_ptrs: Destination device pointer per key.
             dst_sizes: Destination capacity in bytes per key.
@@ -559,7 +606,7 @@ class L2AdapterInterface(ABC):
                 "submit_h2d_batch: keys, gpu_ptrs and dst_sizes must have equal length"
             )
         return [
-            self.submit_h2d(key, gpu_ptr, dst_size)
+            self.submit_h2d(instance_id, key, gpu_ptr, dst_size)
             for key, gpu_ptr, dst_size in zip(keys, gpu_ptrs, dst_sizes, strict=True)
         ]
 

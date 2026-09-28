@@ -52,6 +52,10 @@ pytestmark = pytest.mark.skipif(
 # =============================================================================
 
 
+# The GPU context these copies target.
+INSTANCE = 3131
+
+
 class ResidentMockL2Adapter(MockL2Adapter):
     """MockL2Adapter that opts into the L2-resident retrieve path.
 
@@ -71,7 +75,9 @@ class ResidentMockL2Adapter(MockL2Adapter):
     def supports_l2_resident_retrieve(self) -> bool:
         return True
 
-    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+    def submit_h2d(
+        self, instance_id: int, key: ObjectKey, gpu_ptr: int, dst_size: int
+    ) -> int:
         self.submit_h2d_calls.append((key, gpu_ptr, dst_size))
         if not self.debug_has_key(key):
             return -1
@@ -323,7 +329,7 @@ class TestResidentAdapterPrimitives:
         keys = [make_object_key(i) for i in range(3)]
         store_keys_in_l2(adapter, keys, layout)
 
-        tokens = [adapter.submit_h2d(k, 0, 0) for k in keys]
+        tokens = [adapter.submit_h2d(INSTANCE, k, 0, 0) for k in keys]
         assert all(t >= 0 for t in tokens)
         assert len(adapter.submit_h2d_calls) == 3
 
@@ -333,7 +339,7 @@ class TestResidentAdapterPrimitives:
 
     def test_submit_h2d_miss_returns_negative(self):
         adapter = make_resident_adapter()
-        token = adapter.submit_h2d(make_object_key(99), 0, 0)
+        token = adapter.submit_h2d(INSTANCE, make_object_key(99), 0, 0)
         assert token == -1
         # Releasing a miss token is a no-op.
         adapter.release_after_h2d(token)
@@ -344,7 +350,7 @@ class TestResidentAdapterPrimitives:
         adapter = make_plain_adapter()
         assert adapter.supports_l2_resident_retrieve() is False
         with pytest.raises(NotImplementedError):
-            adapter.submit_h2d(make_object_key(0), 0, 0)
+            adapter.submit_h2d(INSTANCE, make_object_key(0), 0, 0)
         adapter.close()
 
     def test_submit_h2d_batch_matches_per_key(self):
@@ -358,7 +364,7 @@ class TestResidentAdapterPrimitives:
         miss = make_object_key(99)
         keys = [hit_keys[0], miss, hit_keys[1], hit_keys[2]]
 
-        tokens = adapter.submit_h2d_batch(keys, [0, 0, 0, 0], [0, 0, 0, 0])
+        tokens = adapter.submit_h2d_batch(INSTANCE, keys, [0, 0, 0, 0], [0, 0, 0, 0])
         assert len(tokens) == len(keys)
         assert tokens[1] == -1  # the miss
         assert all(t >= 0 for t in (tokens[0], tokens[2], tokens[3]))
@@ -371,7 +377,7 @@ class TestResidentAdapterPrimitives:
     def test_submit_h2d_batch_rejects_unequal_lengths(self):
         adapter = make_resident_adapter()
         with pytest.raises(ValueError):
-            adapter.submit_h2d_batch([make_object_key(0)], [0, 0], [0])
+            adapter.submit_h2d_batch(INSTANCE, [make_object_key(0)], [0, 0], [0])
         adapter.close()
 
 

@@ -754,14 +754,17 @@ class StorageManager:
                     world_size,
                 )
 
-    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
-        """Offer the GPU retrieve staging buffer to every L2 adapter.
+    def register_gpu_staging_buffer(
+        self, instance_id: int, gpu_ptr: int, size: int, device: str
+    ) -> None:
+        """Offer one GPU context's retrieve staging buffer to every L2 adapter.
 
         Adapters that can transfer straight into GPU memory (e.g. the NIXL
         peer adapter's GPUDirect path) register it and begin reporting
         ``supports_l2_resident_retrieve() == True``; the rest ignore it.
-        Called once, when the GPU context is created — the buffer does not
-        exist when the adapters are built.
+        Called once per GPU context — so once per TP rank, and again for
+        each co-located vLLM instance. The buffers do not exist when the
+        adapters are built.
 
         A failure to register is logged and swallowed rather than raised:
         GPUDirect is an optimization, and an adapter that cannot use this
@@ -769,21 +772,47 @@ class StorageManager:
         registration for the whole engine.
 
         Args:
+            instance_id: Identifies the registering GPU context.
             gpu_ptr: Device pointer of the staging buffer's base.
             size: Byte size of the staging buffer.
+            device: The CUDA device the buffer lives on.
         """
         for adapter_idx, adapter in enumerate(self._l2_adapters):
             try:
-                adapter.register_gpu_staging_buffer(gpu_ptr, size)
+                adapter.register_gpu_staging_buffer(instance_id, gpu_ptr, size, device)
             except Exception:
                 logger.exception(
-                    "L2 adapter %d rejected the GPU staging buffer; it will "
-                    "keep using its non-GPUDirect path",
+                    "L2 adapter %d rejected the GPU staging buffer for "
+                    "instance %d; it will keep using its non-GPUDirect path",
                     adapter_idx,
+                    instance_id,
+                )
+
+    def unregister_gpu_staging_buffer(self, instance_id: int) -> None:
+        """Tell every L2 adapter that a GPU context has gone away.
+
+        Mirrors :meth:`register_gpu_staging_buffer`. Adapters that hold a
+        per-instance transport resource release it; the rest ignore it.
+        Failures are logged and swallowed — teardown must not break
+        KV-cache unregistration.
+
+        Args:
+            instance_id: The GPU context being released.
+        """
+        for adapter_idx, adapter in enumerate(self._l2_adapters):
+            try:
+                adapter.unregister_gpu_staging_buffer(instance_id)
+            except Exception:
+                logger.exception(
+                    "L2 adapter %d failed to release the GPU staging buffer "
+                    "for instance %d",
+                    adapter_idx,
+                    instance_id,
                 )
 
     def submit_h2d_for_l2_resident(
         self,
+        instance_id: int,
         keys: list[ObjectKey],
         adapter_indices: list[int],
         gpu_ptrs: list[int],
@@ -796,6 +825,9 @@ class StorageManager:
         on that stream and not synchronized here.
 
         Args:
+            instance_id: The GPU context whose staging buffer the pointers
+                point into. One retrieve serves one context, so this is
+                constant across the call.
             keys: Resident keys to copy.
             adapter_indices: Adapter index serving each key (parallel to
                 ``keys``).
@@ -824,6 +856,7 @@ class StorageManager:
         tokens: list[int] = [-1] * len(keys)
         for adapter_idx, positions in by_adapter.items():
             adapter_tokens = self._l2_adapters[adapter_idx].submit_h2d_batch(
+                instance_id,
                 [keys[i] for i in positions],
                 [gpu_ptrs[i] for i in positions],
                 [sizes[i] for i in positions],

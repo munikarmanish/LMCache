@@ -753,7 +753,9 @@ class CXLL2Adapter(L2AdapterInterface):
         """CXL serves hits straight to GPU from the registered pool."""
         return True
 
-    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+    def submit_h2d(
+        self, instance_id: int, key: ObjectKey, gpu_ptr: int, dst_size: int
+    ) -> int:
         """Issue an async H2D copy of ``key``'s chunk into ``gpu_ptr``.
 
         The CXL pool is ``cudaHostRegister``'d at bootstrap, so this is a
@@ -762,6 +764,11 @@ class CXLL2Adapter(L2AdapterInterface):
         keeps the slot alive until ``release_after_h2d``.
 
         Args:
+            instance_id: Ignored. The whole pool is cudaHostRegister'd once
+                at bootstrap with ``cudaHostRegisterDefault``, which is
+                portable across every device in the process, and the source
+                is a host pointer — so no per-GPU-context state exists to
+                select. Accepted to satisfy the interface.
             key: The object key to copy.
             gpu_ptr: Destination device pointer.
             dst_size: Destination capacity in bytes.
@@ -805,6 +812,7 @@ class CXLL2Adapter(L2AdapterInterface):
 
     def submit_h2d_batch(
         self,
+        instance_id: int,
         keys: list[ObjectKey],
         gpu_ptrs: list[int],
         dst_sizes: list[int],
@@ -824,6 +832,7 @@ class CXLL2Adapter(L2AdapterInterface):
         launches but is intentionally not required here.
 
         Args:
+            instance_id: Ignored — see :meth:`submit_h2d`.
             keys: Object keys to copy.
             gpu_ptrs: Destination device pointer per key.
             dst_sizes: Destination capacity in bytes per key.

@@ -77,10 +77,10 @@ from lmcache.v1.distributed.l2_adapters.nixl_peer_messages import (
     RemoteLookupReq,
     RemoteUnlockReq,
 )
-from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
 from lmcache.v1.distributed.l2_adapters.nixl_peer_transport import (
     NixlPeerControlClient,
 )
+from lmcache.v1.distributed.l2_adapters.peer_health import PeerHealthMonitor
 from lmcache.v1.memory_management import MemoryObj
 
 if TYPE_CHECKING:
@@ -178,6 +178,11 @@ class PeerDataChannel(Protocol):
         """
         ...
 
+    @property
+    def buffer_base(self) -> int:
+        """Base device pointer of the staging buffer this channel covers."""
+        ...
+
     def close(self) -> None:
         """Release transfer-channel resources."""
         ...
@@ -267,7 +272,9 @@ class _Peer:
         gpu_init_url: The peer's GPU-side NIXL handshake side-channel
             (bare ``host:port``). Empty when the peer advertises no GPU
             channel, which disables GPUDirect reads from it.
-        gpu_connected: Whether the GPU-side NIXL handshake has completed.
+        gpu_connected: The GPU contexts (``instance_id``s) whose channel
+            has completed its GPU-side NIXL handshake with this peer. Each
+            context has its own NIXL agent, so each handshakes separately.
             Tracked separately from ``connected`` because the two channels
             are distinct NIXL agents with independent handshakes: a peer can
             be usable for the DRAM path and not (yet) for the GPU path.
@@ -283,7 +290,7 @@ class _Peer:
     connected: bool = False
     connect_lock: threading.Lock = field(default_factory=threading.Lock)
     gpu_init_url: str = ""
-    gpu_connected: bool = False
+    gpu_connected: set[int] = field(default_factory=set)
     gpu_connect_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -446,7 +453,13 @@ class _NixlGpuReadChannel:
     descriptors are fixed at that size by the cross-node wire contract.
     """
 
-    def __init__(self, channel: object, page_size: int, buffer_base: int):
+    def __init__(
+        self,
+        channel: object,
+        page_size: int,
+        buffer_base: int,
+        buffer_size: int,
+    ):
         """Initialize the GPU read channel.
 
         Args:
@@ -455,10 +468,19 @@ class _NixlGpuReadChannel:
             page_size: NIXL descriptor size; must match the donor's.
             buffer_base: Device pointer of the staging buffer's base, used
                 to convert a destination pointer into a descriptor index.
+            buffer_size: Byte size of that buffer. Bounds the conversion so
+                a pointer into a *different* buffer cannot be mistaken for
+                an offset into this one (see :meth:`read_chunks_to_gpu`).
         """
         self._channel = channel
         self._page_size = page_size
         self._buffer_base = buffer_base
+        self._buffer_size = buffer_size
+
+    @property
+    def buffer_base(self) -> int:
+        """Base device pointer of the staging buffer this channel covers."""
+        return self._buffer_base
 
     def lazy_init_peer_connection(
         self, local_id: str, peer_id: str, peer_init_url: str
@@ -506,10 +528,23 @@ class _NixlGpuReadChannel:
             gpu_ptrs, sizes, remote_page_indices, strict=True
         ):
             offset = gpu_ptr - self._buffer_base
-            if offset < 0:
+            # Both bounds matter, and the upper one is the important one.
+            # A pointer into a *different* staging buffer — another vLLM
+            # instance's, or another TP rank's, on another device — is a
+            # plain integer here. Below the base it goes negative and is
+            # obviously wrong; above the end it yields a perfectly
+            # plausible descriptor index, the READ succeeds, and the
+            # scatter kernel writes those bytes into this engine's paged
+            # KV cache as if they were its own. Silent, unrecoverable
+            # context corruption. Refuse instead.
+            if offset < 0 or offset >= self._buffer_size:
                 raise ValueError(
-                    f"destination pointer {gpu_ptr:#x} is below the registered "
-                    f"GPU staging buffer base {self._buffer_base:#x}"
+                    f"destination pointer {gpu_ptr:#x} is outside the registered "
+                    f"GPU staging buffer "
+                    f"[{self._buffer_base:#x}, "
+                    f"{self._buffer_base + self._buffer_size:#x}). A pointer "
+                    "from another GPU context (another TP rank or vLLM "
+                    "instance) cannot be served by this channel."
                 )
             if offset % self._page_size != 0:
                 raise ValueError(
@@ -519,6 +554,14 @@ class _NixlGpuReadChannel:
             if size % self._page_size != 0:
                 raise ValueError(
                     f"chunk size {size} not a multiple of page_size {self._page_size}"
+                )
+            # The whole chunk must fit, not just its first byte: a chunk
+            # spans size/page_size descriptors, and one starting near the
+            # end would run past the registered region.
+            if offset + size > self._buffer_size:
+                raise ValueError(
+                    f"chunk of {size} bytes at offset {offset} runs past the "
+                    f"end of the {self._buffer_size}-byte GPU staging buffer"
                 )
             pages_per_chunk = size // self._page_size
             local_base = offset // self._page_size
@@ -573,11 +616,16 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
     - device: device type of the L1 buffer registered with NIXL
       (``"cpu"`` for the DRAM L1 tier).
 
-    Geometry inputs (must match across the rack — they fix the page size
-    and dtype both sides register with NIXL):
-    - model_name, world_size, kv_dtype_str, kv_shape, use_mla,
-      cluster_chunk_size.
-    - worker_id, local_world_size, local_worker_id: worker identity.
+    - local_worker_id: NIXL descriptor ``dev_id`` for the L1 buffer. It
+      is 0 for a CPU-resident L1, which is the only supported case today.
+
+    The adapter carries **no model or KV-geometry fields**. It never
+    interprets chunk bytes: a chunk is addressed by descriptor index into
+    the peer's L1 and copied verbatim, and the descriptor size is a fixed
+    2 MiB wire constant rather than anything derived from a model. The
+    fields that used to be declared here (model_name, world_size,
+    kv_dtype_str, kv_shape, use_mla, cluster_chunk_size, worker_id,
+    local_world_size) were assigned and never read.
     """
 
     def __init__(
@@ -604,16 +652,15 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
         # RDMA latency from the prefetch phase into the TTFT-critical
         # retrieve phase — a trade that must be measured per deployment.
         enable_gpu_direct: bool = False,
+        # Vestigial as a bind address: each GPU context builds its own NIXL
+        # channel and they would all bind the same port, so the GPU channels
+        # are created with no inbound listener. They do not need one —
+        # GPUDirect is asymmetric, so our GPU agent dials *out* to a peer's
+        # DRAM init_url and nothing ever dials us. Retained because
+        # ``peers[].gpu_init_url`` is still how a peer advertises that it
+        # has GPUDirect enabled, and this is its local counterpart.
         gpu_init_bind_url: str = "0.0.0.0:8502",
         device: str = "cpu",
-        model_name: str = "",
-        world_size: int = 1,
-        kv_dtype_str: str = "torch.bfloat16",
-        kv_shape: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
-        use_mla: bool = False,
-        cluster_chunk_size: int = 256,
-        worker_id: int = 0,
-        local_world_size: int = 1,
         local_worker_id: int = 0,
     ):
         if node_id < 0:
@@ -684,24 +731,12 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
         self.peer_probe_interval_ms = peer_probe_interval_ms
         self.peer_probe_timeout_ms = peer_probe_timeout_ms
         self.device = device
-        self.model_name = model_name
-        self.world_size = world_size
-        self.kv_dtype_str = kv_dtype_str
-        self.kv_shape = tuple(kv_shape)
-        self.use_mla = use_mla
-        self.cluster_chunk_size = cluster_chunk_size
-        self.worker_id = worker_id
-        self.local_world_size = local_world_size
         self.local_worker_id = local_worker_id
 
     @classmethod
     def from_dict(cls, d: dict) -> "NixlPeerL2AdapterConfig":
         if not isinstance(d.get("node_id"), int):
             raise ValueError("'node_id' (int) is required")
-
-        kv_shape = d.get("kv_shape", (0, 0, 0, 0, 0))
-        if not isinstance(kv_shape, (list, tuple)) or len(kv_shape) != 5:
-            raise ValueError("kv_shape must be a 5-element list/tuple")
 
         peers = d.get("peers", [])
         if peers is not None and not isinstance(peers, list):
@@ -724,14 +759,6 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             enable_gpu_direct=bool(d.get("enable_gpu_direct", False)),
             gpu_init_bind_url=d.get("gpu_init_bind_url", "0.0.0.0:8502"),
             device=d.get("device", "cpu"),
-            model_name=d.get("model_name", ""),
-            world_size=int(d.get("world_size", 1)),
-            kv_dtype_str=d.get("kv_dtype_str", "torch.bfloat16"),
-            kv_shape=tuple(kv_shape),
-            use_mla=bool(d.get("use_mla", False)),
-            cluster_chunk_size=int(d.get("cluster_chunk_size", 256)),
-            worker_id=int(d.get("worker_id", 0)),
-            local_world_size=int(d.get("local_world_size", 1)),
             local_worker_id=int(d.get("local_worker_id", 0)),
         )
 
@@ -771,9 +798,10 @@ class NixlPeerL2AdapterConfig(L2AdapterConfigBase):
             "DRAM path\n"
             "- device (str): L1 buffer device registered with NIXL "
             "(default 'cpu')\n"
-            "- model_name, world_size, kv_dtype_str, kv_shape, use_mla, "
-            "cluster_chunk_size: rack geometry; must match across peers\n"
-            "- worker_id, local_world_size, local_worker_id: worker identity"
+            "- local_worker_id (int): NIXL dev_id for the L1 buffer "
+            "(0 for a CPU-resident L1)\n"
+            "\nNo model/geometry fields: chunks are copied verbatim by "
+            "descriptor index, so the adapter never interprets their bytes."
         )
 
 
@@ -881,7 +909,15 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         # ``register_gpu_staging_buffer`` runs, which is what flips
         # ``supports_l2_resident_retrieve()`` to True.
         self._gpu_channel_factory = gpu_channel_factory
-        self._gpu_channel: GpuPeerDataChannel | None = None
+        # One GPU data channel per registered GPU context (vLLM worker),
+        # keyed by instance_id. A TP=N instance contributes N entries, and
+        # co-located instances add more.
+        self._gpu_channels: dict[int, GpuPeerDataChannel] = {}
+        # Latched when any context fails to register: GPUDirect is then off
+        # adapter-wide, because the prefetch controller cannot ask the
+        # question per rank (see `register_gpu_staging_buffer`).
+        self._gpu_direct_disabled: bool = False
+        self._gpu_lock = threading.Lock()
         # h2d token -> the key whose remote pin it holds, so
         # ``release_after_h2d`` can unlock exactly that key.
         self._h2d_token_to_key: dict[int, ObjectKey] = {}
@@ -1057,6 +1093,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         loop. The blocking handshake runs in the default executor.
 
         Args:
+            instance_id: The GPU context whose channel should connect.
             peer: The peer to connect to.
 
         Returns:
@@ -1226,49 +1263,106 @@ class NixlPeerL2Adapter(L2AdapterInterface):
 
     # ---------------- l2-resident retrieve (GPUDirect) ----------------
 
-    def register_gpu_staging_buffer(self, gpu_ptr: int, size: int) -> None:
-        """Register the GPU staging buffer, enabling GPUDirect retrieve.
+    def register_gpu_staging_buffer(
+        self, instance_id: int, gpu_ptr: int, size: int, device: str
+    ) -> None:
+        """Register one GPU context's staging buffer for GPUDirect retrieve.
 
-        Called once by the retrieve module after the GPU context has
-        allocated its staging buffer (which does not exist when the adapter
-        is constructed). Builds the GPU-side data channel via the configured
-        factory and starts background handshakes to each peer that advertises
-        a GPU init URL.
+        Called by the retrieve module after a GPU context has allocated its
+        staging buffer (which does not exist when the adapter is
+        constructed). Builds a GPU-side data channel for that context via
+        the configured factory and starts background handshakes to each
+        peer that advertises a GPU init URL.
 
-        After this returns successfully, ``supports_l2_resident_retrieve()``
-        reports ``True`` and the ``PrefetchController`` begins leaving hits
-        L2-resident for GPU-direct retrieve.
+        **One channel per GPU context.** A TP=N instance registers N
+        buffers, one per rank on its own device, and co-located vLLM
+        instances add more. Each gets its own NIXL agent and registered
+        region, keyed by ``instance_id``; a destination pointer is resolved
+        against its own context's channel, never a shared one.
+
+        **All contexts must succeed, or none serves GPU-direct.**
+        ``supports_l2_resident_retrieve`` is consulted by the prefetch
+        controller, which runs on the vLLM *scheduler* path and has no
+        worker identity — it cannot ask "can *this rank* serve GPU-direct?"
+        So a mixed state is not expressible: if one context registers and
+        another fails, the plan would route keys GPU-direct for a rank that
+        cannot serve them, and the resident path has deliberately skipped
+        the L1 load that would otherwise be the fallback. The adapter
+        therefore latches :attr:`_gpu_direct_disabled` on the first failure
+        and tears down any channels already built, so the whole server
+        falls back to DRAM uniformly. See
+        ``docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect_multi_rank.md``
+        §4.4.
 
         No-op when the adapter was built without a ``gpu_channel_factory``
         (GPUDirect disabled), so the caller can invoke it unconditionally.
 
         Args:
+            instance_id: Identifies the registering GPU context.
             gpu_ptr: Device pointer of the staging buffer's base.
             size: Byte size of the staging buffer.
+            device: The CUDA device the buffer lives on.
 
         Raises:
             ValueError: If ``gpu_ptr``/``size`` are unusable for NIXL
                 registration (non-positive, or not tiling evenly at the
-                NIXL descriptor size).
-            RuntimeError: If called twice.
+                NIXL descriptor size). GPUDirect is disabled adapter-wide
+                before raising.
         """
         if self._gpu_channel_factory is None:
             return
-        if self._gpu_channel is not None:
-            raise RuntimeError("GPU staging buffer is already registered")
-        if gpu_ptr <= 0:
-            raise ValueError(f"gpu_ptr must be a positive pointer, got {gpu_ptr}")
-        if size <= 0:
-            raise ValueError(f"size must be positive, got {size}")
+        with self._gpu_lock:
+            if self._gpu_direct_disabled:
+                # An earlier context failed; stay uniformly on DRAM rather
+                # than serving some ranks GPU-direct and not others.
+                logger.info(
+                    "NIXL GPUDirect is disabled adapter-wide; ignoring the "
+                    "staging buffer for instance %d",
+                    instance_id,
+                )
+                return
+            existing = self._gpu_channels.get(instance_id)
+            if existing is not None:
+                if existing.buffer_base == gpu_ptr:
+                    return  # idempotent re-registration
+                self._disable_gpu_direct_locked(
+                    f"instance {instance_id} re-registered a different staging "
+                    f"buffer ({gpu_ptr:#x} vs {existing.buffer_base:#x}) without "
+                    "unregistering the first"
+                )
+                raise ValueError(
+                    f"instance {instance_id} already registered a different "
+                    f"GPU staging buffer ({existing.buffer_base:#x})"
+                )
 
-        channel = self._gpu_channel_factory(gpu_ptr, size)
-        self._gpu_channel = channel
-        logger.info(
-            "NIXL peer adapter: GPU staging buffer registered "
-            "(ptr=%#x, size=%d); GPUDirect retrieve enabled",
-            gpu_ptr,
-            size,
-        )
+            try:
+                if gpu_ptr <= 0:
+                    raise ValueError(
+                        f"gpu_ptr must be a positive pointer, got {gpu_ptr}"
+                    )
+                if size <= 0:
+                    raise ValueError(f"size must be positive, got {size}")
+                channel = self._gpu_channel_factory(gpu_ptr, size, device)
+            except Exception as exc:
+                # One context that cannot use GPUDirect disables it for all
+                # of them — see the docstring.
+                self._disable_gpu_direct_locked(
+                    f"instance {instance_id} could not register its staging "
+                    f"buffer ({type(exc).__name__}: {exc})"
+                )
+                raise
+
+            self._gpu_channels[instance_id] = channel
+            logger.info(
+                "NIXL peer adapter: GPU staging buffer registered for instance "
+                "%d on %s (ptr=%#x, size=%d); %d context(s) now GPUDirect",
+                instance_id,
+                device,
+                gpu_ptr,
+                size,
+                len(self._gpu_channels),
+            )
+
         # Handshake off the request path, as the DRAM channel does, so the
         # first GPUDirect retrieve does not pay for it. A plain daemon
         # thread rather than the bg asyncio loop: the handshake is a
@@ -1277,10 +1371,73 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         gpu_peers = [p for p in self._peers if p.gpu_init_url]
         if gpu_peers:
             threading.Thread(
-                target=lambda: [self._connect_peer_gpu_sync(p) for p in gpu_peers],
+                target=lambda: [
+                    self._connect_peer_gpu_sync(instance_id, p) for p in gpu_peers
+                ],
                 name="nixl-peer-gpu-connect",
                 daemon=True,
             ).start()
+
+    def _disable_gpu_direct_locked(self, reason: str) -> None:
+        """Latch GPUDirect off adapter-wide and tear down live channels.
+
+        Caller must hold ``self._gpu_lock``.
+
+        Args:
+            reason: Why it is being disabled, for the operator-facing log.
+        """
+        self._gpu_direct_disabled = True
+        victims = list(self._gpu_channels.items())
+        self._gpu_channels.clear()
+        for instance_id, channel in victims:
+            try:
+                channel.close()
+            except Exception:
+                logger.exception(
+                    "closing the GPU channel for instance %d during "
+                    "GPUDirect teardown failed",
+                    instance_id,
+                )
+        logger.warning(
+            "NIXL GPUDirect DISABLED for this server: %s. Every GPU context "
+            "now falls back to the DRAM path — correct, but without the "
+            "GPU-direct optimization. %d channel(s) torn down. GPUDirect is "
+            "all-or-nothing here because the prefetch plan is built on the "
+            "vLLM scheduler path, which cannot tell which rank will consume "
+            "the keys.",
+            reason,
+            len(victims),
+        )
+
+    def unregister_gpu_staging_buffer(self, instance_id: int) -> None:
+        """Release the GPU channel held for `instance_id`, if any.
+
+        Called when that GPU context goes away. Harmless for an instance
+        that never registered.
+
+        Note this does NOT re-enable GPUDirect if it was latched off: the
+        surviving contexts have already been told (via
+        ``supports_l2_resident_retrieve``) to use the DRAM path, and
+        flipping back mid-flight would strand plans built under the old
+        answer.
+
+        Args:
+            instance_id: The GPU context being released.
+        """
+        with self._gpu_lock:
+            channel = self._gpu_channels.pop(instance_id, None)
+        if channel is None:
+            return
+        try:
+            channel.close()
+        except Exception:
+            logger.exception(
+                "closing the GPU channel for instance %d failed", instance_id
+            )
+        logger.info(
+            "NIXL peer adapter: released the GPU staging buffer for instance %d",
+            instance_id,
+        )
 
     def supports_l2_resident_retrieve(self) -> bool:
         """Whether hits can currently be served GPU-direct from a peer.
@@ -1295,9 +1452,10 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         Returns:
             ``True`` iff GPUDirect retrieve is enabled and registered.
         """
-        return self._gpu_channel is not None
+        with self._gpu_lock:
+            return bool(self._gpu_channels) and not self._gpu_direct_disabled
 
-    def _connect_peer_gpu_sync(self, peer: _Peer) -> bool:
+    def _connect_peer_gpu_sync(self, instance_id: int, peer: _Peer) -> bool:
         """Establish the GPU-side NIXL connection to ``peer``, blocking.
 
         The GPU analogue of :meth:`_ensure_peer_connected`, tracked by its
@@ -1326,6 +1484,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         cannot be stranded by a concurrent ``close``.
 
         Args:
+            instance_id: The GPU context whose channel should connect.
             peer: The peer to connect to.
 
         Returns:
@@ -1333,14 +1492,15 @@ class NixlPeerL2Adapter(L2AdapterInterface):
             if it advertises no GPU URL, GPUDirect is off, or the handshake
             failed (the caller should treat the peer as unavailable).
         """
-        if peer.gpu_connected:
+        if instance_id in peer.gpu_connected:
             return True
-        channel = self._gpu_channel
+        with self._gpu_lock:
+            channel = self._gpu_channels.get(instance_id)
         if channel is None or not peer.gpu_init_url:
             return False
         try:
             with peer.gpu_connect_lock:
-                if peer.gpu_connected:
+                if instance_id in peer.gpu_connected:
                     return True
                 # peer.init_url (the peer's L1/DRAM agent), NOT
                 # peer.gpu_init_url — see the docstring.
@@ -1349,7 +1509,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
                     peer_id=peer.peer_id,
                     peer_init_url=peer.init_url,
                 )
-                peer.gpu_connected = True
+                peer.gpu_connected.add(instance_id)
         except Exception as e:
             logger.debug(
                 "NIXL GPU connect to peer node_id=%d not ready (%s)",
@@ -1362,6 +1522,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
 
     def submit_h2d_batch(
         self,
+        instance_id: int,
         keys: list[ObjectKey],
         gpu_ptrs: list[int],
         dst_sizes: list[int],
@@ -1404,11 +1565,12 @@ class NixlPeerL2Adapter(L2AdapterInterface):
             raise ValueError(
                 "submit_h2d_batch: keys, gpu_ptrs and dst_sizes must have equal length"
             )
-        channel = self._gpu_channel
+        with self._gpu_lock:
+            channel = self._gpu_channels.get(instance_id)
         if channel is None:
             raise NotImplementedError(
-                "NixlPeerL2Adapter: GPUDirect retrieve is not enabled "
-                "(register_gpu_staging_buffer has not run)"
+                "NixlPeerL2Adapter: GPUDirect retrieve is not enabled for "
+                f"instance {instance_id} (no staging buffer registered for it)"
             )
         if not keys:
             return []
@@ -1433,7 +1595,9 @@ class NixlPeerL2Adapter(L2AdapterInterface):
             # (see the docstring), and hopping to the loop would queue the
             # TTFT-critical retrieve behind whatever else it is running —
             # and strand the coroutine if the adapter closes meanwhile.
-            if not peer.gpu_connected and not self._connect_peer_gpu_sync(peer):
+            if instance_id not in peer.gpu_connected and (
+                not self._connect_peer_gpu_sync(instance_id, peer)
+            ):
                 logger.warning(
                     "submit_h2d_batch: peer node_id=%d has no GPU channel; "
                     "%d key(s) cannot be served GPU-direct",
@@ -1482,7 +1646,9 @@ class NixlPeerL2Adapter(L2AdapterInterface):
 
         return tokens
 
-    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+    def submit_h2d(
+        self, instance_id: int, key: ObjectKey, gpu_ptr: int, dst_size: int
+    ) -> int:
         """Pull one pinned remote chunk into GPU memory.
 
         Single-key form of :meth:`submit_h2d_batch`; see it for the blocking
@@ -1500,7 +1666,7 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         Raises:
             NotImplementedError: If GPUDirect retrieve is not enabled.
         """
-        return self.submit_h2d_batch([key], [gpu_ptr], [dst_size])[0]
+        return self.submit_h2d_batch(instance_id, [key], [gpu_ptr], [dst_size])[0]
 
     def release_after_h2d_batch(self, tokens: list[int]) -> None:
         """Release the remote read-locks for a batch of copied chunks.
@@ -1646,13 +1812,17 @@ class NixlPeerL2Adapter(L2AdapterInterface):
         # forever. We're shutting down, so bound it: run the close in a
         # daemon thread, wait briefly, and move on if it doesn't finish.
         # Any leaked NIXL thread dies with the process.
-        gpu_channel = self._gpu_channel
-        self._gpu_channel = None
-        if gpu_channel is not None:
+        with self._gpu_lock:
+            gpu_channels = list(self._gpu_channels.items())
+            self._gpu_channels.clear()
+        for instance_id, gpu_channel in gpu_channels:
             try:
                 gpu_channel.close()
             except Exception:
-                logger.exception("GPU data channel close failed during shutdown")
+                logger.exception(
+                    "GPU data channel close failed during shutdown for instance %d",
+                    instance_id,
+                )
 
         closer = threading.Thread(
             target=self._safe_channel_close, name="nixl-peer-chan-close", daemon=True
@@ -1873,13 +2043,18 @@ def build_nixl_peer_adapter_from_config(
     if config.enable_gpu_direct:
 
         def gpu_channel_factory(  # noqa: F811
-            gpu_ptr: int, size: int
+            gpu_ptr: int, size: int, device: str
         ) -> _NixlGpuReadChannel:
-            """Build the GPU-side read channel over the staging buffer.
+            """Build the GPU-side read channel over one staging buffer.
 
             Args:
                 gpu_ptr: Base device pointer of the staging buffer.
                 size: Its byte size.
+                device: The CUDA device it lives on. Passed to NIXL as the
+                    descriptor's ``dev_id``, so a buffer on ``cuda:1`` is
+                    registered as being on device 1 — the config's
+                    ``local_worker_id`` is one value for the whole MP
+                    server and cannot describe several devices.
 
             Returns:
                 A ``_NixlGpuReadChannel`` registered over that buffer.
@@ -1909,19 +2084,33 @@ def build_nixl_peer_adapter_from_config(
                     f"are not a 2 MiB multiple (e.g. an odd KV-head or layer "
                     f"count) cannot use GPUDirect."
                 )
+            # NIXL's descriptor dev_id must name the buffer's real device:
+            # "cuda:1" -> 1. ``config.local_worker_id`` is a single value
+            # for the whole MP server, so it cannot describe N devices.
+            dev_index = int(device.split(":")[1]) if ":" in device else 0
             gpu_channel = NixlChannel(
                 async_mode=False,
-                device="cuda",
+                device=device,
                 role="both",
                 buffer_ptr=gpu_ptr,
                 buffer_size=size,
                 align_bytes=nixl_page_bytes,
-                tp_rank=config.local_worker_id,
-                peer_init_url=_strip_tcp_scheme(config.gpu_init_bind_url),
+                tp_rank=dev_index,
+                # No inbound listener. Each GPU context builds its own
+                # channel, and they would all bind the same port. They do
+                # not need one: GPUDirect is asymmetric — we READ the
+                # peer's DRAM L1, so our GPU agent dials *out* to the
+                # peer's init_url and nothing ever dials us. (A peer's
+                # advertised gpu_init_url is a capability flag, never a
+                # handshake target — see _connect_peer_gpu_sync.)
+                peer_init_url=None,
                 backends=config.nixl_backends,
             )
             return _NixlGpuReadChannel(
-                gpu_channel, page_size=nixl_page_bytes, buffer_base=gpu_ptr
+                gpu_channel,
+                page_size=nixl_page_bytes,
+                buffer_base=gpu_ptr,
+                buffer_size=size,
             )
 
         logger.info(

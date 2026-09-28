@@ -323,7 +323,10 @@ class GPUTransferModule:
         staging = getattr(cache_context, "tmp_gpu_staging_buffer", None)
         if staging is not None:
             self._ctx.storage_manager.register_gpu_staging_buffer(
-                staging.data_ptr(), staging.nbytes
+                instance_id,
+                staging.data_ptr(),
+                staging.nbytes,
+                str(cache_context.device),
             )
 
         logger.info(
@@ -346,6 +349,10 @@ class GPUTransferModule:
             return
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
+        # Release any per-instance transport resource an L2 adapter holds
+        # for this context (e.g. the NIXL peer adapter's registered GPU
+        # agent). Without this they accumulate one per worker restart.
+        self._ctx.storage_manager.unregister_gpu_staging_buffer(instance_id)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
         torch_dev.empty_cache()
 
@@ -749,6 +756,7 @@ class GPUTransferModule:
                         lmcache_memcpy_async_h2d(source, staging)
                 if resident_keys:
                     batch_tokens = self._ctx.storage_manager.submit_h2d_for_l2_resident(
+                        instance_id,
                         resident_keys,
                         resident_adapters,
                         resident_ptrs,

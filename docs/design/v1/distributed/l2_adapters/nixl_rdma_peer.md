@@ -342,17 +342,18 @@ only what already lives in their own L1 from their own traffic.
   "peer_probe_interval_ms": 5000,       // background liveness-ping interval for DEAD peers (§2b)
   "peer_probe_timeout_ms": 1000,        // single-ping timeout (far shorter than control_timeout_ms)
   "device": "cpu",                      // device the L1 buffer lives on
-
-  // geometry — must match across the rack
-  "model_name": "...", "world_size": 8,
-  "kv_dtype_str": "torch.bfloat16",
-  "kv_shape": [32, 2, 256, 8, 128],
-  "use_mla": false, "cluster_chunk_size": 256,
-
-  // worker identity (not part of geometry)
-  "worker_id": 0, "local_world_size": 1, "local_worker_id": 0
+  "local_worker_id": 0                  // NIXL dev_id for that buffer (0 for CPU)
 }
 ```
+
+**No model or KV-geometry fields.** The adapter never interprets chunk bytes:
+a chunk is addressed by descriptor index into the peer's L1 and copied
+verbatim, and the descriptor size is a fixed 2 MiB wire constant, not
+something derived from a model. `model_name`, `world_size`, `kv_dtype_str`,
+`kv_shape`, `use_mla`, `cluster_chunk_size`, `worker_id` and
+`local_world_size` were declared here historically but were assigned and
+never read; they have been removed. An older config file that still carries
+them still starts — unknown keys are ignored.
 
 The factory needs both `l1_memory_desc` (to register the L1 buffer with
 NIXL for RDMA) and `l1_manager` (for the donor side to read-lock/serve

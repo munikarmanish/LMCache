@@ -22,6 +22,10 @@ import pytest
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 
+# The GPU context these copies target. One retrieve serves one context,
+# so it is constant across a batch.
+INSTANCE = 4242
+
 
 def _key(int_hash: int) -> ObjectKey:
     return ObjectKey(
@@ -45,7 +49,9 @@ class _StubH2DAdapter(L2AdapterInterface):
         self._next = 0
         self.calls: list[tuple[ObjectKey, int, int]] = []
 
-    def submit_h2d(self, key: ObjectKey, gpu_ptr: int, dst_size: int) -> int:
+    def submit_h2d(
+        self, instance_id: int, key: ObjectKey, gpu_ptr: int, dst_size: int
+    ) -> int:
         self.calls.append((key, gpu_ptr, dst_size))
         if key not in self._known:
             return -1
@@ -91,7 +97,9 @@ class _StubH2DAdapter(L2AdapterInterface):
 def test_default_batch_loops_submit_h2d():
     k0, k1, k2 = _key(0), _key(1), _key(2)
     adapter = _StubH2DAdapter(known={k0, k1, k2})
-    tokens = adapter.submit_h2d_batch([k0, k1, k2], [100, 200, 300], [64, 64, 64])
+    tokens = adapter.submit_h2d_batch(
+        INSTANCE, [k0, k1, k2], [100, 200, 300], [64, 64, 64]
+    )
     # One token per key, in order; the default fans out to submit_h2d.
     assert tokens == [0, 1, 2]
     assert adapter.calls == [(k0, 100, 64), (k1, 200, 64), (k2, 300, 64)]
@@ -100,7 +108,7 @@ def test_default_batch_loops_submit_h2d():
 def test_default_batch_propagates_misses():
     k_hit, k_miss = _key(0), _key(99)
     adapter = _StubH2DAdapter(known={k_hit})
-    tokens = adapter.submit_h2d_batch([k_hit, k_miss], [10, 20], [64, 64])
+    tokens = adapter.submit_h2d_batch(INSTANCE, [k_hit, k_miss], [10, 20], [64, 64])
     # Miss -> -1, hit -> a real token, positions preserved.
     assert tokens[1] == -1
     assert tokens[0] >= 0
@@ -109,17 +117,17 @@ def test_default_batch_propagates_misses():
 def test_default_batch_rejects_unequal_lengths():
     adapter = _StubH2DAdapter(known=set())
     with pytest.raises(ValueError):
-        adapter.submit_h2d_batch([_key(0)], [1, 2], [64])
+        adapter.submit_h2d_batch(INSTANCE, [_key(0)], [1, 2], [64])
 
 
 def test_override_is_honored():
     class _BatchAdapter(_StubH2DAdapter):
-        def submit_h2d_batch(self, keys, gpu_ptrs, dst_sizes):
+        def submit_h2d_batch(self, instance_id, keys, gpu_ptrs, dst_sizes):
             self.batch_called = True
             return [42] * len(keys)
 
     adapter = _BatchAdapter(known={_key(0)})
-    tokens = adapter.submit_h2d_batch([_key(0), _key(1)], [1, 2], [64, 64])
+    tokens = adapter.submit_h2d_batch(INSTANCE, [_key(0), _key(1)], [1, 2], [64, 64])
     assert tokens == [42, 42]
     assert adapter.batch_called
     # The override did NOT fall through to per-key submit_h2d.

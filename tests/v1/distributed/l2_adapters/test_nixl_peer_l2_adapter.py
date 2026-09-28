@@ -66,11 +66,20 @@ from lmcache.v1.memory_management import (
 
 MODEL = "nixl-peer-test"
 
+# The GPU context (vLLM worker) these registrations and copies belong to.
+INSTANCE = 7777
+DEVICE = "cuda:0"
+
 # The L1 allocator stores ``meta.address`` as a byte offset; the donor and
 # read channel convert it to a NIXL descriptor index by ``// page_size``.
 # Use a page size > 1 so the conversion is actually exercised (a chunk at
 # page_index N sits at byte offset N * PAGE_SIZE).
 PAGE_SIZE = 4096
+
+# Staging-buffer size for the direct _NixlGpuReadChannel tests. Large enough
+# that the existing index-math cases sit well inside it, so only the tests
+# that deliberately probe the bounds hit them.
+BUF_SIZE = 256 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1083,12 +1092,13 @@ class _FakeGpuChannel:
     the caller's CUDA stream, so the adapter must not return early).
     """
 
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, buffer_base: int = 0x200000):
         self.reads: list[tuple[str, list[int], list[int], list[int]]] = []
         self.connects: list[str] = []
         self.fail = fail
         self.closed = False
         self.completed_before_return = True
+        self._buffer_base = buffer_base
 
     def lazy_init_peer_connection(self, local_id, peer_id, peer_init_url):
         # Record the URL, not just the peer id: GPUDirect must handshake the
@@ -1103,6 +1113,10 @@ class _FakeGpuChannel:
             (peer_id, list(gpu_ptrs), list(sizes), list(remote_page_indices))
         )
         return len(gpu_ptrs)
+
+    @property
+    def buffer_base(self) -> int:
+        return self._buffer_base
 
     def close(self):
         self.closed = True
@@ -1139,7 +1153,7 @@ def _gpu_adapter(fail: bool = False):
         control_server=None,
         eager_connect=False,
         register_peer_callback=False,
-        gpu_channel_factory=lambda ptr, size: gpu_channel,
+        gpu_channel_factory=lambda ptr, size, device: gpu_channel,
     )
     return adapter, gpu_channel, server, peer_l1
 
@@ -1158,10 +1172,10 @@ def test_gpu_direct_disabled_without_factory():
         assert adapter.supports_l2_resident_retrieve() is False
         # Registration is a no-op, not an error: the caller invokes it
         # unconditionally for every adapter.
-        adapter.register_gpu_staging_buffer(0x1000, 4096)
+        adapter.register_gpu_staging_buffer(INSTANCE, 0x1000, 4096, DEVICE)
         assert adapter.supports_l2_resident_retrieve() is False
         with pytest.raises(NotImplementedError):
-            adapter.submit_h2d_batch([_make_object_key(1)], [0x1000], [64])
+            adapter.submit_h2d_batch(INSTANCE, [_make_object_key(1)], [0x1000], [64])
     finally:
         adapter.close()
 
@@ -1171,23 +1185,36 @@ def test_gpu_direct_support_flips_on_registration():
     adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
     try:
         assert adapter.supports_l2_resident_retrieve() is False
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
         assert adapter.supports_l2_resident_retrieve() is True
-        # Registering twice is a programming error, not a silent no-op.
-        with pytest.raises(RuntimeError):
-            adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        # Re-registering the SAME buffer for the same context is idempotent
+        # (the register path can be re-driven on a heartbeat recovery).
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
+        assert adapter.supports_l2_resident_retrieve() is True
     finally:
         adapter.close()
         server.stop()
 
 
-def test_gpu_direct_rejects_bad_buffer():
+@pytest.mark.parametrize(
+    "gpu_ptr,size", [(0, 4096), (0x200000, 0)], ids=["null-ptr", "zero-size"]
+)
+def test_gpu_direct_rejects_bad_buffer(gpu_ptr, size):
+    """An unusable buffer is refused, and disables GPUDirect adapter-wide.
+
+    The disable is the point: a context that cannot register must not leave
+    the others reporting GPU-direct, because the prefetch plan is built on
+    the scheduler path and cannot route per rank.
+    """
     adapter, _gpu_channel, server, _peer_l1 = _gpu_adapter()
     try:
         with pytest.raises(ValueError):
-            adapter.register_gpu_staging_buffer(0, 4096)
-        with pytest.raises(ValueError):
-            adapter.register_gpu_staging_buffer(0x200000, 0)
+            adapter.register_gpu_staging_buffer(INSTANCE, gpu_ptr, size, DEVICE)
+        assert adapter.supports_l2_resident_retrieve() is False
     finally:
         adapter.close()
         server.stop()
@@ -1197,14 +1224,18 @@ def test_gpu_direct_h2d_reads_and_releases_pins():
     """lookup -> submit_h2d_batch -> release drops every remote read-lock."""
     adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
         k0, k1 = _make_object_key(10), _make_object_key(11)
 
         bitmap = _run_lookup(adapter, [k0, k1])
         assert bitmap.popcount() == 2
         assert adapter.debug_held_pin_count() == 2
 
-        tokens = adapter.submit_h2d_batch([k0, k1], [0x200000, 0x400000], [64, 64])
+        tokens = adapter.submit_h2d_batch(
+            INSTANCE, [k0, k1], [0x200000, 0x400000], [64, 64]
+        )
         assert all(t >= 0 for t in tokens)
         assert len(set(tokens)) == 2, "tokens must be distinct"
 
@@ -1241,8 +1272,12 @@ def test_gpu_direct_h2d_without_pin_returns_miss():
     """A key with no held pin yields -1 rather than a bogus transfer."""
     adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
-        tokens = adapter.submit_h2d_batch([_make_object_key(999)], [0x200000], [64])
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
+        tokens = adapter.submit_h2d_batch(
+            INSTANCE, [_make_object_key(999)], [0x200000], [64]
+        )
         assert tokens == [-1]
         assert gpu_channel.reads == []
     finally:
@@ -1254,10 +1289,12 @@ def test_gpu_direct_h2d_failure_returns_miss_and_keeps_pin():
     """A failed READ reports -1; the pin stays so unlock can still free it."""
     adapter, gpu_channel, server, peer_l1 = _gpu_adapter(fail=True)
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
         k0 = _make_object_key(10)
         _run_lookup(adapter, [k0])
-        tokens = adapter.submit_h2d_batch([k0], [0x200000], [64])
+        tokens = adapter.submit_h2d_batch(INSTANCE, [k0], [0x200000], [64])
         assert tokens == [-1]
         # Pin still held -> the abort path (submit_unlock, which the
         # retrieve consumer calls via submit_unlock_l2_resident when a
@@ -1277,7 +1314,9 @@ def test_gpu_direct_h2d_failure_returns_miss_and_keeps_pin():
 def test_gpu_direct_release_ignores_negative_tokens():
     adapter, _gpu_channel, server, _peer_l1 = _gpu_adapter()
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
         adapter.release_after_h2d_batch([-1, -1])
         adapter.release_after_h2d(-1)
     finally:
@@ -1288,7 +1327,9 @@ def test_gpu_direct_release_ignores_negative_tokens():
 def test_gpu_direct_close_tears_down_gpu_channel():
     adapter, gpu_channel, server, peer_l1 = _gpu_adapter()
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
     finally:
         adapter.close()
         server.stop()
@@ -1305,7 +1346,9 @@ def test_gpu_read_channel_expands_chunk_into_all_descriptors():
     base = 0x40000000
 
     fake = _FakeChannelForRead()
-    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+    rc = _NixlGpuReadChannel(
+        fake, page_size=page, buffer_base=base, buffer_size=BUF_SIZE
+    )
 
     # Staging slots 0 and 1; donor bases 2 and 4 chunks in.
     rc.read_chunks_to_gpu(
@@ -1332,7 +1375,9 @@ def test_gpu_read_channel_derives_slot_index_from_pointer():
     base = 0x40000000
 
     fake = _FakeChannelForRead()
-    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+    rc = _NixlGpuReadChannel(
+        fake, page_size=page, buffer_base=base, buffer_size=BUF_SIZE
+    )
     # Slot 3 only.
     rc.read_chunks_to_gpu([base + 3 * chunk], [chunk], [0], "node-1")
     assert fake.nixl_agent.local_indices == list(
@@ -1343,7 +1388,10 @@ def test_gpu_read_channel_derives_slot_index_from_pointer():
 def test_gpu_read_channel_rejects_pointer_below_base():
     page = 2 * 1024 * 1024
     rc = _NixlGpuReadChannel(
-        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+        _FakeChannelForRead(),
+        page_size=page,
+        buffer_base=0x40000000,
+        buffer_size=BUF_SIZE,
     )
     with pytest.raises(ValueError):
         rc.read_chunks_to_gpu([0x3FFFFFFF], [page], [0], "node-1")
@@ -1352,7 +1400,10 @@ def test_gpu_read_channel_rejects_pointer_below_base():
 def test_gpu_read_channel_rejects_misaligned_pointer():
     page = 2 * 1024 * 1024
     rc = _NixlGpuReadChannel(
-        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+        _FakeChannelForRead(),
+        page_size=page,
+        buffer_base=0x40000000,
+        buffer_size=BUF_SIZE,
     )
     with pytest.raises(ValueError):
         rc.read_chunks_to_gpu([0x40000000 + 1], [page], [0], "node-1")
@@ -1361,7 +1412,10 @@ def test_gpu_read_channel_rejects_misaligned_pointer():
 def test_gpu_read_channel_rejects_non_multiple_size():
     page = 2 * 1024 * 1024
     rc = _NixlGpuReadChannel(
-        _FakeChannelForRead(), page_size=page, buffer_base=0x40000000
+        _FakeChannelForRead(),
+        page_size=page,
+        buffer_base=0x40000000,
+        buffer_size=BUF_SIZE,
     )
     with pytest.raises(ValueError):
         rc.read_chunks_to_gpu([0x40000000], [page + 1], [0], "node-1")
@@ -1385,10 +1439,12 @@ def test_gpu_direct_handshakes_l1_not_gpu_url():
     """
     adapter, gpu_channel, server, _peer_l1 = _gpu_adapter()
     try:
-        adapter.register_gpu_staging_buffer(0x200000, 64 * 1024 * 1024)
+        adapter.register_gpu_staging_buffer(
+            INSTANCE, 0x200000, 64 * 1024 * 1024, DEVICE
+        )
         k0 = _make_object_key(10)
         _run_lookup(adapter, [k0])
-        adapter.submit_h2d_batch([k0], [0x200000], [64])
+        adapter.submit_h2d_batch(INSTANCE, [k0], [0x200000], [64])
 
         assert gpu_channel.connects, "no GPU handshake happened"
         _peer_id, url = gpu_channel.connects[0]
@@ -1416,7 +1472,9 @@ def test_gpu_direct_reads_remote_index_beyond_staging_buffer():
     base = 0x40000000
 
     fake = _FakeChannelForRead()
-    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base)
+    rc = _NixlGpuReadChannel(
+        fake, page_size=page, buffer_base=base, buffer_size=BUF_SIZE
+    )
 
     # Staging slot 0 (local idx 0-15) <- remote base 8192 (deep in a 32 GiB
     # L1, far past the 64 descriptors a 128 MiB staging buffer would have).
@@ -1425,3 +1483,188 @@ def test_gpu_direct_reads_remote_index_beyond_staging_buffer():
     agent = fake.nixl_agent
     assert agent.local_indices == list(range(0, pages_per_chunk))
     assert agent.remote_indices == list(range(8192, 8192 + pages_per_chunk))
+
+
+# ---------------------------------------------------------------------------
+# Destination bounds: a pointer from another GPU context must be refused
+# ---------------------------------------------------------------------------
+#
+# The staging buffer is per GPU context, so with TP>1 or a second co-located
+# vLLM instance there are several of them, on several devices. A destination
+# pointer is a bare integer by the time it reaches the channel, so a pointer
+# into a *different* buffer must be rejected rather than silently converted
+# into a plausible descriptor index — that would READ another context's bytes
+# into this one's KV cache. See
+# docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect_multi_rank.md §1.1
+
+
+def test_gpu_read_channel_rejects_pointer_past_buffer_end():
+    """A pointer above the registered buffer is refused, not wrapped.
+
+    This is the dangerous direction: below the base the offset goes
+    negative and is obviously wrong, but above the end it yields a
+    perfectly valid-looking index.
+    """
+    page = 2 * 1024 * 1024
+    base = 0x40000000
+    size = 8 * page
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=base, buffer_size=size
+    )
+    with pytest.raises(ValueError, match="outside the registered"):
+        rc.read_chunks_to_gpu([base + size], [page], [0], "node-1")
+
+
+def test_gpu_read_channel_rejects_second_buffers_pointer():
+    """A pointer into a second staging buffer laid out above the first.
+
+    The realistic TP>1 shape: two contexts allocate two buffers, and the
+    second happens to sit above the first in the address space.
+    """
+    page = 2 * 1024 * 1024
+    base_a = 0x40000000
+    size = 8 * page
+    base_b = base_a + size  # a second context's buffer, immediately after
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=base_a, buffer_size=size
+    )
+    with pytest.raises(ValueError, match="outside the registered"):
+        rc.read_chunks_to_gpu([base_b], [page], [0], "node-1")
+
+
+def test_gpu_read_channel_rejects_chunk_running_past_end():
+    """A chunk that starts inside but extends past the end is refused.
+
+    A chunk spans size/page_size descriptors, so checking only its first
+    byte would let the tail run off the registered region.
+    """
+    page = 2 * 1024 * 1024
+    base = 0x40000000
+    size = 8 * page
+    rc = _NixlGpuReadChannel(
+        _FakeChannelForRead(), page_size=page, buffer_base=base, buffer_size=size
+    )
+    # Starts at the last page, but asks for two pages' worth.
+    with pytest.raises(ValueError, match="runs past the end"):
+        rc.read_chunks_to_gpu([base + 7 * page], [2 * page], [0], "node-1")
+
+
+def test_gpu_read_channel_accepts_the_last_chunk():
+    """The final chunk that exactly fills the buffer is still valid.
+
+    Guards against an off-by-one in the bound that would reject a
+    legitimate destination.
+    """
+    page = 2 * 1024 * 1024
+    base = 0x40000000
+    size = 8 * page
+    fake = _FakeChannelForRead()
+    rc = _NixlGpuReadChannel(fake, page_size=page, buffer_base=base, buffer_size=size)
+    rc.read_chunks_to_gpu([base + 6 * page], [2 * page], [0], "node-1")
+    assert fake.nixl_agent.local_indices == [6, 7]
+
+
+# ---------------------------------------------------------------------------
+# Per-instance GPU channels (TP>1 and co-located vLLM instances)
+# ---------------------------------------------------------------------------
+#
+# Each GPU context registers its own staging buffer on its own device, so the
+# adapter keeps one channel per instance_id. GPUDirect is all-or-nothing
+# across them: the prefetch plan is built on the vLLM scheduler path, which
+# has no worker identity and so cannot route per rank. See
+# docs/design/v1/distributed/l2_adapters/nixl_peer_gpudirect_multi_rank.md §4.4
+
+
+def _multi_gpu_adapter(channels):
+    """Adapter with no peers whose GPU factory hands out `channels` in order.
+
+    Peers are unnecessary here: these tests exercise registration and
+    channel bookkeeping, not the read path.
+    """
+    handed: list = list(channels)
+    adapter = NixlPeerL2Adapter(
+        peers=[],
+        data_channel=FakeDataChannel(),
+        node_id=0,
+        control_server=None,
+        eager_connect=False,
+        register_peer_callback=False,
+        gpu_channel_factory=lambda ptr, size, device: handed.pop(0),
+    )
+    return adapter
+
+
+def test_two_instances_each_get_their_own_channel():
+    """TP=2 (or two co-located instances) both register successfully."""
+    ch_a = _FakeGpuChannel(buffer_base=0x200000)
+    ch_b = _FakeGpuChannel(buffer_base=0x400000)
+    adapter = _multi_gpu_adapter([ch_a, ch_b])
+    try:
+        adapter.register_gpu_staging_buffer(1, 0x200000, 1 << 20, "cuda:0")
+        adapter.register_gpu_staging_buffer(2, 0x400000, 1 << 20, "cuda:1")
+        assert adapter.supports_l2_resident_retrieve() is True
+    finally:
+        adapter.close()
+
+
+def test_unregister_releases_only_that_instance():
+    """One context going away leaves the other's channel intact."""
+    ch_a = _FakeGpuChannel(buffer_base=0x200000)
+    ch_b = _FakeGpuChannel(buffer_base=0x400000)
+    adapter = _multi_gpu_adapter([ch_a, ch_b])
+    try:
+        adapter.register_gpu_staging_buffer(1, 0x200000, 1 << 20, "cuda:0")
+        adapter.register_gpu_staging_buffer(2, 0x400000, 1 << 20, "cuda:1")
+
+        adapter.unregister_gpu_staging_buffer(1)
+        assert ch_a.closed is True
+        assert ch_b.closed is False
+        # The surviving context still serves GPU-direct.
+        assert adapter.supports_l2_resident_retrieve() is True
+
+        # Unregistering an instance that never registered is harmless.
+        adapter.unregister_gpu_staging_buffer(999)
+    finally:
+        adapter.close()
+
+
+def test_one_failed_registration_disables_gpudirect_for_all():
+    """All-or-nothing: a context that cannot register takes the rest down.
+
+    The prefetch controller asks one question for the whole adapter, so a
+    mixed state would route keys GPU-direct for a rank that cannot serve
+    them — and the resident path has already skipped the L1 load that
+    would otherwise be the fallback.
+    """
+    ch_a = _FakeGpuChannel(buffer_base=0x200000)
+    adapter = _multi_gpu_adapter([ch_a])
+    try:
+        adapter.register_gpu_staging_buffer(1, 0x200000, 1 << 20, "cuda:0")
+        assert adapter.supports_l2_resident_retrieve() is True
+
+        # Second context offers an unusable buffer.
+        with pytest.raises(ValueError):
+            adapter.register_gpu_staging_buffer(2, 0, 1 << 20, "cuda:1")
+
+        # GPUDirect is off for everyone, and the good channel was torn down.
+        assert adapter.supports_l2_resident_retrieve() is False
+        assert ch_a.closed is True
+    finally:
+        adapter.close()
+
+
+def test_registrations_after_disable_are_ignored():
+    """Once latched off, later contexts do not silently re-enable it."""
+    ch_a = _FakeGpuChannel(buffer_base=0x200000)
+    adapter = _multi_gpu_adapter([ch_a])
+    try:
+        with pytest.raises(ValueError):
+            adapter.register_gpu_staging_buffer(1, 0, 1 << 20, "cuda:0")
+        assert adapter.supports_l2_resident_retrieve() is False
+
+        # A perfectly good buffer from a later context must NOT flip it back
+        # on: plans built while it was False are still in flight.
+        adapter.register_gpu_staging_buffer(2, 0x200000, 1 << 20, "cuda:1")
+        assert adapter.supports_l2_resident_retrieve() is False
+    finally:
+        adapter.close()
